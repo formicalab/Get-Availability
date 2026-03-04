@@ -40,8 +40,17 @@
     Service principal callers are resolved to display names using
     Get-AzADServicePrincipal for clearer reporting.
 
+    State transitions (start after deallocation, reboot after patching, first
+    boot after creation) often produce 1-2 minutes of null or zero metric while
+    the VM is booting and the Guest Agent reconnects.  A configurable grace
+    period (TransitionGraceMinutes, default 2) extends each exclusion window's
+    trailing edge so those transition minutes are not penalised as unavailable.
+    Data points where the metric is already 1 (available) are never suppressed
+    by the grace period.
+
     Null data points that fall outside any known user-initiated deallocation
-    or patching window are treated as unavailable (potential platform issue).
+    or patching window (including the grace period) are treated as unavailable
+    (potential platform issue).
 
     Availability % = AvailableMinutes / (AvailableMinutes + UnavailableMinutes) * 100
 
@@ -78,6 +87,12 @@
 .EXAMPLE
     # All VMs in the current subscription
     ./get-availability.ps1 -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z"
+
+.EXAMPLE
+    # Custom grace period (0 = disable, max 10)
+    ./get-availability.ps1 -VMName "web-01" -ResourceGroupName "rg-prod" `
+        -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z" `
+        -TransitionGraceMinutes 3
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Subscription')]
@@ -95,7 +110,11 @@ param(
     [datetime]$StartDate,
 
     [Parameter(Mandatory)]
-    [datetime]$EndDate
+    [datetime]$EndDate,
+
+    [Parameter()]
+    [ValidateRange(0, 10)]
+    [int]$TransitionGraceMinutes = 2
 )
 
 Set-StrictMode -Version Latest
@@ -109,6 +128,17 @@ $EndDate   = $EndDate.ToUniversalTime()
 
 if ($EndDate -le $StartDate) {
     Write-Error 'EndDate must be greater than StartDate.'
+}
+
+# ---------------------------------------------------------------------------
+# Warn if the query period exceeds Activity Log retention (90 days)
+# ---------------------------------------------------------------------------
+$activityLogMaxDays = 89
+$daysBack = ((Get-Date).ToUniversalTime() - $StartDate).TotalDays
+if ($daysBack -gt $activityLogMaxDays) {
+    Write-Warning ("StartDate is {0:N0} days ago. Azure Activity Log retains events for ~90 days. " +
+                   "Deallocation, patching, and lifecycle events older than 90 days will be missing, " +
+                   "which may cause null metrics to be incorrectly counted as unavailable.") -f $daysBack
 }
 
 # ---------------------------------------------------------------------------
@@ -156,6 +186,7 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
     $endDate        = $using:EndDate
     $timeGrainMins  = $using:timeGrainMins
     $azCtx          = $using:azContext
+    $graceMins      = $using:TransitionGraceMinutes
 
     # Each parallel runspace needs its own Az context
     $null = Set-AzContext -Context $azCtx -ErrorAction Stop
@@ -255,6 +286,26 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
             Caller      = $pendingDealloc.Caller
             DisplayName = $pendingDealloc.DisplayName
         })
+    }
+
+    # Orphan start: if the first dealloc/start event is a Start without a
+    # preceding Deallocate, the VM was deallocated before the query period.
+    # Synthesise a window [startDate, firstStartTimestamp).
+    if ($deallocStartEvents -and @($deallocStartEvents).Count -gt 0) {
+        $firstEvt    = @($deallocStartEvents)[0]
+        $firstOpDisp = $firstEvt.OperationName.ToString()
+        $firstOpVal  = $firstEvt.OperationName.Value
+        $firstIsStart = $firstOpDisp -in $startPatterns -or $firstOpVal -in $startPatterns
+
+        if ($firstIsStart) {
+            # No matching deallocate in the period → VM was already deallocated
+            $deallocWindows.Insert(0, [PSCustomObject]@{
+                From        = $startDate
+                To          = $firstEvt.EventTimestamp
+                Caller      = '(deallocated before period)'
+                DisplayName = $null
+            })
+        }
     }
 
     if ($deallocWindows.Count -gt 0) {
@@ -380,29 +431,14 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
     # Release memory from the full event set
     $allEvents = $null
 
-    # Helper: check whether a timestamp falls inside any non-existence window
-    $isInNonExistWindow = {
-        param([datetime]$ts)
-        foreach ($w in $nonExistWindows) {
-            if ($ts -ge $w.From -and $ts -lt $w.To) { return $true }
-        }
-        return $false
-    }
-
-    # Helper: check whether a timestamp falls inside any deallocation window
-    $isInDeallocWindow = {
-        param([datetime]$ts)
-        foreach ($w in $deallocWindows) {
-            if ($ts -ge $w.From -and $ts -lt $w.To) { return $true }
-        }
-        return $false
-    }
-
-    # Helper: check whether a timestamp falls inside any OS patching window
-    $isInPatchWindow = {
-        param([datetime]$ts)
-        foreach ($w in $patchWindows) {
-            if ($ts -ge $w.From -and $ts -lt $w.To) { return $true }
+    # Helper: check whether a timestamp falls inside any window.
+    # When $useGrace is true, the trailing edge of each window is extended
+    # by $graceMins minutes to cover metric-emission lag during VM boot.
+    $isInWindow = {
+        param([System.Collections.Generic.List[PSCustomObject]]$windows, [datetime]$ts, [bool]$useGrace)
+        foreach ($w in $windows) {
+            $effectiveTo = if ($useGrace) { $w.To.AddMinutes($graceMins) } else { $w.To }
+            if ($ts -ge $w.From -and $ts -lt $effectiveTo) { return $true }
         }
         return $false
     }
@@ -428,23 +464,36 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
     # -----------------------------------------------------------------
     $availableMinutes         = 0
     $unavailableMinutes       = 0
-    $userDeallocatedMinutes   = 0   # null AND inside a known deallocation window
-    $patchingMinutes          = 0   # null AND inside a known OS patching window
-    $nonExistentMinutes       = 0   # null AND inside a known non-existence window
+    $userDeallocatedMinutes   = 0   # null/0 inside a known deallocation window
+    $patchingMinutes          = 0   # null/0 inside a known OS patching window
+    $nonExistentMinutes       = 0   # null/0 inside a known non-existence window
     $unknownNullMinutes       = 0   # null but NOT in any known window → unavailable
+    $transitionGraceMinutes   = 0   # null/0 caught by the trailing grace period
+    $totalDataPoints          = 0   # for completeness sanity check
 
     foreach ($timeseries in $metric.Timeseries) {
         foreach ($dataPoint in $timeseries.Data) {
+            $totalDataPoints++
+
             if ($null -eq $dataPoint.Minimum) {
                 # Priority: non-existence > deallocation > patching > unknown
-                if (& $isInNonExistWindow $dataPoint.TimeStamp) {
+                # First check exact windows, then check with grace extension.
+                if (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $false) {
                     $nonExistentMinutes++
                 }
-                elseif (& $isInDeallocWindow $dataPoint.TimeStamp) {
+                elseif (& $isInWindow $deallocWindows $dataPoint.TimeStamp $false) {
                     $userDeallocatedMinutes++
                 }
-                elseif (& $isInPatchWindow $dataPoint.TimeStamp) {
+                elseif (& $isInWindow $patchWindows $dataPoint.TimeStamp $false) {
                     $patchingMinutes++
+                }
+                elseif ($graceMins -gt 0 -and (
+                    (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $true) -or
+                    (& $isInWindow $deallocWindows  $dataPoint.TimeStamp $true) -or
+                    (& $isInWindow $patchWindows    $dataPoint.TimeStamp $true)
+                )) {
+                    # Null falls within the grace period after a known window
+                    $transitionGraceMinutes++
                 }
                 else {
                     # Null outside any known window → treat as unavailable
@@ -452,19 +501,40 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
                 }
             }
             elseif ($dataPoint.Minimum -ge 1) {
+                # VM was available — always count, even during grace period
                 $availableMinutes++
             }
             else {
-                # Minimum < 1 → VM was unavailable during this minute
-                if (& $isInPatchWindow $dataPoint.TimeStamp) {
-                    # Planned reboot during OS patching → exclude from eligible
+                # Minimum < 1 → VM was unavailable / transitioning
+                # Check all window types (same priority as null)
+                if (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $false) {
+                    $nonExistentMinutes++
+                }
+                elseif (& $isInWindow $deallocWindows $dataPoint.TimeStamp $false) {
+                    $userDeallocatedMinutes++
+                }
+                elseif (& $isInWindow $patchWindows $dataPoint.TimeStamp $false) {
                     $patchingMinutes++
+                }
+                elseif ($graceMins -gt 0 -and (
+                    (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $true) -or
+                    (& $isInWindow $deallocWindows  $dataPoint.TimeStamp $true) -or
+                    (& $isInWindow $patchWindows    $dataPoint.TimeStamp $true)
+                )) {
+                    # metric < 1 during grace period → transition
+                    $transitionGraceMinutes++
                 }
                 else {
                     $unavailableMinutes++
                 }
             }
         }
+    }
+
+    # Completeness sanity check
+    $expectedMinutes = [int](($endDate - $startDate).TotalMinutes)
+    if ($totalDataPoints -ne $expectedMinutes) {
+        Write-Warning "  [$($vm.Name)] Metric returned $totalDataPoints data points but expected $expectedMinutes. Gap of $($expectedMinutes - $totalDataPoints) minute(s)."
     }
 
     # Unknown-null minutes count as unavailable
@@ -483,6 +553,7 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
         UserDeallocatedMinutes = $userDeallocatedMinutes
         PatchingMinutes        = $patchingMinutes
         NonExistentMinutes     = $nonExistentMinutes
+        TransitionGraceMinutes = $transitionGraceMinutes
         EligibleMinutes        = $eligibleMinutes
         AvailabilityPct        = $availabilityPct
         DeallocWindows         = $deallocWindows
@@ -597,8 +668,9 @@ else {
     $totalDealloc      = ($activeResults | Measure-Object -Property UserDeallocatedMinutes -Sum).Sum
     $totalPatching     = ($activeResults | Measure-Object -Property PatchingMinutes        -Sum).Sum
     $totalNonExistent  = ($activeResults | Measure-Object -Property NonExistentMinutes     -Sum).Sum
+    $totalGrace        = ($activeResults | Measure-Object -Property TransitionGraceMinutes -Sum).Sum
     $totalEligible     = ($activeResults | Measure-Object -Property EligibleMinutes        -Sum).Sum
-    $totalMinutes      = $totalAvailable + $totalUnavailable + $totalUnknownNull + $totalDealloc + $totalPatching + $totalNonExistent
+    $totalMinutes      = $totalAvailable + $totalUnavailable + $totalUnknownNull + $totalDealloc + $totalPatching + $totalNonExistent + $totalGrace
 
     $overallPct = [math]::Round(($totalAvailable / $totalEligible) * 100, 4)
     Write-Host "=== Overall Availability ==="
@@ -607,6 +679,7 @@ else {
     Write-Host "  - User-deallocated                  : $totalDealloc min"
     Write-Host "  - OS patching (planned maintenance) : $totalPatching min"
     Write-Host "  - VM did not exist                  : $totalNonExistent min"
+    Write-Host "  - Transition grace ($TransitionGraceMinutes min tolerance)  : $totalGrace min"
     Write-Host "  = Eligible minutes (denominator)    : $totalEligible min"
     Write-Host "    Of which:"
     Write-Host "      Available (numerator)           : $totalAvailable min"
@@ -637,6 +710,7 @@ foreach ($r in $excludedResults) {
         UserDeallocatedMinutes = $r.UserDeallocatedMinutes
         PatchingMinutes        = $r.PatchingMinutes
         NonExistentMinutes     = $r.NonExistentMinutes
+        TransitionGraceMinutes = $r.TransitionGraceMinutes
         EligibleMinutes        = $r.EligibleMinutes
         AvailabilityPct        = $null
         DeallocWindows         = @()
@@ -686,6 +760,7 @@ foreach ($r in $activeResults) {
         UserDeallocatedMinutes = $r.UserDeallocatedMinutes
         PatchingMinutes        = $r.PatchingMinutes
         NonExistentMinutes     = $r.NonExistentMinutes
+        TransitionGraceMinutes = $r.TransitionGraceMinutes
         EligibleMinutes        = $r.EligibleMinutes
         AvailabilityPct        = $r.AvailabilityPct
         DeallocWindows         = $windowDetails

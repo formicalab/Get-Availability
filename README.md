@@ -27,7 +27,16 @@ Reference: [Calculate the Availability and SLA for Your Azure Solution](https://
 
 # All VMs in the current subscription
 ./get-availability.ps1 -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z"
+
+# Custom grace period (0 disables, max 10)
+./get-availability.ps1 -VMName "web-01" -ResourceGroupName "rg-prod" `
+    -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z" `
+    -TransitionGraceMinutes 3
 ```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-TransitionGraceMinutes` | **2** | Minutes of tolerance after exclusion windows end, to cover metric-emission lag during VM boot. Set to 0 to disable. |
 
 All dates are normalised to UTC internally.
 
@@ -55,6 +64,8 @@ Pairs of **Deallocate Virtual Machine** → **Start Virtual Machine** (Succeeded
 
 If a deallocate event has no matching start, the window extends to the end of the observation period.
 
+**Orphan start events**: If the first event in the period is a Start with no preceding Deallocate, the VM was deallocated before the observation period began. A synthetic window `[startDate, StartTimestamp)` is created to cover the gap.
+
 #### b) OS patching (planned maintenance)
 
 **Install OS update patches on virtual machine** events (Started/Accepted → Succeeded) define patching windows. Both null data points and metric=0 data points inside patching windows are classified as **Patching** and excluded — these represent expected reboots, not unforeseen outages.
@@ -63,20 +74,29 @@ If a deallocate event has no matching start, the window extends to the end of th
 
 **Delete Virtual Machine** → **Create or Update Virtual Machine** (Succeeded) events define non-existence windows. The VM's `TimeCreated` property is used as a fallback to detect first-time creation mid-period (a synthetic `[startDate, TimeCreated)` gap is added if no prior delete exists).
 
-Null data points inside non-existence windows are classified as **NonExistent** and excluded.
+Null **and metric < 1** data points inside non-existence windows are classified as **NonExistent** and excluded.
 
-#### d) Unknown nulls
+#### d) Transition grace period
+
+When a VM boots after deallocation, patching, or creation, the Guest Agent needs 1-3 minutes to reconnect and start reporting metrics. The `TransitionGraceMinutes` parameter (default: 2) extends each exclusion window's trailing edge so these transition minutes are not penalised as unavailable.
+
+- Only applies to null and metric < 1 data points — if the metric is already 1 (available), the minute counts as available regardless.
+- Grace minutes are tracked separately as **TransitionGraceMinutes** and excluded from the denominator.
+- Set to 0 to disable.
+
+#### e) Unknown nulls
 
 Null data points that don't fall into any of the above windows are classified as **UnknownNull** and treated as **unavailable** (potential platform issue).
 
 ### 3. Classification priority
 
-When windows overlap, this priority applies:
+When windows overlap, this priority applies (for both null and metric < 1 data points):
 
 1. **Non-existence** (VM didn't exist)
 2. **User-deallocated** (intentional shutdown)
 3. **OS patching** (planned maintenance)
-4. **Unknown null** (unavailable)
+4. **Transition grace** (within grace period after any of the above)
+5. **Unknown null** (unavailable)
 
 ### 4. Availability formula
 
@@ -89,6 +109,7 @@ Minutes excluded from eligible (denominator):
 - User-deallocated minutes
 - OS patching minutes
 - Non-existent minutes
+- Transition grace minutes
 
 ### 5. Overall availability (multiple VMs)
 
@@ -109,7 +130,17 @@ VMs that were completely inactive for the entire observation period are excluded
 
 Excluded VMs are reported separately and emitted as pipeline objects with `Status = 'Excluded (inactive entire period)'`.
 
-### 7. Service principal name resolution
+### 7. Safeguards
+
+#### Activity Log retention warning
+
+Azure Activity Log retains events for ~90 days. If `StartDate` is older than 89 days ago the script emits a warning, because missing events could cause null metrics to be incorrectly classified as unavailable.
+
+#### Completeness check
+
+After querying metrics, the script compares the number of data points returned against the expected number of 1-minute slots in the period. A mismatch triggers a warning, alerting you to potential gaps in the metric data.
+
+### 8. Service principal name resolution
 
 Deallocation callers that are GUIDs are resolved to display names after parallel processing completes, using a shared cache to avoid duplicate lookups:
 
@@ -131,13 +162,14 @@ A colour-coded summary:
   - User-deallocated                  : 1139 min
   - OS patching (planned maintenance) : 4 min
   - VM did not exist                  : 0 min
-  = Eligible minutes (denominator)    : 79497 min
+  - Transition grace (2 min tolerance): 4 min
+  = Eligible minutes (denominator)    : 79493 min
     Of which:
       Available (numerator)           : 79486 min
-      Unavailable (metric = 0)        : 6 min
-      Unavailable (no metric emitted) : 5 min
+      Unavailable (metric = 0)        : 4 min
+      Unavailable (no metric emitted) : 3 min
 
-  >>> Availability: 99.9862% <<<
+  >>> Availability: 99.9912% <<<
 ```
 
 Colour thresholds: **green** ≥ 99.99%, **yellow** ≥ 99.9%, **red** < 99.9%.
@@ -156,7 +188,8 @@ Per-VM objects for downstream processing (export to CSV, filtering, etc.):
 | `UnknownNullMinutes` | Null minutes not in any exclusion window |
 | `UserDeallocatedMinutes` | Null minutes inside deallocation windows |
 | `PatchingMinutes` | Null/0 minutes inside patching windows |
-| `NonExistentMinutes` | Null minutes inside non-existence windows |
+| `NonExistentMinutes` | Null/0 minutes inside non-existence windows |
+| `TransitionGraceMinutes` | Null/0 minutes within grace period after exclusion windows |
 | `EligibleMinutes` | Denominator for availability % |
 | `AvailabilityPct` | Per-VM availability % |
 | `DeallocWindows` | Array of `{From, To, By}` |
