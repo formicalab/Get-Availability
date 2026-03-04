@@ -291,8 +291,8 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
     # Orphan start: if the first dealloc/start event is a Start without a
     # preceding Deallocate, the VM was deallocated before the query period.
     # Synthesise a window [startDate, firstStartTimestamp).
-    if ($deallocStartEvents -and @($deallocStartEvents).Count -gt 0) {
-        $firstEvt    = @($deallocStartEvents)[0]
+    if ($deallocStartEvents.Count -gt 0) {
+        $firstEvt    = $deallocStartEvents[0]
         $firstOpDisp = $firstEvt.OperationName.ToString()
         $firstOpVal  = $firstEvt.OperationName.Value
         $firstIsStart = $firstOpDisp -in $startPatterns -or $firstOpVal -in $startPatterns
@@ -310,7 +310,7 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
 
     if ($deallocWindows.Count -gt 0) {
         foreach ($w in $deallocWindows) {
-            $who = if ($w.DisplayName) { "$($w.DisplayName) ($($w.Caller))" } else { $w.Caller }
+            $who = $w.DisplayName ? "$($w.DisplayName) ($($w.Caller))" : $w.Caller
             Write-Host "  [$($vm.Name)]   Deallocation window: $($w.From.ToString('u')) -> $($w.To.ToString('u'))  by $who"
         }
     }
@@ -431,102 +431,89 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
     # Release memory from the full event set
     $allEvents = $null
 
-    # Helper: check whether a timestamp falls inside any window.
-    # When $useGrace is true, the trailing edge of each window is extended
-    # by $graceMins minutes to cover metric-emission lag during VM boot.
-    $isInWindow = {
-        param([System.Collections.Generic.List[PSCustomObject]]$windows, [datetime]$ts, [bool]$useGrace)
-        foreach ($w in $windows) {
-            $effectiveTo = if ($useGrace) { $w.To.AddMinutes($graceMins) } else { $w.To }
-            if ($ts -ge $w.From -and $ts -lt $effectiveTo) { return $true }
-        }
-        return $false
+    # -----------------------------------------------------------------
+    # 2. Pre-compute HashSets for O(1) window membership checks
+    # -----------------------------------------------------------------
+    $minuteTicks = [TimeSpan]::FromMinutes(1).Ticks
+
+    $setNonExist      = [System.Collections.Generic.HashSet[long]]::new()
+    $setDealloc       = [System.Collections.Generic.HashSet[long]]::new()
+    $setPatch         = [System.Collections.Generic.HashSet[long]]::new()
+    $setNonExistGrace = [System.Collections.Generic.HashSet[long]]::new()
+    $setDeallocGrace  = [System.Collections.Generic.HashSet[long]]::new()
+    $setPatchGrace    = [System.Collections.Generic.HashSet[long]]::new()
+
+    foreach ($w in $nonExistWindows) {
+        $t = $w.From.Ticks - ($w.From.Ticks % $minuteTicks)
+        $endTicks = $w.To.Ticks
+        while ($t -lt $endTicks)      { $null = $setNonExist.Add($t);      $t += $minuteTicks }
+        $graceEndTicks = $w.To.AddMinutes($graceMins).Ticks
+        while ($t -lt $graceEndTicks) { $null = $setNonExistGrace.Add($t); $t += $minuteTicks }
+    }
+    foreach ($w in $deallocWindows) {
+        $t = $w.From.Ticks - ($w.From.Ticks % $minuteTicks)
+        $endTicks = $w.To.Ticks
+        while ($t -lt $endTicks)      { $null = $setDealloc.Add($t);      $t += $minuteTicks }
+        $graceEndTicks = $w.To.AddMinutes($graceMins).Ticks
+        while ($t -lt $graceEndTicks) { $null = $setDeallocGrace.Add($t); $t += $minuteTicks }
+    }
+    foreach ($w in $patchWindows) {
+        $t = $w.From.Ticks - ($w.From.Ticks % $minuteTicks)
+        $endTicks = $w.To.Ticks
+        while ($t -lt $endTicks)      { $null = $setPatch.Add($t);      $t += $minuteTicks }
+        $graceEndTicks = $w.To.AddMinutes($graceMins).Ticks
+        while ($t -lt $graceEndTicks) { $null = $setPatchGrace.Add($t); $t += $minuteTicks }
     }
 
     # -----------------------------------------------------------------
-    # 2. Query the VmAvailabilityMetric
+    # 3. Query the VmAvailabilityMetric
     # -----------------------------------------------------------------
     Write-Host "  [$($vm.Name)] Querying VmAvailabilityMetric..."
 
-    $metricParams = @{
-        ResourceId      = $vm.Id
-        MetricName      = $metricName
-        TimeGrain       = [TimeSpan]::FromMinutes($timeGrainMins)
-        StartTime       = $startDate
-        EndTime         = $endDate
-        AggregationType = 'Minimum'
-    }
-
-    $metric = Get-AzMetric @metricParams -WarningAction SilentlyContinue
+    $metric = Get-AzMetric -ResourceId $vm.Id -MetricName $metricName `
+        -TimeGrain ([TimeSpan]::FromMinutes($timeGrainMins)) `
+        -StartTime $startDate -EndTime $endDate `
+        -AggregationType 'Minimum' -WarningAction SilentlyContinue
 
     # -----------------------------------------------------------------
-    # 3. Classify each 1-minute data point
+    # 4. Classify each 1-minute data point
     # -----------------------------------------------------------------
-    $availableMinutes         = 0
-    $unavailableMinutes       = 0
-    $userDeallocatedMinutes   = 0   # null/0 inside a known deallocation window
-    $patchingMinutes          = 0   # null/0 inside a known OS patching window
-    $nonExistentMinutes       = 0   # null/0 inside a known non-existence window
-    $unknownNullMinutes       = 0   # null but NOT in any known window → unavailable
-    $transitionGraceMinutes   = 0   # null/0 caught by the trailing grace period
-    $totalDataPoints          = 0   # for completeness sanity check
+    $availableMinutes       = 0
+    $unavailableMinutes     = 0
+    $userDeallocatedMinutes = 0
+    $patchingMinutes        = 0
+    $nonExistentMinutes     = 0
+    $unknownNullMinutes     = 0
+    $transitionGraceMinutes = 0
+    $totalDataPoints        = 0
 
     foreach ($timeseries in $metric.Timeseries) {
         foreach ($dataPoint in $timeseries.Data) {
             $totalDataPoints++
+            $tsTicks = $dataPoint.TimeStamp.Ticks - ($dataPoint.TimeStamp.Ticks % $minuteTicks)
 
-            if ($null -eq $dataPoint.Minimum) {
-                # Priority: non-existence > deallocation > patching > unknown
-                # First check exact windows, then check with grace extension.
-                if (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $false) {
-                    $nonExistentMinutes++
-                }
-                elseif (& $isInWindow $deallocWindows $dataPoint.TimeStamp $false) {
-                    $userDeallocatedMinutes++
-                }
-                elseif (& $isInWindow $patchWindows $dataPoint.TimeStamp $false) {
-                    $patchingMinutes++
-                }
-                elseif ($graceMins -gt 0 -and (
-                    (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $true) -or
-                    (& $isInWindow $deallocWindows  $dataPoint.TimeStamp $true) -or
-                    (& $isInWindow $patchWindows    $dataPoint.TimeStamp $true)
-                )) {
-                    # Null falls within the grace period after a known window
-                    $transitionGraceMinutes++
-                }
-                else {
-                    # Null outside any known window → treat as unavailable
-                    $unknownNullMinutes++
-                }
-            }
-            elseif ($dataPoint.Minimum -ge 1) {
-                # VM was available — always count, even during grace period
+            if ($dataPoint.Minimum -ge 1) {
+                # VM was available — always count, even inside grace windows
                 $availableMinutes++
+                continue
+            }
+
+            # null or < 1 — check exclusion windows (priority: non-exist > dealloc > patch > grace > unavailable)
+            if     ($setNonExist.Contains($tsTicks)) { $nonExistentMinutes++ }
+            elseif ($setDealloc.Contains($tsTicks))  { $userDeallocatedMinutes++ }
+            elseif ($setPatch.Contains($tsTicks))    { $patchingMinutes++ }
+            elseif ($graceMins -gt 0 -and (
+                $setNonExistGrace.Contains($tsTicks) -or
+                $setDeallocGrace.Contains($tsTicks) -or
+                $setPatchGrace.Contains($tsTicks)
+            )) {
+                $transitionGraceMinutes++
+            }
+            elseif ($null -eq $dataPoint.Minimum) {
+                $unknownNullMinutes++
             }
             else {
-                # Minimum < 1 → VM was unavailable / transitioning
-                # Check all window types (same priority as null)
-                if (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $false) {
-                    $nonExistentMinutes++
-                }
-                elseif (& $isInWindow $deallocWindows $dataPoint.TimeStamp $false) {
-                    $userDeallocatedMinutes++
-                }
-                elseif (& $isInWindow $patchWindows $dataPoint.TimeStamp $false) {
-                    $patchingMinutes++
-                }
-                elseif ($graceMins -gt 0 -and (
-                    (& $isInWindow $nonExistWindows $dataPoint.TimeStamp $true) -or
-                    (& $isInWindow $deallocWindows  $dataPoint.TimeStamp $true) -or
-                    (& $isInWindow $patchWindows    $dataPoint.TimeStamp $true)
-                )) {
-                    # metric < 1 during grace period → transition
-                    $transitionGraceMinutes++
-                }
-                else {
-                    $unavailableMinutes++
-                }
+                $unavailableMinutes++
             }
         }
     }
@@ -540,9 +527,7 @@ $perVmResults = $vms | ForEach-Object -ThrottleLimit $throttleLimit -Parallel {
     # Unknown-null minutes count as unavailable
     $totalUnavailable = $unavailableMinutes + $unknownNullMinutes
     $eligibleMinutes  = $availableMinutes + $totalUnavailable
-    $availabilityPct  = if ($eligibleMinutes -gt 0) {
-        [math]::Round(($availableMinutes / $eligibleMinutes) * 100, 4)
-    } else { $null }
+    $availabilityPct  = $eligibleMinutes -gt 0 ? [math]::Round(($availableMinutes / $eligibleMinutes) * 100, 4) : $null
 
     [PSCustomObject]@{
         VMName                 = $vm.Name
@@ -589,13 +574,6 @@ foreach ($r in $perVmResults) {
             }
             if (-not $resolved) {
                 try {
-                    $sp = Get-AzADServicePrincipal -Filter "appId eq '$($w.Caller)'" -ErrorAction SilentlyContinue |
-                          Select-Object -First 1
-                    if ($sp) { $resolved = $sp.DisplayName }
-                } catch { }
-            }
-            if (-not $resolved) {
-                try {
                     $graphResp = Invoke-AzRestMethod -Uri "https://graph.microsoft.com/v1.0/directoryObjects/$($w.Caller)" -Method GET -ErrorAction SilentlyContinue
                     if ($graphResp.StatusCode -eq 200) {
                         $obj = $graphResp.Content | ConvertFrom-Json
@@ -605,6 +583,7 @@ foreach ($r in $perVmResults) {
             }
             $spNameCache[$w.Caller] = $resolved
             if ($resolved) { $w.DisplayName = $resolved }
+            else { $w.DisplayName ??= $w.Caller }
         }
     }
 }
@@ -662,15 +641,20 @@ if ($activeResults.Count -eq 0) {
     Write-Warning 'All VMs were deallocated for the entire period — no eligible minutes to compute availability.'
 }
 else {
-    $totalAvailable    = ($activeResults | Measure-Object -Property AvailableMinutes       -Sum).Sum
-    $totalUnavailable  = ($activeResults | Measure-Object -Property UnavailableMinutes     -Sum).Sum
-    $totalUnknownNull  = ($activeResults | Measure-Object -Property UnknownNullMinutes     -Sum).Sum
-    $totalDealloc      = ($activeResults | Measure-Object -Property UserDeallocatedMinutes -Sum).Sum
-    $totalPatching     = ($activeResults | Measure-Object -Property PatchingMinutes        -Sum).Sum
-    $totalNonExistent  = ($activeResults | Measure-Object -Property NonExistentMinutes     -Sum).Sum
-    $totalGrace        = ($activeResults | Measure-Object -Property TransitionGraceMinutes -Sum).Sum
-    $totalEligible     = ($activeResults | Measure-Object -Property EligibleMinutes        -Sum).Sum
-    $totalMinutes      = $totalAvailable + $totalUnavailable + $totalUnknownNull + $totalDealloc + $totalPatching + $totalNonExistent + $totalGrace
+    # Sum once via foreach — faster than 8 Measure-Object pipelines
+    $totalAvailable = $totalUnavailable = $totalUnknownNull = 0
+    $totalDealloc = $totalPatching = $totalNonExistent = $totalGrace = $totalEligible = 0
+    foreach ($r in $activeResults) {
+        $totalAvailable   += $r.AvailableMinutes
+        $totalUnavailable += $r.UnavailableMinutes
+        $totalUnknownNull += $r.UnknownNullMinutes
+        $totalDealloc     += $r.UserDeallocatedMinutes
+        $totalPatching    += $r.PatchingMinutes
+        $totalNonExistent += $r.NonExistentMinutes
+        $totalGrace       += $r.TransitionGraceMinutes
+        $totalEligible    += $r.EligibleMinutes
+    }
+    $totalMinutes = $totalAvailable + $totalUnavailable + $totalUnknownNull + $totalDealloc + $totalPatching + $totalNonExistent + $totalGrace
 
     $overallPct = [math]::Round(($totalAvailable / $totalEligible) * 100, 4)
     Write-Host "=== Overall Availability ==="
@@ -687,7 +671,7 @@ else {
     Write-Host "      Unavailable (no metric emitted) : $totalUnknownNull min"
     Write-Host ''
     Write-Host '  >>> Availability: ' -NoNewline
-    $color = if ($overallPct -ge 99.99) { 'Green' } elseif ($overallPct -ge 99.9) { 'Yellow' } else { 'Red' }
+    $color = $overallPct -ge 99.99 ? 'Green' : ($overallPct -ge 99.9 ? 'Yellow' : 'Red')
     Write-Host "$overallPct%" -ForegroundColor $color -NoNewline
     Write-Host ' <<<'
 }
@@ -698,62 +682,31 @@ else {
 # ---------------------------------------------------------------------------
 # Return structured objects for pipeline consumers
 # ---------------------------------------------------------------------------
-# Excluded VMs first (with status marker)
-foreach ($r in $excludedResults) {
-    [PSCustomObject]@{
-        VMName                 = $r.VMName
-        ResourceGroupName      = $r.ResourceGroupName
-        Status                 = 'Excluded (inactive entire period)'
-        AvailableMinutes       = $r.AvailableMinutes
-        UnavailableMinutes     = $r.UnavailableMinutes
-        UnknownNullMinutes     = $r.UnknownNullMinutes
-        UserDeallocatedMinutes = $r.UserDeallocatedMinutes
-        PatchingMinutes        = $r.PatchingMinutes
-        NonExistentMinutes     = $r.NonExistentMinutes
-        TransitionGraceMinutes = $r.TransitionGraceMinutes
-        EligibleMinutes        = $r.EligibleMinutes
-        AvailabilityPct        = $null
-        DeallocWindows         = @()
-        PatchWindows           = @()
-        NonExistWindows        = @()
-    }
-}
+# Emit excluded VMs first, then active — single unified loop
+$isExcludedSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]($excludedResults | ForEach-Object { $_.VMName + '|' + $_.ResourceGroupName }),
+    [StringComparer]::OrdinalIgnoreCase
+)
 
-# Active VMs
-foreach ($r in $activeResults) {
-    $windowDetails = if ($r.DeallocWindows -and $r.DeallocWindows.Count -gt 0) {
+foreach ($r in @($excludedResults) + @($activeResults)) {
+    $excluded = $isExcludedSet.Contains($r.VMName + '|' + $r.ResourceGroupName)
+
+    $windowDetails = $excluded ? @() : @(
         $r.DeallocWindows | ForEach-Object {
-            $who = if ($_.DisplayName) { "$($_.DisplayName) ($($_.Caller))" } else { $_.Caller }
             [PSCustomObject]@{
                 From = $_.From
                 To   = $_.To
-                By   = $who
+                By   = $_.DisplayName ? "$($_.DisplayName) ($($_.Caller))" : $_.Caller
             }
         }
-    } else { @() }
-
-    $patchDetails = if ($r.PatchWindows -and $r.PatchWindows.Count -gt 0) {
-        $r.PatchWindows | ForEach-Object {
-            [PSCustomObject]@{
-                From = $_.From
-                To   = $_.To
-            }
-        }
-    } else { @() }
-
-    $nonExistDetails = if ($r.NonExistWindows -and $r.NonExistWindows.Count -gt 0) {
-        $r.NonExistWindows | ForEach-Object {
-            [PSCustomObject]@{
-                From = $_.From
-                To   = $_.To
-            }
-        }
-    } else { @() }
+    )
+    $patchDetails    = $excluded ? @() : @($r.PatchWindows    | ForEach-Object { [PSCustomObject]@{ From = $_.From; To = $_.To } })
+    $nonExistDetails = $excluded ? @() : @($r.NonExistWindows | ForEach-Object { [PSCustomObject]@{ From = $_.From; To = $_.To } })
 
     [PSCustomObject]@{
         VMName                 = $r.VMName
         ResourceGroupName      = $r.ResourceGroupName
-        Status                 = 'Active'
+        Status                 = $excluded ? 'Excluded (inactive entire period)' : 'Active'
         AvailableMinutes       = $r.AvailableMinutes
         UnavailableMinutes     = $r.UnavailableMinutes
         UnknownNullMinutes     = $r.UnknownNullMinutes
@@ -762,7 +715,7 @@ foreach ($r in $activeResults) {
         NonExistentMinutes     = $r.NonExistentMinutes
         TransitionGraceMinutes = $r.TransitionGraceMinutes
         EligibleMinutes        = $r.EligibleMinutes
-        AvailabilityPct        = $r.AvailabilityPct
+        AvailabilityPct        = $excluded ? $null : $r.AvailabilityPct
         DeallocWindows         = $windowDetails
         PatchWindows           = $patchDetails
         NonExistWindows        = $nonExistDetails
