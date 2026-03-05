@@ -11,7 +11,7 @@ Reference: [Calculate the Availability and SLA for Your Azure Solution](https://
 | Requirement | Detail |
 |---|---|
 | **PowerShell** | 7.0 or later |
-| **Az modules** | `Az.Accounts`, `Az.Compute`, `Az.Monitor`, `Az.Resources` |
+| **Az modules** | `Az.Accounts`, `Az.Compute`, `Az.Monitor` |
 | **Azure context** | `Connect-AzAccount` must be run before the script |
 
 ## Usage
@@ -60,7 +60,7 @@ A null metric alone does not tell us *why* the VM wasn't running. The script que
 
 #### a) User-initiated deallocations
 
-Pairs of **Deallocate Virtual Machine** → **Start Virtual Machine** (Succeeded) events define deallocation windows. Null data points inside these windows are classified as **UserDeallocated** and excluded from the denominator.
+Pairs of **Deallocate Virtual Machine** (Started/Accepted) → **Start Virtual Machine** (Succeeded) events define deallocation windows. The window starts at the earliest deallocate event (Started or Accepted), not Succeeded, because during a user-initiated shutdown the metric transitions 1 → 0 → null — the metric=0 minutes between Started and Succeeded represent active shutdown, not platform-initiated unavailability. Null and metric=0 data points inside these windows are classified as **UserDeallocated** and excluded from the denominator.
 
 If a deallocate event has no matching start, the window extends to the end of the observation period.
 
@@ -123,12 +123,17 @@ This means a VM that was running longer carries proportionally more weight.
 
 ### 6. VM exclusion
 
-VMs that were completely inactive for the entire observation period are excluded from the overall calculation:
+VMs that provide no usable availability data are excluded from the overall calculation. Two categories are distinguished:
 
-- **All eligible minutes = 0** — deallocation/patching/non-existence windows covered the full period
-- **No real metric signals** (no 1s, no 0s — all nulls) **and no Activity Log events** — the VM was deallocated before the observation period started
+#### a) Anomaly VMs (no metric reported)
 
-Excluded VMs are reported separately and emitted as pipeline objects with `Status = 'Excluded (inactive entire period)'`.
+VMs where **neither metric = 1 nor metric = 0** was ever emitted during the entire period (all data points were null). These may be VMs that were deallocated before the period started, or running VMs with metric collection issues. They are reported with `Status = 'Excluded (no metric reported — anomaly)'`.
+
+#### b) Inactive VMs (fully covered by exclusion windows)
+
+VMs where **eligible minutes = 0** because deallocation, patching, and/or non-existence windows covered the full period. Some real metric signals (0 or 1) were observed, but all non-excluded time was accounted for. They are reported with `Status = 'Excluded (inactive entire period)'`.
+
+Both categories are reported separately in the console output and emitted as pipeline objects for downstream processing.
 
 ### 7. Safeguards
 
@@ -142,12 +147,12 @@ After querying metrics, the script compares the number of data points returned a
 
 ### 8. Service principal name resolution
 
-Deallocation callers that are GUIDs are resolved to display names after parallel processing completes, using a shared cache to avoid duplicate lookups:
+Deallocation callers that are GUIDs are resolved to display names after parallel processing completes, using the Microsoft Graph API via `Invoke-AzRestMethod` and a shared cache to avoid duplicate lookups:
 
-1. `Get-AzADServicePrincipal -ObjectId`
-2. `Get-AzADServicePrincipal -ApplicationId`
-3. `Get-AzADServicePrincipal -Filter "appId eq '...'"` 
-4. Graph API `directoryObjects` fallback
+1. **Batch resolve** — `POST /v1.0/directoryObjects/getByIds` (up to 1000 IDs per call, covering users, service principals, groups, and applications)
+2. **appId fallback** — `GET /v1.0/servicePrincipals?$filter=appId eq '...'` for GUIDs that represent Application/Client IDs rather than Object IDs
+
+Resolved names are shown in deallocation window output as `displayName (guid)` for traceability.
 
 ## Output
 
@@ -157,7 +162,7 @@ A colour-coded summary:
 
 ```
 === Overall Availability ===
-    VMs assessed (active)            : 2 of 3 total
+    VMs assessed (active)            : 2 of 3 total (0 anomaly, 1 inactive)
     Total minutes in period           : 80640 min
   - User-deallocated                  : 1139 min
   - OS patching (planned maintenance) : 4 min
@@ -176,13 +181,18 @@ Colour thresholds: **green** ≥ 99.99%, **yellow** ≥ 99.9%, **red** < 99.9%.
 
 ### Pipeline objects
 
-Per-VM objects for downstream processing (export to CSV, filtering, etc.):
+Per-VM objects for downstream processing (export to CSV, filtering, etc.).
+
+The default table view shows **VMName**, **ResourceGroupName**, **Location**, **Placement**, **Status**, **EligibleMinutes**, and **AvailabilityPct**. All other properties are accessible via `Select-Object`, `Format-List`, or export commands.
 
 | Property | Description |
 |---|---|
 | `VMName` | VM name |
 | `ResourceGroupName` | Resource group |
-| `Status` | `Active` or `Excluded (inactive entire period)` |
+| `Location` | Azure region (e.g. `westeurope`) |
+| `Zones` | Availability zone number(s), or `$null` for regional VMs |
+| `Placement` | `Zonal (1)` / `Zonal (1,2)` or `Regional` |
+| `Status` | `Active`, `Excluded (inactive entire period)`, or `Excluded (no metric reported — anomaly)` |
 | `AvailableMinutes` | Minutes with metric ≥ 1 |
 | `UnavailableMinutes` | Minutes with metric < 1 (outside patching) |
 | `UnknownNullMinutes` | Null minutes not in any exclusion window |
