@@ -15,8 +15,8 @@
       AvailabilityPct = AvailableMinutes / EligibleMinutes * 100
 
     For VMs with null VmAvailabilityMetric data points during eligible minutes,
-    supplementary guest-level metrics (CPU, Network, Disk) are checked. A gap
-    minute is recovered only if ALL 5 metrics report non-null data.
+    supplementary guest-level metrics (CPU, Network) are checked inline. A gap
+    minute is recovered only if BOTH metrics report non-null data.
 
 .PARAMETER SubscriptionNames
     One or more Azure subscription display names.
@@ -24,8 +24,8 @@
 .PARAMETER ResourceName
     Optional single resource to report on (server/db format for SQL DBs).
 
-.PARAMETER TransitionBufferMinutes
-    Symmetric buffer (+-N) around each start/stop event. Default 5.
+.PARAMETER TransitionToleranceMinutes
+    Symmetric tolerance (+-N) around each start/stop event. Default 5.
 
 .EXAMPLE
     ./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE'
@@ -41,12 +41,15 @@ param(
     [string[]]$SubscriptionNames,
 
     [ValidateRange(1, 64)]
-    [int]$Parallelism = 8,
+    [int]$Parallelism = [math]::Max(4, [math]::Min(16, [Environment]::ProcessorCount)),
 
     [string]$ResourceName,
 
+    [ValidateSet('vm','sql','storage')]
+    [string[]]$ResourceKinds = @('vm','sql','storage'),
+
     [ValidateRange(0, 120)]
-    [int]$TransitionBufferMinutes = 5
+    [int]$TransitionToleranceMinutes = 5
 )
 
 Set-StrictMode -Version Latest
@@ -263,14 +266,14 @@ resourcechanges
     @($allEvents)
 }
 
-# ── Availability metric retrieval (parallel) ─────────────────────────────────
+# ── Availability metric retrieval (parallel, inline computation) ──────────────
 
 function Get-AvailabilityMetrics([object[]]$Resources, [datetime]$StartDate, [datetime]$EndDate, [int]$ThrottleLimit, [string]$ArmToken) {
     $total = $Resources.Count
     Write-Host "Querying metrics for $total resource(s) with parallelism $ThrottleLimit..."
 
     $done = 0
-    $dpLookup = @{}; $nullLookup = @{}
+    $resultByRes = @{}
 
     $Resources | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         $resource = $_
@@ -281,9 +284,20 @@ function Get-AvailabilityMetrics([object[]]$Resources, [datetime]$StartDate, [da
         $isVm      = $resource.Kind -eq 'VirtualMachine'
         $isStorage = $resource.Kind -eq 'StorageAccount'
 
+        # Build HashSet of excluded minute ticks for O(1) lookup
+        $exclFrom  = @($resource._ExclFrom)
+        $exclTo    = @($resource._ExclTo)
+        $ticksPerMin = [TimeSpan]::TicksPerMinute
+        $excludedTicks = [System.Collections.Generic.HashSet[long]]::new()
+        for ($i = 0; $i -lt $exclFrom.Count; $i++) {
+            $t = [long]$exclFrom[$i]
+            $end = [long]$exclTo[$i]
+            while ($t -lt $end) { [void]$excludedTicks.Add($t); $t += $ticksPerMin }
+        }
+
         if ($isVm) {
-            $metricNames = 'VmAvailabilityMetric'
-            $agg = 'Minimum'
+            $metricNames = 'VmAvailabilityMetric,Percentage CPU,Network In Total'
+            $agg = 'Minimum,Average'
         } elseif ($isStorage) {
             $metricNames = 'Availability,Transactions'
             $agg = 'Minimum,Total'
@@ -296,13 +310,17 @@ function Get-AvailabilityMetrics([object[]]$Resources, [datetime]$StartDate, [da
                "api-version=2024-02-01&metricnames=$([uri]::EscapeDataString($metricNames))" +
                "&timespan=$startIso/$endIso&interval=PT1M&aggregation=$agg"
 
-        $dataPoints     = [System.Collections.Generic.List[object]]::new()
-        $nullTimestamps = [System.Collections.Generic.List[datetime]]::new()
-
-        $response = $null
+        # Use Invoke-WebRequest + System.Text.Json instead of Invoke-RestMethod to avoid
+        # deserializing ~60K data points into costly PSObject trees. JsonDocument uses pooled
+        # memory and is disposable — peak per-response memory drops from ~30-50 MB to ~2-5 MB.
+        $jsonBody = $null
         for ($attempt = 1; $attempt -le 5; $attempt++) {
             try {
-                $response = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $token" } -Method GET
+                $oldPref = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+                try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ Authorization = "Bearer $token" } -Method GET -UseBasicParsing }
+                finally { $ProgressPreference = $oldPref }
+                $jsonBody = $resp.Content
+                $resp = $null
                 break
             }
             catch {
@@ -318,128 +336,128 @@ function Get-AvailabilityMetrics([object[]]$Resources, [datetime]$StartDate, [da
             }
         }
 
-        if ($response -and $response.value) {
-            if ($isStorage) {
-                # Build lookup: minute -> Transactions total
-                $txByMinute = @{}
-                $txMetric = $response.value | Where-Object { $_.name.value -eq 'Transactions' }
-                if ($txMetric) {
-                    foreach ($ts in $txMetric.timeseries) {
-                        foreach ($dp in $ts.data) {
-                            $time = [DateTime]::SpecifyKind([datetime]$dp.timeStamp, [DateTimeKind]::Utc)
-                            $tot = $dp.PSObject.Properties['total']
-                            if ($tot -and $null -ne $tot.Value) { $txByMinute[$time] = [double]$tot.Value }
-                        }
+        [double]$availSum = 0.0
+        [int]$recovered = 0
+        [int]$zeroTxMin = 0
+
+        if ($jsonBody) {
+            $doc = $null
+            try {
+                $doc = [System.Text.Json.JsonDocument]::Parse($jsonBody)
+                $jsonBody = $null  # release the string immediately
+
+                $jNull = [System.Text.Json.JsonValueKind]::Null
+                $jNum  = [System.Text.Json.JsonValueKind]::Number
+
+                # Safe numeric extraction: data points may omit aggregation keys entirely
+                function script:GetNum([System.Text.Json.JsonElement]$dp, [string]$prop) {
+                    foreach ($p in $dp.EnumerateObject()) {
+                        if ($p.Name -eq $prop -and $p.Value.ValueKind -eq $jNum) { return $p.Value.GetDouble() }
                     }
+                    return $null
                 }
-                # Process Availability metric: only use value when Transactions > 0
-                $availMetric = $response.value | Where-Object { $_.name.value -eq 'Availability' }
-                if ($availMetric) {
-                    foreach ($ts in $availMetric.timeseries) {
-                        foreach ($dp in $ts.data) {
-                            $time = [DateTime]::SpecifyKind([datetime]$dp.timeStamp, [DateTimeKind]::Utc)
-                            $hasTx = $txByMinute.ContainsKey($time) -and $txByMinute[$time] -gt 0
-                            if ($hasTx -and $null -ne $dp.minimum) {
-                                $dataPoints.Add([PSCustomObject]@{ Timestamp = $time; Value = [double]$dp.minimum / 100.0 })
-                            } elseif (-not $hasTx) {
-                                # Zero transactions → not eligible for availability measurement
-                                $nullTimestamps.Add($time)
+
+                $valueArr = $doc.RootElement.GetProperty('value')
+                if ($isStorage) {
+                    # First pass: build Transactions lookup
+                    $txByTicks = [System.Collections.Generic.Dictionary[long,double]]::new()
+                    foreach ($metricEl in $valueArr.EnumerateArray()) {
+                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
+                        if ($mName -ne 'Transactions') { continue }
+                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
+                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
+                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
+                                $tot = GetNum $dp 'total'
+                                if ($null -ne $tot) { $txByTicks[$time.Ticks] = $tot }
                             }
                         }
                     }
-                }
-            } else {
-                $scale100 = -not $isVm  # SQL DB reports 0-100
-                foreach ($ts in $response.value[0].timeseries) {
-                    foreach ($dp in $ts.data) {
-                        $time = [DateTime]::SpecifyKind([datetime]$dp.timeStamp, [DateTimeKind]::Utc)
-                        if ($null -ne $dp.minimum) {
-                            $val = [double]$dp.minimum
-                            if ($scale100) { $val /= 100.0 }
-                            $dataPoints.Add([PSCustomObject]@{ Timestamp = $time; Value = $val })
-                        } else {
-                            $nullTimestamps.Add($time)
+                    # Second pass: process Availability
+                    foreach ($metricEl in $valueArr.EnumerateArray()) {
+                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
+                        if ($mName -ne 'Availability') { continue }
+                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
+                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
+                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
+                                $ticks = $time.Ticks
+                                $txVal = [double]0
+                                $hasTx = $txByTicks.TryGetValue($ticks, [ref]$txVal) -and $txVal -gt 0
+                                $minVal = GetNum $dp 'minimum'
+                                if ($hasTx -and $null -ne $minVal) {
+                                    if (-not $excludedTicks.Contains($ticks)) { $availSum += $minVal / 100.0 }
+                                } elseif (-not $hasTx) {
+                                    if (-not $excludedTicks.Contains($ticks)) { $zeroTxMin++ }
+                                }
+                            }
                         }
                     }
+                    $txByTicks = $null
+                } else {
+                    # VM or SQL DB
+                    $suppByMinute = @{}
+                    $nullTicks = [System.Collections.Generic.List[long]]::new()
+                    foreach ($metricEl in $valueArr.EnumerateArray()) {
+                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
+                        $isPrimary = $mName -eq 'VmAvailabilityMetric' -or $mName -eq 'Availability'
+                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
+                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
+                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
+                                $ticks = $time.Ticks
+                                if ($isPrimary) {
+                                    $minVal = GetNum $dp 'minimum'
+                                    if ($null -ne $minVal) {
+                                        if (-not $isVm) { $minVal /= 100.0 }
+                                        if (-not $excludedTicks.Contains($ticks)) { $availSum += $minVal }
+                                    } else {
+                                        $nullTicks.Add($ticks)
+                                    }
+                                } elseif ($isVm) {
+                                    $avgVal = GetNum $dp 'average'
+                                    if ($null -ne $avgVal) {
+                                        $tsKey = $time.ToString('yyyy-MM-dd HH:mm')
+                                        $suppByMinute[$tsKey] = ($suppByMinute[$tsKey] ?? 0) + 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    # Inline gap recovery (VMs only, require both CPU + Network)
+                    if ($isVm -and $nullTicks.Count -gt 0) {
+                        foreach ($nt in $nullTicks) {
+                            if (-not $excludedTicks.Contains($nt)) {
+                                $ts = [datetime]::new($nt, [DateTimeKind]::Utc)
+                                if (($suppByMinute[$ts.ToString('yyyy-MM-dd HH:mm')] ?? 0) -ge 2) {
+                                    $recovered++; $availSum += 1.0
+                                }
+                            }
+                        }
+                    }
+                    $suppByMinute = $null; $nullTicks = $null
                 }
             }
+            finally {
+                if ($doc) { $doc.Dispose() }
+            }
         }
+        $excludedTicks = $null
 
         [PSCustomObject]@{
-            ResourceId     = $resource.ResourceId
-            Name           = $resource.Name
-            DataPoints     = @($dataPoints)
-            NullTimestamps = @($nullTimestamps)
+            ResourceId   = $resource.ResourceId
+            Name         = $resource.Name
+            AvailableSum = $availSum
+            Recovered    = $recovered
+            ZeroTxMin    = $zeroTxMin
         }
     } | ForEach-Object {
         $done++
         $key = $_.ResourceId.ToLowerInvariant()
-        $dpLookup[$key]   = $_.DataPoints
-        $nullLookup[$key] = $_.NullTimestamps
+        $resultByRes[$key] = $_
         Write-Progress -Activity 'Querying metrics' `
             -Status "[$done / $total] $($_.Name)" `
             -PercentComplete ([math]::Min(100, $done / $total * 100))
     }
     Write-Progress -Activity 'Querying metrics' -Completed
-    [PSCustomObject]@{ DataPoints = $dpLookup; NullTimestamps = $nullLookup }
-}
-
-function Get-SupplementaryRecovery([object[]]$Items, [int]$ThrottleLimit, [string]$ArmToken) {
-    # $Items = array of @{ Resource; GapTimestamps } — VMs with null primary-metric minutes
-    $total = $Items.Count
-    Write-Host "  Recovering gaps for $total VM(s) in parallel..."
-    $done = 0
-    $suppLookup = @{}
-
-    $Items | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-        $item = $_
-        $resource = $item.Resource
-        $gapTimestamps = $item.GapTimestamps
-        $token = $using:ArmToken
-
-        $minTs = ($gapTimestamps | Measure-Object -Minimum).Minimum.AddMinutes(-2)
-        $maxTs = ($gapTimestamps | Measure-Object -Maximum).Maximum.AddMinutes(2)
-        $timespan = "$($minTs.ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($maxTs.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
-
-        $metricNames = 'Percentage CPU,Network In Total,Network Out Total,Disk Read Bytes,Disk Write Bytes'
-        $uri = "https://management.azure.com$($resource.ResourceId)/providers/Microsoft.Insights/metrics?" +
-               "api-version=2024-02-01&metricnames=$([uri]::EscapeDataString($metricNames))" +
-               "&timespan=$timespan&interval=PT1M&aggregation=Average&metricnamespace=microsoft.compute/virtualmachines"
-
-        $gapSet = [System.Collections.Generic.HashSet[string]]::new()
-        foreach ($ts in $gapTimestamps) { $null = $gapSet.Add($ts.ToString('yyyy-MM-dd HH:mm')) }
-
-        $countByMinute = @{}
-        try {
-            $response = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $token" } -Method GET
-            if ($response -and $response.value) {
-                foreach ($metric in $response.value) {
-                    $minutesSeen = [System.Collections.Generic.HashSet[string]]::new()
-                    foreach ($ts in $metric.timeseries) {
-                        foreach ($dp in $ts.data) {
-                            $avg = $dp.PSObject.Properties['average']
-                            if ($avg -and $null -ne $avg.Value) {
-                                $tsKey = ([datetime]$dp.timeStamp).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')
-                                if ($gapSet.Contains($tsKey)) { $null = $minutesSeen.Add($tsKey) }
-                            }
-                        }
-                    }
-                    foreach ($tsKey in $minutesSeen) {
-                        $countByMinute[$tsKey] = ($countByMinute[$tsKey] ?? 0) + 1
-                    }
-                }
-            }
-        } catch { }
-
-        [PSCustomObject]@{ ResourceId = $resource.ResourceId; Name = $resource.Name; CountByMinute = $countByMinute }
-    } | ForEach-Object {
-        $done++
-        $key = $_.ResourceId.ToLowerInvariant()
-        $suppLookup[$key] = $_.CountByMinute
-        Write-Progress -Activity 'Recovering VM gaps' -Status "[$done / $total] $($_.Name)" -PercentComplete ($done / $total * 100)
-    }
-    Write-Progress -Activity 'Recovering VM gaps' -Completed
-    $suppLookup
+    $resultByRes
 }
 
 # ── Eligibility calculation per resource ─────────────────────────────────────
@@ -452,7 +470,7 @@ function Get-ResourceEligibilityResult {
         [datetime]$PeriodEnd,
         [int]$TotalMinutes,
         [string]$CurrentPowerState = 'Unknown',
-        [int]$TransitionBufferMinutes = 5
+        [int]$TransitionToleranceMinutes = 5
     )
 
     $sortedEvents = @($Events | Sort-Object EventTimestamp)
@@ -502,8 +520,8 @@ function Get-ResourceEligibilityResult {
     }
     if ($pendingStop) { Add-Window $stoppedWindows $pendingStop $PeriodEnd $PeriodStart $PeriodEnd }
 
-    # Symmetric +-N buffer around every power event
-    $buf = [TimeSpan]::FromMinutes($TransitionBufferMinutes)
+    # Symmetric +-N tolerance around every power event
+    $buf = [TimeSpan]::FromMinutes($TransitionToleranceMinutes)
     foreach ($pe in $powerEvents) {
         Add-Window $stoppedWindows ($pe.Time - $buf) ($pe.Time + $buf) $PeriodStart $PeriodEnd
     }
@@ -560,12 +578,13 @@ function Get-ResourceEligibilityResult {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
 $now      = [datetime]::UtcNow
 $utcEnd   = [datetime]::new($now.Year, $now.Month, $now.Day, $now.Hour, $now.Minute, 0, [DateTimeKind]::Utc)
 $utcStart = $utcEnd.AddDays(-14)
 $period   = [PSCustomObject]@{ Start = $utcStart; End = $utcEnd; TotalMinutes = [int](($utcEnd - $utcStart).TotalMinutes) }
 
-Write-Host "Window: $($period.Start.ToString('u')) -> $($period.End.ToString('u')) ($($period.TotalMinutes) min, buffer: +/-$TransitionBufferMinutes min)"
+Write-Host "Window: $($period.Start.ToString('u')) -> $($period.End.ToString('u')) ($($period.TotalMinutes) min, tolerance: +/-$TransitionToleranceMinutes min)"
 
 # Resolve all subscriptions up front
 $allAzSubs = @(Get-AzSubscription)
@@ -583,7 +602,11 @@ Write-Host "Processing $($resolvedSubs.Count) subscription(s): $($resolvedSubs.N
 Write-Host 'Querying resource inventory...'
 $resources = Get-CurrentTrackedResources $subIds $subIdToName
 if ($resources.Count -eq 0) { Write-Warning 'No VMs or SQL databases found.'; return }
-Write-Host "  Found $($resources.Count) resource(s) across $($resolvedSubs.Count) subscription(s)."
+# Filter by requested resource kinds
+$kindMap = @{ 'vm' = 'VirtualMachine'; 'sql' = 'AzureSqlDatabase'; 'storage' = 'StorageAccount' }
+$selectedKinds = @($ResourceKinds | ForEach-Object { $kindMap[$_] })
+$resources = @($resources | Where-Object Kind -in $selectedKinds)
+Write-Host "  Found $($resources.Count) resource(s) across $($resolvedSubs.Count) subscription(s) (kinds: $($ResourceKinds -join ', '))."
 
 if ($ResourceName) {
     $resources = @($resources | Where-Object Name -eq $ResourceName)
@@ -598,114 +621,64 @@ $allEvents = Get-ResourceChangeEvents $subIds $period.Start $period.End
 # Single ARM token (tenant/management-plane scoped, works across all subscriptions)
 $rawToken = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com').Token
 $armToken = ($rawToken -is [securestring]) ? ($rawToken | ConvertFrom-SecureString -AsPlainText) : [string]$rawToken
+$rawToken = $null
 
-# Single parallel metric pool across all resources from all subscriptions
-$metrics    = Get-AvailabilityMetrics $resources $period.Start $period.End $Parallelism $armToken
-$availByRes = $metrics.DataPoints
-$nullByRes  = $metrics.NullTimestamps
-
+# Group events by resource, then release raw events list
 $eventsByRes = @{}
 foreach ($evt in $allEvents) {
     $key = $evt.ResourceId.ToLowerInvariant()
     if (-not $eventsByRes.ContainsKey($key)) { $eventsByRes[$key] = [System.Collections.Generic.List[object]]::new() }
     $eventsByRes[$key].Add($evt)
 }
+$allEvents = $null
+
+# Pre-compute eligibility (exclusion windows) before metric fetch
+Write-Host 'Computing eligibility...'
+$eligByRes = @{}
+foreach ($res in $resources) {
+    $key = $res.ResourceId.ToLowerInvariant()
+    $elig = Get-ResourceEligibilityResult -Resource $res `
+        -Events ($eventsByRes.ContainsKey($key) ? @($eventsByRes[$key]) : @()) `
+        -PeriodStart $period.Start -PeriodEnd $period.End -TotalMinutes $period.TotalMinutes `
+        -CurrentPowerState ($res.CurrentPowerState ? $res.CurrentPowerState : 'Unknown') `
+        -TransitionToleranceMinutes $TransitionToleranceMinutes
+    $eligByRes[$key] = $elig
+    # Attach exclusion windows as tick arrays for efficient serialization into parallel runspaces
+    $res | Add-Member -NotePropertyName _ExclFrom -NotePropertyValue @($elig.ExclusionWindows | ForEach-Object { $_.From.Ticks }) -Force
+    $res | Add-Member -NotePropertyName _ExclTo   -NotePropertyValue @($elig.ExclusionWindows | ForEach-Object { $_.To.Ticks })   -Force
+}
+$eventsByRes = $null
+
+# Fetch metrics and compute availability inline (no large data arrays cross the parallel boundary)
+$metricResults = Get-AvailabilityMetrics $resources $period.Start $period.End $Parallelism $armToken
 
 Update-TypeData -TypeName ResourceEligibilityResult -DefaultDisplayPropertySet @(
     'SubscriptionName','Name','Kind','Location','AvailabilityPct','AvailableMinutes','EligibleMinutes','TotalMinutes','Explanation'
 ) -Force
 
-# Pass 1: eligibility + primary metric availability + collect non-excluded gaps
-Write-Host 'Computing availability...'
-$idx = 0
-$pass1 = foreach ($res in $resources) {
-    $idx++
-    Write-Progress -Activity 'Computing availability' -Status "[$idx / $($resources.Count)] $($res.SubscriptionName) / $($res.Name)" -PercentComplete ($idx / $resources.Count * 100)
-
+# Assemble final results from pre-computed eligibility + metric scalars
+$results = foreach ($res in $resources) {
     $key = $res.ResourceId.ToLowerInvariant()
-    $result = Get-ResourceEligibilityResult -Resource $res `
-        -Events ($eventsByRes.ContainsKey($key) ? @($eventsByRes[$key]) : @()) `
-        -PeriodStart $period.Start -PeriodEnd $period.End -TotalMinutes $period.TotalMinutes `
-        -CurrentPowerState ($res.CurrentPowerState ? $res.CurrentPowerState : 'Unknown') `
-        -TransitionBufferMinutes $TransitionBufferMinutes
+    $elig = $eligByRes[$key]
+    $mr   = $metricResults.ContainsKey($key) ? $metricResults[$key] : $null
 
-    $dps  = $availByRes.ContainsKey($key) ? $availByRes[$key] : @()
-    $excl = $result.ExclusionWindows
-    [double]$availSum = 0.0
-    foreach ($dp in $dps) {
-        $dpEnd = $dp.Timestamp.AddMinutes(1)
-        $hit = $false
-        foreach ($w in $excl) { if ($w.From -lt $dpEnd -and $w.To -gt $dp.Timestamp) { $hit = $true; break } }
-        if (-not $hit) { $availSum += $dp.Value }
+    if ($mr -and $mr.Recovered -gt 0) {
+        Write-Host "  [$($res.Name)] Recovered $($mr.Recovered) gap min via supplementary metrics"
+    }
+    if ($mr -and $mr.ZeroTxMin -gt 0 -and $res.Kind -eq 'StorageAccount') {
+        $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes - $mr.ZeroTxMin)
     }
 
-    # Collect non-excluded gap timestamps for VMs
-    $eligibleGaps = @()
-    if ($res.Kind -eq 'VirtualMachine') {
-        $nullTs = $nullByRes.ContainsKey($key) ? $nullByRes[$key] : @()
-        $eligibleGaps = @(foreach ($ts in $nullTs) {
-            $dpEnd = $ts.AddMinutes(1)
-            $hit = $false
-            foreach ($w in $excl) { if ($w.From -lt $dpEnd -and $w.To -gt $ts) { $hit = $true; break } }
-            if (-not $hit) { $ts }
-        })
-    }
-
-    # Storage accounts: zero-transaction minutes reduce eligible minutes
-    $zeroTxMinutes = 0
-    if ($res.Kind -eq 'StorageAccount') {
-        $nullTs = $nullByRes.ContainsKey($key) ? $nullByRes[$key] : @()
-        foreach ($ts in $nullTs) {
-            $dpEnd = $ts.AddMinutes(1)
-            $hit = $false
-            foreach ($w in $excl) { if ($w.From -lt $dpEnd -and $w.To -gt $ts) { $hit = $true; break } }
-            if (-not $hit) { $zeroTxMinutes++ }
-        }
-    }
-
-    [PSCustomObject]@{ Resource = $res; Result = $result; AvailSum = $availSum; EligibleGaps = $eligibleGaps; ZeroTxMinutes = $zeroTxMinutes }
-}
-Write-Progress -Activity 'Computing availability' -Completed
-
-# Targeted supplementary recovery: only VMs with non-excluded gaps (narrow timespans)
-$pendingRecovery = @($pass1 | Where-Object { $_.EligibleGaps.Count -gt 0 })
-$suppByRes = @{}
-if ($pendingRecovery.Count -gt 0) {
-    $recoveryItems = @($pendingRecovery | ForEach-Object {
-        [PSCustomObject]@{ Resource = $_.Resource; GapTimestamps = $_.EligibleGaps }
-    })
-    $suppByRes = Get-SupplementaryRecovery $recoveryItems $Parallelism $armToken
-}
-
-# Pass 2: apply recovered gaps and finalize
-$results = foreach ($item in $pass1) {
-    $result = $item.Result
-    $availSum = $item.AvailSum
-
-    # Storage: reduce eligible minutes by zero-transaction minutes
-    if ($item.ZeroTxMinutes -gt 0) {
-        $result.EligibleMinutes = [math]::Max(0, $result.EligibleMinutes - $item.ZeroTxMinutes)
-    }
-
-    if ($item.EligibleGaps.Count -gt 0) {
-        $key = $item.Resource.ResourceId.ToLowerInvariant()
-        $supp = $suppByRes.ContainsKey($key) ? $suppByRes[$key] : @{}
-        $recovered = 0
-        foreach ($ts in $item.EligibleGaps) {
-            if (($supp[$ts.ToString('yyyy-MM-dd HH:mm')] ?? 0) -ge 5) { $recovered++; $availSum += 1.0 }
-        }
-        if ($recovered -gt 0) { Write-Host "  [$($item.Resource.Name)] Recovered $recovered gap min via supplementary metrics" }
-    }
-
-    $availMin = [math]::Round($availSum, 2)
-    $result | Add-Member -NotePropertyName AvailableMinutes -NotePropertyValue $availMin
-    $result | Add-Member -NotePropertyName AvailabilityPct -NotePropertyValue (
-        $result.EligibleMinutes -gt 0 ? [math]::Round($availMin / $result.EligibleMinutes * 100, 5) : 'N/A'
+    $availMin = $mr ? [math]::Round($mr.AvailableSum, 2) : 0
+    $elig | Add-Member -NotePropertyName AvailableMinutes -NotePropertyValue $availMin
+    $elig | Add-Member -NotePropertyName AvailabilityPct -NotePropertyValue (
+        $elig.EligibleMinutes -gt 0 ? [math]::Round($availMin / $elig.EligibleMinutes * 100, 5) : 'N/A'
     )
-    $result | Add-Member -NotePropertyName SubscriptionName -NotePropertyValue $item.Resource.SubscriptionName
-    $result.PSObject.TypeNames.Insert(0, 'ResourceEligibilityResult')
-    $result
+    $elig | Add-Member -NotePropertyName SubscriptionName -NotePropertyValue $res.SubscriptionName
+    $elig.PSObject.TypeNames.Insert(0, 'ResourceEligibilityResult')
+    $elig
 }
+$eligByRes = $null; $metricResults = $null
 
 $sorted = @($results | Sort-Object SubscriptionName, Kind, Name)
 $sorted
@@ -745,3 +718,6 @@ if ($resolvedSubs.Count -gt 1 -and $eligible.Count -gt 0) {
     Write-Host "  OVERALL [$tn res]: $(($te -gt 0) ? [math]::Round($ta / $te * 100, 5) : 0)% ($([math]::Round($ta, 2)) / $([math]::Round($te, 2)) eligible min)"
     Write-Host ''
 }
+
+$sw.Stop()
+Write-Host "Completed in $($sw.Elapsed.ToString('hh\:mm\:ss\.ff'))"
