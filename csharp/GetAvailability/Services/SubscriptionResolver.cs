@@ -3,8 +3,13 @@ using Azure.ResourceManager.Resources;
 
 namespace GetAvailability.Services;
 
+/// <summary>Resolves Azure subscription display names to subscription IDs.</summary>
 public static class SubscriptionResolver
 {
+    /// <summary>
+    /// Lists all subscriptions visible to the authenticated identity, then matches each
+    /// requested display name. Throws if a name isn't found or matches more than one.
+    /// </summary>
     public static async Task<List<(string Id, string Name)>> ResolveAsync(
         ArmClient client, string[] subscriptionNames)
     {

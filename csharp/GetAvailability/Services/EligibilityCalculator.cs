@@ -4,11 +4,24 @@ using System.Text;
 
 namespace GetAvailability.Services;
 
+/// <summary>
+/// Computes eligible minutes for a resource by building exclusion windows from lifecycle events.
+/// Phase 1: non-existence (Delete→Create). Phase 2: purposeful stops. Phase 3: ±tolerance zones.
+/// </summary>
 public static class EligibilityCalculator
 {
+    // Power states that indicate a resource is intentionally stopped/deallocated
     private static readonly HashSet<string> StoppedStates =
         ["deallocated", "deallocating", "stopped", "stopping", "Paused", "Pausing", "Resuming"];
 
+    /// <summary>
+    /// Builds exclusion windows from lifecycle events and computes how many of the total minutes
+    /// the resource was expected to be available (eligible). Works in three phases:
+    ///   Phase 1: Non-existence windows (Delete→Create gaps, pre-creation time).
+    ///   Phase 2: Purposeful-stop windows (Stop→Start gaps, currently-stopped with no events).
+    ///   Phase 3: Symmetric ±N minute tolerance zones around each Start/Stop event.
+    /// Windows are merged, snapped to whole-minute boundaries, and subtracted from totalMinutes.
+    /// </summary>
     public static EligibilityResult Compute(
         TrackedResource resource,
         IReadOnlyList<LifecycleEvent> events,
@@ -22,6 +35,9 @@ public static class EligibilityCalculator
         var stoppedWindows = new List<ExclusionWindow>();
 
         // Phase 1: Non-existence windows
+        // If the resource was created during the window (no prior delete), exclude [periodStart, createdAt).
+        // For each Delete→Create pair, exclude the gap between them.
+        // A trailing Delete with no subsequent Create excludes through periodEnd.
         var deletes = sorted.Where(e => e.EventKind == "Delete").ToArray();
 
         if (resource.CreatedAt is { } created && created > periodStart && created < periodEnd)
@@ -44,6 +60,11 @@ public static class EligibilityCalculator
             ExclusionWindowHelper.Add(nonExistWindows, pendingDelete.Value, periodEnd, periodStart, periodEnd);
 
         // Phase 2: Purposeful-stop windows
+        // Extract Start/Stop events in chronological order.
+        // If first event is Start → resource was stopped before the window, exclude [periodStart, firstStart).
+        // If no events and current state is stopped → exclude entire period.
+        // For each Stop→Start pair, exclude the gap between them.
+        // A trailing Stop with no subsequent Start excludes through periodEnd.
         var powerEvents = new List<(string Kind, DateTimeOffset Time)>();
         foreach (var evt in sorted)
         {
@@ -69,12 +90,17 @@ public static class EligibilityCalculator
         if (pendingStop.HasValue)
             ExclusionWindowHelper.Add(stoppedWindows, pendingStop.Value, periodEnd, periodStart, periodEnd);
 
-        // Symmetric ±N tolerance around every power event
+        // Symmetric ±N tolerance around every power event.
+        // This covers the ramp-down before shutdown and ramp-up after boot where metrics
+        // may be degraded. Consecutive events naturally merge: events at 18:00 and 18:02
+        // with N=5 produce a single merged window [17:55, 18:07].
         var buf = TimeSpan.FromMinutes(toleranceMinutes);
         foreach (var pe in powerEvents)
             ExclusionWindowHelper.Add(stoppedWindows, pe.Time - buf, pe.Time + buf, periodStart, periodEnd);
 
-        // Phase 3: Merge, snap, compute eligible minutes
+        // Phase 3: Merge all windows, snap to whole-minute boundaries, compute eligible minutes.
+        // Snapping: floor(from) and ceil(to) ensures discrete metric data points (one per minute)
+        // align perfectly with eligible minute counts.
         var mergedNonExist = ExclusionWindowHelper.Merge(nonExistWindows);
         var mergedStopped = ExclusionWindowHelper.Merge(stoppedWindows);
 
@@ -93,7 +119,7 @@ public static class EligibilityCalculator
         double excludedMin = ExclusionWindowHelper.GetMinutes(mergedExcluded);
         int eligibleMin = Math.Max(0, (int)(totalMinutes - excludedMin));
 
-        // Build explanation
+        // Build human-readable explanation of what was excluded and why
         var sb = new StringBuilder();
         if (eligibleMin == totalMinutes)
         {

@@ -6,14 +6,28 @@ using System.Text.Json;
 
 namespace GetAvailability.Services;
 
+/// <summary>Queries Resource Graph resourcechanges table for VM, SQL DB, and Storage lifecycle transitions.</summary>
 public static class ChangeEventsService
 {
+    /// <summary>
+    /// Runs 3 KQL queries (VM, SQL, Storage) against the resourcechanges table to detect
+    /// lifecycle transitions within the analysis window. Each raw change is normalized into
+    /// one of: Start, Stop, Create, Delete. Shutdown intermediates (Pausing, deallocating,
+    /// stopping) map to Stop immediately; startup intermediates are NOT mapped.
+    /// Storage Accounts only track Create/Delete (no start/stop concept).
+    /// Results are paginated via skipToken for large estates.
+    /// </summary>
     public static async Task<List<LifecycleEvent>> QueryAsync(
         ArmClient client, string[] subscriptionIds,
         DateTimeOffset startDate, DateTimeOffset endDate)
     {
         string startIso = startDate.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ");
         string endIso = endDate.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        // Three separate KQL queries because each resource type tracks different property changes.
+        // VM: properties.extended.instanceView.powerState.code
+        // SQL: properties.status
+        // Storage: Create/Delete only (no power state)
 
         string vmQuery = $"""
             resourcechanges
@@ -89,6 +103,11 @@ public static class ChangeEventsService
                         var targetId = row.GetProperty("targetId").GetString()!;
                         var changeTime = DateTimeOffset.Parse(row.GetProperty("changeTime").GetString()!).ToUniversalTime();
 
+                        // Normalize raw change into a lifecycle event kind:
+                        // - Create/Delete pass through directly
+                        // - VM power state changes: running→Start, deallocating/stopped→Stop
+                        // - SQL status changes: Online→Start, Paused/Pausing→Stop
+                        // - Unrecognized transitions are discarded (null)
                         string? eventKind = changeType switch
                         {
                             "Create" => "Create",
@@ -98,8 +117,8 @@ public static class ChangeEventsService
                                 "VM" => (row.GetProperty("newPowerState").GetString() ?? "") switch
                                 {
                                     "PowerState/running" => "Start",
-                                    var ps when ps.StartsWith("PowerState/deallocat") => "Stop",
-                                    var ps when ps.StartsWith("PowerState/stop") => "Stop",
+                                    var ps when ps.StartsWith("PowerState/deallocat", StringComparison.Ordinal) => "Stop",
+                                    var ps when ps.StartsWith("PowerState/stop", StringComparison.Ordinal) => "Stop",
                                     _ => null
                                 },
                                 "SQL" => (row.GetProperty("newStatus").GetString() ?? "") switch

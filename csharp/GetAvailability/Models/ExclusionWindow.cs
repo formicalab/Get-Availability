@@ -1,3 +1,4 @@
 namespace GetAvailability.Models;
 
-public record struct ExclusionWindow(long FromTicks, long ToTicks);
+/// <summary>A time interval (in UTC ticks) that should be excluded from availability calculations.</summary>
+public readonly record struct ExclusionWindow(long FromTicks, long ToTicks);

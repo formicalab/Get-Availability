@@ -3,12 +3,15 @@ using Azure.ResourceManager.ResourceGraph;
 using Azure.ResourceManager.ResourceGraph.Models;
 using GetAvailability.Models;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace GetAvailability.Services;
 
+/// <summary>Queries Resource Graph resources table for VMs, SQL DBs, and Storage Accounts.</summary>
 public static class ResourceInventoryService
 {
+    // KQL query against the Resource Graph 'resources' table.
+    // Returns all VMs, SQL DBs (excluding system 'master'), and Storage Accounts
+    // with their current power state and creation date inline — no per-resource REST calls needed.
     private const string Query = """
         resources
         | where type =~ 'microsoft.compute/virtualmachines'
@@ -39,6 +42,12 @@ public static class ResourceInventoryService
                   createdAt, sqlServerName, databaseName, currentPowerState
         """;
 
+    /// <summary>
+    /// Executes the inventory KQL query with pagination (skipToken) across all subscriptions.
+    /// Parses the JSON response into TrackedResource objects, normalizing SQL DB names to
+    /// "server/database" format and stripping the "PowerState/" prefix from VM power states.
+    /// Returns resources sorted by subscription → kind → name.
+    /// </summary>
     public static async Task<List<TrackedResource>> QueryAsync(
         ArmClient client, string[] subscriptionIds, Dictionary<string, string> subIdToName)
     {
@@ -58,6 +67,7 @@ public static class ResourceInventoryService
             var response = await tenant.GetResourcesAsync(content);
             var result = response.Value;
 
+            // Parse JSON response using System.Text.Json (AOT-safe, no reflection)
             using var doc = JsonDocument.Parse(result.Data);
             var data = doc.RootElement;
             if (data.ValueKind == JsonValueKind.Array)
@@ -68,6 +78,7 @@ public static class ResourceInventoryService
                     var rawPower = row.GetProperty("currentPowerState").GetString() ?? "";
                     var subId = row.GetProperty("subscriptionId").GetString()!;
 
+                    // SQL DB names are shown as "server/database" for clarity
                     string name;
                     if (kind == "AzureSqlDatabase")
                     {
@@ -81,11 +92,10 @@ public static class ResourceInventoryService
                         name = row.GetProperty("name").GetString()!;
                     }
 
-                    string powerState;
-                    if (kind == "VirtualMachine" && Regex.Match(rawPower, @"PowerState/(.+)") is { Success: true } m)
-                        powerState = m.Groups[1].Value;
-                    else
-                        powerState = rawPower;
+                    // Strip "PowerState/" prefix if present
+                    string powerState = kind == "VirtualMachine" && rawPower.StartsWith("PowerState/", StringComparison.Ordinal)
+                        ? rawPower["PowerState/".Length..]
+                        : rawPower;
 
                     DateTimeOffset? createdAt = null;
                     var createdStr = row.GetProperty("createdAt").GetString();

@@ -2,22 +2,35 @@ using GetAvailability.Models;
 
 namespace GetAvailability.Helpers;
 
+/// <summary>Utilities for building, merging, snapping and querying exclusion windows.</summary>
 public static class ExclusionWindowHelper
 {
+    /// <summary>
+    /// Adds an exclusion window [from, to) clamped to the analysis period.
+    /// Silently discards windows that fall entirely outside the period or are zero-length.
+    /// </summary>
     public static void Add(List<ExclusionWindow> windows, DateTimeOffset from, DateTimeOffset to,
         DateTimeOffset periodStart, DateTimeOffset periodEnd)
     {
-        if (to <= periodStart || from >= periodEnd) return;
-        if (from < periodStart) from = periodStart;
-        if (to > periodEnd) to = periodEnd;
+        if (to <= periodStart || from >= periodEnd) return;  // entirely outside the window
+        if (from < periodStart) from = periodStart;          // clamp start
+        if (to > periodEnd) to = periodEnd;                  // clamp end
         if (to > from)
             windows.Add(new ExclusionWindow(from.UtcTicks, to.UtcTicks));
     }
 
+    /// <summary>
+    /// Sorts windows by start time and merges overlapping/adjacent intervals.
+    /// Input: potentially overlapping windows. Output: sorted, non-overlapping array.
+    /// </summary>
     public static ExclusionWindow[] Merge(List<ExclusionWindow> windows)
     {
         if (windows.Count == 0) return [];
-        windows.Sort((a, b) => a.FromTicks.CompareTo(b.FromTicks) is var c && c != 0 ? c : a.ToTicks.CompareTo(b.ToTicks));
+        windows.Sort((a, b) =>
+        {
+            int c = a.FromTicks.CompareTo(b.FromTicks);
+            return c != 0 ? c : a.ToTicks.CompareTo(b.ToTicks);
+        });
         var merged = new List<ExclusionWindow>(windows.Count);
         long f = windows[0].FromTicks, t = windows[0].ToTicks;
         for (int i = 1; i < windows.Count; i++)
@@ -37,6 +50,7 @@ public static class ExclusionWindowHelper
         return [.. merged];
     }
 
+    /// <summary>Returns the total duration of the given windows in minutes.</summary>
     public static double GetMinutes(ExclusionWindow[] windows)
     {
         double sum = 0;
@@ -64,7 +78,11 @@ public static class ExclusionWindowHelper
     public static HashSet<long> BuildExcludedTickSet(ExclusionWindow[] windows)
     {
         long ticksPerMin = TimeSpan.TicksPerMinute;
-        var set = new HashSet<long>();
+        // Estimate capacity to avoid rehashing
+        int capacity = 0;
+        foreach (var w in windows)
+            capacity += (int)((w.ToTicks - w.FromTicks) / ticksPerMin);
+        var set = new HashSet<long>(capacity);
         foreach (var w in windows)
         {
             for (long t = w.FromTicks; t < w.ToTicks; t += ticksPerMin)

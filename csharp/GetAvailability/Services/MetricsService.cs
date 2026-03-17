@@ -6,8 +6,18 @@ using System.Collections.Concurrent;
 
 namespace GetAvailability.Services;
 
+/// <summary>
+/// Fetches Azure Monitor metrics per resource in parallel and computes available minutes inline.
+/// Uses Parallel.ForEachAsync for concurrent metric API calls with configurable parallelism.
+/// Each resource's metrics are processed entirely within the parallel task — only scalar results
+/// (AvailableSum, Recovered, ZeroTxMin) are returned, minimizing cross-thread data and GC pressure.
+/// </summary>
 public static class MetricsService
 {
+    /// <summary>
+    /// Queries metrics for all resources in parallel. Returns a dictionary keyed by lowercase resource ID.
+    /// Progress is reported via console overwrite (\r) every 10 resources.
+    /// </summary>
     public static async Task<ConcurrentDictionary<string, MetricScalars>> QueryAsync(
         MetricsQueryClient metricsClient,
         IReadOnlyList<TrackedResource> resources,
@@ -37,6 +47,14 @@ public static class MetricsService
         return results;
     }
 
+    /// <summary>
+    /// Fetches metrics for a single resource with retry logic, then computes available minutes.
+    /// Metrics requested per resource type:
+    ///   VM:      VmAvailabilityMetric (0–1) + CPU + Network (for gap recovery) — 3 metrics, 1 API call
+    ///   SQL DB:  Availability (0–100, normalized to 0–1) — 1 metric
+    ///   Storage: Availability (0–100) + Transactions — 2 metrics, 1 API call
+    /// Retries up to 5 times on 429 (throttle) and 5xx errors with exponential backoff.
+    /// </summary>
     private static async Task<MetricScalars> QuerySingleResourceAsync(
         MetricsQueryClient metricsClient,
         TrackedResource resource,
@@ -47,6 +65,8 @@ public static class MetricsService
         bool isVm = resource.Kind == "VirtualMachine";
         bool isStorage = resource.Kind == "StorageAccount";
 
+        // VMs fetch 3 metrics in a single API call (~4MB, under Azure's 8MB limit).
+        // The supplementary CPU and Network metrics enable inline gap recovery without a second call.
         string[] metricNames;
         if (isVm)
             metricNames = ["VmAvailabilityMetric", "Percentage CPU", "Network In Total"];
@@ -75,6 +95,7 @@ public static class MetricsService
             options.Aggregations.Add(MetricAggregationType.Minimum);
         }
 
+        // Retry loop with exponential backoff for throttling (429) and transient server errors (5xx)
         MetricsQueryResult response;
         for (int attempt = 1; ; attempt++)
         {
@@ -87,14 +108,14 @@ public static class MetricsService
             catch (Azure.RequestFailedException ex) when (attempt < 5 &&
                 (ex.Status == 429 || ex.Status >= 500))
             {
-                await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt))), ct);
+                await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 1 << attempt)), ct);
             }
             catch (Exception ex) when (attempt < 5 &&
                 (ex.Message.Contains("transport", StringComparison.OrdinalIgnoreCase) ||
                  ex.Message.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
                  ex.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase)))
             {
-                await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt))), ct);
+                await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 1 << attempt)), ct);
             }
             catch (Exception ex)
             {
@@ -103,9 +124,11 @@ public static class MetricsService
             }
         }
 
-        // Build excluded ticks set
-        var excluded = ExclusionWindowHelper.BuildExcludedTickSet(
-            resource.ExclFromTicks.Zip(resource.ExclToTicks, (f, t) => new ExclusionWindow(f, t)).ToArray());
+        // Build excluded ticks set from pre-computed tick arrays
+        var windows = new ExclusionWindow[resource.ExclFromTicks.Length];
+        for (int i = 0; i < windows.Length; i++)
+            windows[i] = new ExclusionWindow(resource.ExclFromTicks[i], resource.ExclToTicks[i]);
+        var excluded = ExclusionWindowHelper.BuildExcludedTickSet(windows);
 
         double availSum = 0.0;
         int recovered = 0;
@@ -119,10 +142,16 @@ public static class MetricsService
         return new MetricScalars(availSum, recovered, zeroTxMin);
     }
 
+    /// <summary>
+    /// Processes Storage Account metrics. A storage minute is only counted toward availability
+    /// if there were actual transactions (Transactions > 0). Minutes with zero transactions
+    /// have no availability signal and are tracked as zeroTxMin — later subtracted from eligibility.
+    /// Availability values are 0–100, normalized to 0.0–1.0.
+    /// </summary>
     private static void ProcessStorage(MetricsQueryResult response, HashSet<long> excluded,
         ref double availSum, ref int zeroTxMin)
     {
-        // Build Transactions lookup
+        // Build a lookup of transaction counts by minute (ticks) for cross-referencing with availability
         var txByTicks = new Dictionary<long, double>();
         var txMetric = response.Metrics.FirstOrDefault(m =>
             string.Equals(m.Name, "Transactions", StringComparison.OrdinalIgnoreCase));
@@ -136,7 +165,9 @@ public static class MetricsService
             }
         }
 
-        // Process Availability
+        // For each availability data point, check if there were transactions at that minute.
+        // Tx > 0 + avail present → count toward availability (normalized /100).
+        // No transactions → count as zero-tx minute (subtracted from eligibility later).
         var availMetric = response.Metrics.FirstOrDefault(m =>
             string.Equals(m.Name, "Availability", StringComparison.OrdinalIgnoreCase));
         if (availMetric != null)
@@ -161,11 +192,21 @@ public static class MetricsService
         }
     }
 
+    /// <summary>
+    /// Processes VM or SQL DB metrics. For VMs, also performs inline gap recovery:
+    /// when VmAvailabilityMetric is null but both CPU and Network report data, the minute
+    /// is recovered as available (1.0). This compensates for known Azure telemetry gaps.
+    /// VM availability is 0.0–1.0 natively; SQL is 0–100, normalized to 0.0–1.0.
+    /// </summary>
     private static void ProcessVmOrSql(MetricsQueryResult response, HashSet<long> excluded,
         bool isVm, ref double availSum, ref int recovered)
     {
-        var suppByMinute = new Dictionary<string, int>();
-        var nullTicks = new List<long>();
+        // Key supplementary metrics (CPU, Network) by ticks for O(1) gap recovery lookup.
+        // Using long ticks avoids DateTime.ToString allocation per datapoint.
+        // suppByTicks[minute] = count of supplementary metrics with non-null Average at that minute.
+        // Gap recovery requires count >= 2 (both CPU and Network present).
+        var suppByTicks = new Dictionary<long, int>();
+        var nullTicks = new List<long>();  // primary metric minutes that were null (gaps)
 
         foreach (var metric in response.Metrics)
         {
@@ -182,37 +223,32 @@ public static class MetricsService
                     if (val.Minimum.HasValue)
                     {
                         double v = val.Minimum.Value;
-                        if (!isVm) v /= 100.0;
+                        if (!isVm) v /= 100.0;  // SQL Availability is 0–100, normalize to 0–1
                         if (!excluded.Contains(ticks))
                             availSum += v;
                     }
                     else
                     {
-                        nullTicks.Add(ticks);
+                        nullTicks.Add(ticks);  // track for gap recovery
                     }
                 }
-                else if (isVm && val.Average.HasValue)
+                else if (isVm && val.Average.HasValue)  // supplementary metric (CPU or Network)
                 {
-                    string key = val.TimeStamp.UtcDateTime.ToString("yyyy-MM-dd HH:mm");
-                    suppByMinute[key] = suppByMinute.GetValueOrDefault(key) + 1;
+                    long key = val.TimeStamp.UtcTicks;
+                    suppByTicks[key] = suppByTicks.GetValueOrDefault(key) + 1;
                 }
             }
         }
 
-        // Inline gap recovery (VMs only, require both CPU + Network)
+        // Inline gap recovery: require both CPU + Network non-null at the same minute
         if (isVm && nullTicks.Count > 0)
         {
             foreach (long nt in nullTicks)
             {
-                if (!excluded.Contains(nt))
+                if (!excluded.Contains(nt) && suppByTicks.GetValueOrDefault(nt) >= 2)
                 {
-                    var dt = new DateTimeOffset(nt, TimeSpan.Zero);
-                    string key = dt.UtcDateTime.ToString("yyyy-MM-dd HH:mm");
-                    if (suppByMinute.GetValueOrDefault(key) >= 2)
-                    {
-                        recovered++;
-                        availSum += 1.0;
-                    }
+                    recovered++;
+                    availSum += 1.0;
                 }
             }
         }
