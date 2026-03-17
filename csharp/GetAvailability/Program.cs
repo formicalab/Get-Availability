@@ -1,8 +1,11 @@
-﻿// Get-Availability — rolling 14-day Azure resource availability reporter (C# / Native AOT)
+﻿// Get-Availability — monthly calendar Azure resource availability reporter (C# / Native AOT)
 //
-// Pipeline: resolve subscriptions → inventory (Resource Graph) → lifecycle events (resourcechanges)
+// Pipeline: resolve subscriptions → inventory (Resource Graph) → lifecycle events (Activity Log)
 //         → compute eligibility (exclusion windows) → fetch metrics (Azure Monitor, parallel)
 //         → assemble results → print table + summaries
+//
+// Uses Azure Activity Log (90-day retention) instead of Resource Graph resourcechanges (14-day)
+// to support analysis of past calendar months (--month -1, -2, -3, or 0 for current).
 
 using System.Diagnostics;
 using Azure.Identity;
@@ -20,6 +23,7 @@ string[] kinds = ["vm", "sql", "storage"];
 string? resourceName = null;
 int tolerance = 5;  // symmetric ±N minutes around each start/stop event
 int parallelism = Math.Max(4, Math.Min(16, Environment.ProcessorCount)); // auto-scale to CPU cores
+int monthOffset = -1; // -1 = previous month (default), -2 = two months ago, -3 = three months ago, 0 = current month
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -46,6 +50,9 @@ for (int i = 0; i < args.Length; i++)
         case "--parallelism" or "-p":
             parallelism = int.Parse(args[++i]);
             break;
+        case "--month" or "-m":
+            monthOffset = int.Parse(args[++i]);
+            break;
         case "--help" or "-h":
             Console.WriteLine("Usage: GetAvailability --subscriptions <name1> [name2 ...] [options]");
             Console.WriteLine("  --subscriptions, -s  Required. One or more Azure subscription display names.");
@@ -53,6 +60,7 @@ for (int i = 0; i < args.Length; i++)
             Console.WriteLine("  --resource, -r       Filter to a single resource name.");
             Console.WriteLine("  --tolerance, -t      +/- minute tolerance around events (default: 5).");
             Console.WriteLine("  --parallelism, -p    Max concurrent metric calls (default: auto).");
+            Console.WriteLine("  --month, -m          Month offset: -1 (previous, default), -2, -3, 0 (current).");
             return 0;
     }
 }
@@ -63,23 +71,35 @@ if (subscriptionNames.Length == 0)
     return 1;
 }
 
-await RunAsync(subscriptionNames, kinds, resourceName, tolerance, parallelism);
+await RunAsync(subscriptionNames, kinds, resourceName, tolerance, parallelism, monthOffset);
 return 0;
 
 // ── Main orchestration ───────────────────────────────────────────────────────
 
 static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? resourceName,
-    int tolerance, int parallelism)
+    int tolerance, int parallelism, int monthOffset)
 {
     var sw = Stopwatch.StartNew();
 
-    // Define the 14-day rolling window, floored to the current UTC minute
+    // Compute calendar month boundaries based on --month offset.
+    // -1 = previous full month, -2 = two months ago, -3 = three months ago, 0 = current month (partial, to now).
     var now = DateTimeOffset.UtcNow;
-    var utcEnd = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, TimeSpan.Zero);
-    var utcStart = utcEnd.AddDays(-14);
-    int totalMinutes = (int)(utcEnd - utcStart).TotalMinutes;  // always 20160
+    var target = now.AddMonths(monthOffset);
+    var utcStart = new DateTimeOffset(target.Year, target.Month, 1, 0, 0, 0, TimeSpan.Zero);
+    var utcEnd = monthOffset == 0
+        ? new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, TimeSpan.Zero)
+        : utcStart.AddMonths(1);
+    int totalMinutes = (int)(utcEnd - utcStart).TotalMinutes;
 
-    Console.WriteLine($"Window: {utcStart:u} -> {utcEnd:u} ({totalMinutes} min, tolerance: +/-{tolerance} min)");
+    // Activity Log retains 90 days — validate the requested month is within range
+    if ((DateTimeOffset.UtcNow - utcStart).TotalDays > 89)
+    {
+        Console.Error.WriteLine("Error: Activity Log retains only 90 days. The requested month is too far back.");
+        return;
+    }
+
+    var monthName = utcStart.ToString("MMMM yyyy");
+    Console.WriteLine($"Month: {monthName} ({utcStart:u} -> {utcEnd:u}, {totalMinutes} min, tolerance: +/-{tolerance} min)");
 
     // Authenticate using DefaultAzureCredential (az login, managed identity, etc.)
     var credential = new DefaultAzureCredential();
@@ -116,9 +136,23 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
     }
     if (resources.Count == 0) { Console.WriteLine("No resources found."); return; }
 
-    // Step 3: Query Resource Graph Changes for lifecycle events (start/stop/create/delete)
-    Console.Write("Querying lifecycle events... ");
-    var allEvents = await ChangeEventsService.QueryAsync(armClient, subIds, utcStart, utcEnd);
+    // Step 3: Query Activity Log for lifecycle events (start/stop/delete)
+    // Activity Log retains 90 days (vs 14 for resourcechanges), enabling monthly analysis.
+    // The query includes a 30-day lookback before utcStart to capture pre-period power state.
+    Console.Write("Querying activity log... ");
+    var allEvents = await ActivityLogService.QueryAsync(credential, subIds, utcStart, utcEnd, subIdToName);
+
+    // Synthesize Create events from inventory CreatedAt timestamps.
+    // Activity Log write operations can't reliably distinguish creation from updates,
+    // so we use the creation time recorded in Resource Graph inventory instead.
+    // The 30-day lookback in the query window ensures Delete→Create pairs are matched
+    // even when the deletion happened before the analysis period.
+    var lookbackStart = utcStart.AddDays(-30);
+    foreach (var res in resources)
+    {
+        if (res.CreatedAt is { } created && created >= lookbackStart && created < utcEnd)
+            allEvents.Add(new LifecycleEvent(res.ResourceId, created, "Create"));
+    }
     Console.WriteLine($"{allEvents.Count} lifecycle event(s) found.");
 
     // Group lifecycle events by resource ID for quick lookup
@@ -166,6 +200,13 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
             // Log supplementary-metric gap recovery for VMs
             if (mr.Recovered > 0)
                 Console.WriteLine($"  [{res.Name}] Recovered {mr.Recovered} gap min via supplementary metrics");
+
+            // Flag resources where the primary metric returned 100% null (broken telemetry)
+            if (mr.NoData && elig.EligibleMinutes > 0)
+            {
+                elig.NoData = true;
+                Console.WriteLine($"  [{res.Name}] No metric data (telemetry not emitting)");
+            }
 
             // For Storage Accounts, subtract zero-transaction minutes from eligibility
             // (no transactions = no availability signal, so those minutes shouldn't count)

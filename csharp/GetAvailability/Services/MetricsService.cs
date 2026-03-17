@@ -53,6 +53,8 @@ public static class MetricsService
     ///   VM:      VmAvailabilityMetric (0–1) + CPU + Network (for gap recovery) — 3 metrics, 1 API call
     ///   SQL DB:  Availability (0–100, normalized to 0–1) — 1 metric
     ///   Storage: Availability (0–100) + Transactions — 2 metrics, 1 API call
+    /// For VMs with time ranges longer than 15 days, the query is split into two halves to stay
+    /// under Azure Monitor's 8MB response limit (3 metrics × 40k+ minutes exceeds it).
     /// Retries up to 5 times on 429 (throttle) and 5xx errors with exponential backoff.
     /// </summary>
     private static async Task<MetricScalars> QuerySingleResourceAsync(
@@ -65,8 +67,8 @@ public static class MetricsService
         bool isVm = resource.Kind == "VirtualMachine";
         bool isStorage = resource.Kind == "StorageAccount";
 
-        // VMs fetch 3 metrics in a single API call (~4MB, under Azure's 8MB limit).
-        // The supplementary CPU and Network metrics enable inline gap recovery without a second call.
+        // VMs fetch 3 metrics in a single API call (~4MB for 14 days, under Azure's 8MB limit).
+        // For periods > 15 days, split into two calls to avoid exceeding 8MB.
         string[] metricNames;
         if (isVm)
             metricNames = ["VmAvailabilityMetric", "Percentage CPU", "Network In Total"];
@@ -75,6 +77,52 @@ public static class MetricsService
         else
             metricNames = ["Availability"];
 
+        // Build excluded ticks set from pre-computed tick arrays
+        var windows = new ExclusionWindow[resource.ExclFromTicks.Length];
+        for (int i = 0; i < windows.Length; i++)
+            windows[i] = new ExclusionWindow(resource.ExclFromTicks[i], resource.ExclToTicks[i]);
+        var excluded = ExclusionWindowHelper.BuildExcludedTickSet(windows);
+
+        // Determine whether to split the time range (VMs only, > 15 days)
+        double totalDays = (endDate - startDate).TotalDays;
+        bool needsSplit = isVm && totalDays > 15;
+
+        if (needsSplit)
+        {
+            var mid = startDate.AddTicks((endDate - startDate).Ticks / 2);
+            // Floor mid to the nearest minute to keep alignment clean
+            mid = new DateTimeOffset(mid.Year, mid.Month, mid.Day, mid.Hour, mid.Minute, 0, TimeSpan.Zero);
+
+            var r1 = await FetchAndProcessAsync(metricsClient, resource, metricNames, isVm, isStorage,
+                startDate, mid, excluded, ct);
+            var r2 = await FetchAndProcessAsync(metricsClient, resource, metricNames, isVm, isStorage,
+                mid, endDate, excluded, ct);
+
+            return new MetricScalars(r1.AvailableSum + r2.AvailableSum,
+                                     r1.Recovered + r2.Recovered,
+                                     r1.ZeroTxMin + r2.ZeroTxMin,
+                                     r1.NoData && r2.NoData);
+        }
+
+        return await FetchAndProcessAsync(metricsClient, resource, metricNames, isVm, isStorage,
+            startDate, endDate, excluded, ct);
+    }
+
+    /// <summary>
+    /// Fetches metrics for a single time range and processes them into scalar results.
+    /// Separated from QuerySingleResourceAsync to allow split-range calls to reuse logic.
+    /// </summary>
+    private static async Task<MetricScalars> FetchAndProcessAsync(
+        MetricsQueryClient metricsClient,
+        TrackedResource resource,
+        string[] metricNames,
+        bool isVm,
+        bool isStorage,
+        DateTimeOffset startDate,
+        DateTimeOffset endDate,
+        HashSet<long> excluded,
+        CancellationToken ct)
+    {
         var options = new MetricsQueryOptions
         {
             Granularity = TimeSpan.FromMinutes(1),
@@ -124,22 +172,17 @@ public static class MetricsService
             }
         }
 
-        // Build excluded ticks set from pre-computed tick arrays
-        var windows = new ExclusionWindow[resource.ExclFromTicks.Length];
-        for (int i = 0; i < windows.Length; i++)
-            windows[i] = new ExclusionWindow(resource.ExclFromTicks[i], resource.ExclToTicks[i]);
-        var excluded = ExclusionWindowHelper.BuildExcludedTickSet(windows);
-
         double availSum = 0.0;
         int recovered = 0;
         int zeroTxMin = 0;
+        bool noData = false;
 
         if (isStorage)
             ProcessStorage(response, excluded, ref availSum, ref zeroTxMin);
         else
-            ProcessVmOrSql(response, excluded, isVm, ref availSum, ref recovered);
+            ProcessVmOrSql(response, excluded, isVm, ref availSum, ref recovered, out noData);
 
-        return new MetricScalars(availSum, recovered, zeroTxMin);
+        return new MetricScalars(availSum, recovered, zeroTxMin, noData);
     }
 
     /// <summary>
@@ -199,7 +242,7 @@ public static class MetricsService
     /// VM availability is 0.0–1.0 natively; SQL is 0–100, normalized to 0.0–1.0.
     /// </summary>
     private static void ProcessVmOrSql(MetricsQueryResult response, HashSet<long> excluded,
-        bool isVm, ref double availSum, ref int recovered)
+        bool isVm, ref double availSum, ref int recovered, out bool noData)
     {
         // Key supplementary metrics (CPU, Network) by ticks for O(1) gap recovery lookup.
         // Using long ticks avoids DateTime.ToString allocation per datapoint.
@@ -207,6 +250,7 @@ public static class MetricsService
         // Gap recovery requires count >= 2 (both CPU and Network present).
         var suppByTicks = new Dictionary<long, int>();
         var nullTicks = new List<long>();  // primary metric minutes that were null (gaps)
+        int primaryDataPoints = 0;  // count of non-null primary metric values
 
         foreach (var metric in response.Metrics)
         {
@@ -222,6 +266,7 @@ public static class MetricsService
                 {
                     if (val.Minimum.HasValue)
                     {
+                        primaryDataPoints++;
                         double v = val.Minimum.Value;
                         if (!isVm) v /= 100.0;  // SQL Availability is 0–100, normalize to 0–1
                         if (!excluded.Contains(ticks))
@@ -252,5 +297,9 @@ public static class MetricsService
                 }
             }
         }
+
+        // NoData = primary metric returned zero non-null values (broken telemetry pipeline).
+        // After gap recovery, also check if all available minutes came only from recovery.
+        noData = primaryDataPoints == 0 && recovered == 0;
     }
 }

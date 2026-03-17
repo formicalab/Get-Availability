@@ -18,8 +18,12 @@ public sealed class EligibilityResult
     // Set after metric computation in the assembly step
     public double AvailableMinutes { get; set; }
 
-    /// <summary>Availability percentage (5 decimal places), or "N/A" if fully excluded.</summary>
-    public string AvailabilityPct => EligibleMinutes > 0
-        ? Math.Round(AvailableMinutes / EligibleMinutes * 100, 5).ToString("F5")
-        : "N/A";
+    /// <summary>True when the primary availability metric returned no data at all (broken telemetry pipeline).</summary>
+    public bool NoData { get; set; }
+
+    /// <summary>Availability percentage (5 decimal places), "N/A" if fully excluded, or "N/D" if no metric data.</summary>
+    public string AvailabilityPct => NoData ? "N/D"
+        : EligibleMinutes > 0
+            ? Math.Round(AvailableMinutes / EligibleMinutes * 100, 5).ToString("F5")
+            : "N/A";
 }
