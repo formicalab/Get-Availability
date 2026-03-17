@@ -1,213 +1,163 @@
 # Get-Availability
 
-Calculates the actual availability percentage for Azure Virtual Machines using the **VmAvailabilityMetric** from Azure Monitor.
+Reports rolling 14-day availability for Azure Virtual Machines and Azure SQL databases in a target subscription.
 
-The goal is to measure **unforeseen unavailability only** — planned operations (user-initiated deallocations, OS patching, VM lifecycle gaps) are excluded from the calculation so the result reflects genuine platform-level reliability.
+For each resource, the script answers:
 
-Reference: [Calculate the Availability and SLA for Your Azure Solution](https://clemens.ms/calculate-the-availability-and-sla-for-your-azure-solution/)
+- How many minutes was it **eligible** (expected to be running)?
+- How many of those minutes was it **available** (confirmed by Azure Monitor)?
+- What is the **availability percentage** (Available / Eligible × 100)?
+
+## How it works
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  1. Resource Graph ─ Inventory query (resources table)                  │
+│     → VMs + SQL DBs, current power state, creation date                │
+│                                                                         │
+│  2. Resource Graph ─ Change events (resourcechanges table)              │
+│     → start/stop/create/delete lifecycle transitions, 14-day retention  │
+│                                                                         │
+│  3. Azure Monitor Metrics REST API (parallel, per-resource)             │
+│     → VmAvailabilityMetric (VMs) or availability (SQL DBs), PT1M       │
+│                                                                         │
+│  4. Per-resource: build exclusion windows → eligible minutes            │
+│  5. Per-resource: filter metric data points against windows → available │
+│  6. Per-resource: recover gap minutes via fallback metrics (VMs only)   │
+│  7. Output: availability % per resource + summary by kind/location      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 1 — Resource inventory
+
+A single KQL query against the `resources` table returns all VMs and SQL databases (excluding system `master` DBs) with their **current power state** inline — no per-resource REST calls needed.
+
+- VMs: `properties.extended.instanceView.powerState.code` → stripped to `running`, `deallocated`, etc.
+- SQL DBs: `properties.status` → `Online`, `Paused`, `Resuming`, etc.
+
+### Step 2 — Lifecycle events
+
+Two KQL queries against the `resourcechanges` table (one for VMs, one for SQL DBs) detect every power-state or status transition within the 14-day window. Each change is normalized into one of four event kinds:
+
+| Source state | Event kind | Resource types |
+|---|---|---|
+| `PowerState/running`, `Online` | **Start** | VM, SQL DB |
+| `PowerState/deallocated`, `PowerState/stopped`, `PowerState/deallocating`, `PowerState/stopping`, `Paused`, `Pausing` | **Stop** | VM, SQL DB |
+| changeType = `Create` | **Create** | Both |
+| changeType = `Delete` | **Delete** | Both |
+
+**Shutdown-direction intermediates** (`Pausing`, `deallocating`, `stopping`) are mapped to `Stop` so the exclusion window starts as soon as shutdown begins — independent of the transition buffer. Startup-direction intermediates (`Resuming`, `starting`) are intentionally **not** mapped; the `Online`/`running` event marks actual availability.
+
+### Step 3 — Availability metrics
+
+Azure Monitor is queried per-resource in parallel (configurable parallelism, default 8) with exponential backoff on 429/5xx errors:
+
+| Resource type | Metric | Scale |
+|---|---|---|
+| Virtual Machine | `VmAvailabilityMetric` | 0.0–1.0 |
+| Azure SQL Database | `availability` | 0–100 (normalized to 0.0–1.0) |
+
+Granularity is PT1M (one data point per minute), aggregation `Minimum`.
+
+## Availability calculation
+
+### Eligible minutes
+
+```
+EligibleMinutes = TotalMinutes − ExcludedMinutes
+```
+
+Exclusion windows are built in three phases:
+
+**Phase 1 — Non-existence:** Delete→Create pairs mark periods when the resource didn't exist. If the resource was created during the 14-day window with no prior delete, the time before creation is also excluded.
+
+**Phase 2 — Purposeful stops:** Stop→Start pairs mark periods when the resource was intentionally stopped (deallocated, paused). If the first observed event is a Start, the resource was stopped before the window → excluded from period start. If the current power state is stopped/deallocated/paused with no events at all → entire period excluded.
+
+**Phase 3 — Transition buffers:** Every power event (Start or Stop) gets a **symmetric ±N minute buffer** (default N=5). This excludes the ramp-down before shutdown and ramp-up after boot where metrics are degraded.
+
+Multiple consecutive events naturally extend the exclusion: events at 18:00 and 18:02 with N=5 produce a merged window [17:55, 18:07].
+
+All windows are merged and snapped to whole-minute boundaries (floor the start, ceil the end) so that discrete metric data points align with eligible minute counts.
+
+### Available minutes
+
+Each metric data point at time T covers the interval [T, T+1min). A data point is counted toward availability only if **no part** of its interval overlaps any exclusion window.
+
+```
+AvailableMinutes = Σ metric.Value  (for non-excluded data points)
+```
+
+Since the metric values are 0.0–1.0, a fully available minute contributes 1.0 and a degraded minute contributes its fractional value.
+
+### Fallback metrics (VMs only)
+
+Azure's `VmAvailabilityMetric` occasionally has null data points even when the VM is fully operational (a known telemetry gap). For VMs with null data points during eligible minutes, the script checks 5 guest-level metrics over a narrow time window around the gaps (±2 minutes):
+
+1. Percentage CPU
+2. Network In Total
+3. Network Out Total
+4. Disk Read Bytes
+5. Disk Write Bytes
+
+A gap minute is **recovered** (counted as available = 1.0) only if **all 5** supplementary metrics report non-null data at that minute. This is conservative — a single missing metric means the minute stays as a gap.
+
+This check is **on-demand**: only VMs that actually have gaps trigger the extra API call, and only for the narrow time range around the gaps. Resources with no gaps incur zero extra cost.
+
+### Final formula
+
+```
+AvailabilityPct = AvailableMinutes / EligibleMinutes × 100
+```
+
+Resources that are stopped/non-existent for the entire period show `N/A` (zero eligible minutes).
+
+## Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `SubscriptionName` | *(required)* | Azure subscription display name |
+| `ResourceName` | *(all)* | Filter to a single resource. Use `server/db` format for SQL DBs |
+| `TransitionBufferMinutes` | `5` | Symmetric ±N buffer around each start/stop event (0–120) |
+| `Parallelism` | `8` | Max concurrent metric API calls (1–64) |
 
 ## Prerequisites
 
 | Requirement | Detail |
 |---|---|
-| **PowerShell** | 7.0 or later |
-| **Az modules** | `Az.Accounts`, `Az.Compute`, `Az.Monitor` |
-| **Azure context** | `Connect-AzAccount` must be run before the script |
+| PowerShell | 7.0 or later |
+| Az modules | `Az.Accounts`, `Az.ResourceGraph` |
+| Azure context | `Connect-AzAccount` must already be established |
 
 ## Usage
 
 ```powershell
-# Single VM
-./get-availability.ps1 -VMName "web-01" -ResourceGroupName "rg-prod" `
-    -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z"
+# Full subscription
+./get-availability.ps1 -SubscriptionName 'POSTE-BANCOPOSTA-PRODUZIONE'
 
-# All VMs in a resource group
-./get-availability.ps1 -ResourceGroupName "rg-prod" `
-    -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z"
+# Single resource
+./get-availability.ps1 -SubscriptionName 'POSTE-BANCOPOSTA-SVILUPPO' -ResourceName 'spiacomdgs01'
 
-# All VMs in the current subscription
-./get-availability.ps1 -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z"
-
-# Custom grace period (0 disables, max 10)
-./get-availability.ps1 -VMName "web-01" -ResourceGroupName "rg-prod" `
-    -StartDate "2026-03-01T00:00:00Z" -EndDate "2026-03-02T00:00:00Z" `
-    -TransitionGraceMinutes 3
+# Custom buffer
+./get-availability.ps1 -SubscriptionName 'POSTE-BANCOPOSTA-PRODUZIONE' -TransitionBufferMinutes 10
 ```
-
-| Parameter | Default | Description |
-|---|---|---|
-| `-TransitionGraceMinutes` | **2** | Minutes of tolerance after exclusion windows end, to cover metric-emission lag during VM boot. Set to 0 to disable. |
-
-All dates are normalised to UTC internally.
-
-## How it works
-
-### 1. VmAvailabilityMetric
-
-Azure Monitor emits `VmAvailabilityMetric` at 1-minute granularity:
-
-| Metric value | Meaning |
-|---|---|
-| **1** | VM was available during that minute |
-| **0** | VM was unavailable (platform-initiated) |
-| **null** | No metric emitted — VM was not running |
-
-The script uses **Minimum** aggregation (pessimistic): if the VM was unavailable at any instant within a minute, the whole minute counts as unavailable.
-
-### 2. Classifying null data points
-
-A null metric alone does not tell us *why* the VM wasn't running. The script queries the **Activity Log** (single call per VM) to build evidence-based exclusion windows:
-
-#### a) User-initiated deallocations
-
-Pairs of **Deallocate Virtual Machine** (Started/Accepted) → **Start Virtual Machine** (Succeeded) events define deallocation windows. The window starts at the earliest deallocate event (Started or Accepted), not Succeeded, because during a user-initiated shutdown the metric transitions 1 → 0 → null — the metric=0 minutes between Started and Succeeded represent active shutdown, not platform-initiated unavailability. Null and metric=0 data points inside these windows are classified as **UserDeallocated** and excluded from the denominator.
-
-If a deallocate event has no matching start, the window extends to the end of the observation period.
-
-**Orphan start events**: If the first event in the period is a Start with no preceding Deallocate, the VM was deallocated before the observation period began. A synthetic window `[startDate, StartTimestamp)` is created to cover the gap.
-
-#### b) OS patching (planned maintenance)
-
-**Install OS update patches on virtual machine** events (Started/Accepted → Succeeded) define patching windows. Both null data points and metric=0 data points inside patching windows are classified as **Patching** and excluded — these represent expected reboots, not unforeseen outages.
-
-#### c) VM lifecycle (create / delete / recreate)
-
-**Delete Virtual Machine** → **Create or Update Virtual Machine** (Succeeded) events define non-existence windows. The VM's `TimeCreated` property is used as a fallback to detect first-time creation mid-period (a synthetic `[startDate, TimeCreated)` gap is added if no prior delete exists).
-
-Null **and metric < 1** data points inside non-existence windows are classified as **NonExistent** and excluded.
-
-#### d) Transition grace period
-
-When a VM boots after deallocation, patching, or creation, the Guest Agent needs 1-3 minutes to reconnect and start reporting metrics. The `TransitionGraceMinutes` parameter (default: 2) extends each exclusion window's trailing edge so these transition minutes are not penalised as unavailable.
-
-- Only applies to null and metric < 1 data points — if the metric is already 1 (available), the minute counts as available regardless.
-- Grace minutes are tracked separately as **TransitionGraceMinutes** and excluded from the denominator.
-- Set to 0 to disable.
-
-#### e) Unknown nulls
-
-Null data points that don't fall into any of the above windows are classified as **UnknownNull** and treated as **unavailable** (potential platform issue).
-
-### 3. Classification priority
-
-When windows overlap, this priority applies (for both null and metric < 1 data points):
-
-1. **Non-existence** (VM didn't exist)
-2. **User-deallocated** (intentional shutdown)
-3. **OS patching** (planned maintenance)
-4. **Transition grace** (within grace period after any of the above)
-5. **Unknown null** (unavailable)
-
-### 4. Availability formula
-
-```
-Eligible minutes = Available + Unavailable(metric=0) + UnknownNull
-Availability %   = Available / Eligible × 100
-```
-
-Minutes excluded from eligible (denominator):
-- User-deallocated minutes
-- OS patching minutes
-- Non-existent minutes
-- Transition grace minutes
-
-### 5. Overall availability (multiple VMs)
-
-When multiple VMs are in scope, the overall availability uses a **resource-weighted average**:
-
-```
-Overall % = Σ(AvailableMinutes) / Σ(EligibleMinutes) × 100
-```
-
-This means a VM that was running longer carries proportionally more weight.
-
-### 6. VM exclusion
-
-VMs that provide no usable availability data are excluded from the overall calculation. Two categories are distinguished:
-
-#### a) Anomaly VMs (no metric reported)
-
-VMs where **neither metric = 1 nor metric = 0** was ever emitted during the entire period (all data points were null). These may be VMs that were deallocated before the period started, or running VMs with metric collection issues. They are reported with `Status = 'Excluded (no metric reported — anomaly)'`.
-
-#### b) Inactive VMs (fully covered by exclusion windows)
-
-VMs where **eligible minutes = 0** because deallocation, patching, and/or non-existence windows covered the full period. Some real metric signals (0 or 1) were observed, but all non-excluded time was accounted for. They are reported with `Status = 'Excluded (inactive entire period)'`.
-
-Both categories are reported separately in the console output and emitted as pipeline objects for downstream processing.
-
-### 7. Safeguards
-
-#### Activity Log retention warning
-
-Azure Activity Log retains events for ~90 days. If `StartDate` is older than 89 days ago the script emits a warning, because missing events could cause null metrics to be incorrectly classified as unavailable.
-
-#### Completeness check
-
-After querying metrics, the script compares the number of data points returned against the expected number of 1-minute slots in the period. A mismatch triggers a warning, alerting you to potential gaps in the metric data.
-
-### 8. Service principal name resolution
-
-Deallocation callers that are GUIDs are resolved to display names after parallel processing completes, using the Microsoft Graph API via `Invoke-AzRestMethod` and a shared cache to avoid duplicate lookups:
-
-1. **Batch resolve** — `POST /v1.0/directoryObjects/getByIds` (up to 1000 IDs per call, covering users, service principals, groups, and applications)
-2. **appId fallback** — `GET /v1.0/servicePrincipals?$filter=appId eq '...'` for GUIDs that represent Application/Client IDs rather than Object IDs
-
-Resolved names are shown in deallocation window output as `displayName (guid)` for traceability.
 
 ## Output
 
-### Console (Write-Host)
+Default table view:
 
-A colour-coded summary:
+| Name | Kind | Location | AvailabilityPct | AvailableMinutes | EligibleMinutes | TotalMinutes | Explanation |
+|---|---|---|---:|---:|---:|---:|---|
+| `sabfpsql01azne/sabfpsqldb01azne` | `AzureSqlDatabase` | `northeurope` | `100` | `20160` | `20160` | `20160` | Fully eligible for the entire period |
+| `spiacomdgs01` | `VirtualMachine` | `northeurope` | `100` | `2794` | `2794` | `20160` | Stopped/deallocated for 17366 min; ... |
 
-```
-=== Overall Availability ===
-    VMs assessed (active)            : 2 of 3 total (0 anomaly, 1 inactive)
-    Total minutes in period           : 80640 min
-  - User-deallocated                  : 1139 min
-  - OS patching (planned maintenance) : 4 min
-  - VM did not exist                  : 0 min
-  - Transition grace (2 min tolerance): 4 min
-  = Eligible minutes (denominator)    : 79493 min
-    Of which:
-      Available (numerator)           : 79486 min
-      Unavailable (metric = 0)        : 4 min
-      Unavailable (no metric emitted) : 3 min
+A summary by Kind + Location and an overall total are printed after the table.
 
-  >>> Availability: 99.9912% <<<
-```
+Additional properties available on the pipeline object: `ResourceId`, `ResourceGroupName`, `CreatedAt`, `ExclusionWindows`.
 
-Colour thresholds: **green** ≥ 99.99%, **yellow** ≥ 99.9%, **red** < 99.9%.
+## Architecture notes
 
-### Pipeline objects
-
-Per-VM objects for downstream processing (export to CSV, filtering, etc.).
-
-The default table view shows **VMName**, **ResourceGroupName**, **Location**, **Placement**, **Status**, **EligibleMinutes**, and **AvailabilityPct**. All other properties are accessible via `Select-Object`, `Format-List`, or export commands.
-
-| Property | Description |
-|---|---|
-| `VMName` | VM name |
-| `ResourceGroupName` | Resource group |
-| `Location` | Azure region (e.g. `westeurope`) |
-| `Zones` | Availability zone number(s), or `$null` for regional VMs |
-| `Placement` | `Zonal (1)` / `Zonal (1,2)` or `Regional` |
-| `Status` | `Active`, `Excluded (inactive entire period)`, or `Excluded (no metric reported — anomaly)` |
-| `AvailableMinutes` | Minutes with metric ≥ 1 |
-| `UnavailableMinutes` | Minutes with metric < 1 (outside patching) |
-| `UnknownNullMinutes` | Null minutes not in any exclusion window |
-| `UserDeallocatedMinutes` | Null minutes inside deallocation windows |
-| `PatchingMinutes` | Null/0 minutes inside patching windows |
-| `NonExistentMinutes` | Null/0 minutes inside non-existence windows |
-| `TransitionGraceMinutes` | Null/0 minutes within grace period after exclusion windows |
-| `EligibleMinutes` | Denominator for availability % |
-| `AvailabilityPct` | Per-VM availability % |
-| `DeallocWindows` | Array of `{From, To, By}` |
-| `PatchWindows` | Array of `{From, To}` |
-| `NonExistWindows` | Array of `{From, To}` |
-
-## Performance
-
-- **Single Activity Log call** per VM (deallocation + patching + lifecycle events extracted from one response)
-- **Parallel processing** with `ForEach-Object -Parallel` (ThrottleLimit 20)
-- **Service principal resolution** runs once after parallel processing, with a shared cache per unique GUID
+- **No per-resource REST calls for inventory or power state.** The `resources` table returns current power state inline.
+- **No Activity Log dependency.** The `resourcechanges` table provides 14-day lifecycle history with a single paginated query per resource type.
+- **Shutdown intermediates captured early.** `Pausing`/`deallocating`/`stopping` map to Stop events so exclusion starts immediately, not after the transition completes.
+- **Metric boundary alignment.** Exclusion windows are floor/ceil-snapped to whole minutes so discrete metric data points match eligible minute counts exactly.
+- **Fallback is conservative and cheap.** Supplementary metrics are only fetched for VMs with actual gaps, over narrow time ranges, and require all 5 metrics to confirm availability.
