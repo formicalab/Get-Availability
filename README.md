@@ -1,6 +1,6 @@
 # Get-Availability
 
-Reports rolling 14-day availability for Azure Virtual Machines and Azure SQL databases in a target subscription.
+Reports rolling 14-day availability for Azure Virtual Machines and Azure SQL databases across one or more Azure subscriptions.
 
 For each resource, the script answers:
 
@@ -115,7 +115,7 @@ Resources that are stopped/non-existent for the entire period show `N/A` (zero e
 
 | Parameter | Default | Description |
 |---|---|---|
-| `SubscriptionName` | *(required)* | Azure subscription display name |
+| `SubscriptionNames` | *(required)* | One or more Azure subscription display names (string array) |
 | `ResourceName` | *(all)* | Filter to a single resource. Use `server/db` format for SQL DBs |
 | `TransitionBufferMinutes` | `5` | Symmetric ±N buffer around each start/stop event (0–120) |
 | `Parallelism` | `8` | Max concurrent metric API calls (1–64) |
@@ -131,26 +131,29 @@ Resources that are stopped/non-existent for the entire period show `N/A` (zero e
 ## Usage
 
 ```powershell
-# Full subscription
-./get-availability.ps1 -SubscriptionName 'POSTE-BANCOPOSTA-PRODUZIONE'
+# Single subscription
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE'
 
-# Single resource
-./get-availability.ps1 -SubscriptionName 'POSTE-BANCOPOSTA-SVILUPPO' -ResourceName 'spiacomdgs01'
+# Multiple subscriptions
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO','POSTE-BANCOPOSTA-PRODUZIONE','POSTE-BANCOPOSTA-CERTIFICAZIONE'
+
+# Single resource (searched in each subscription)
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO' -ResourceName 'spiacomdgs01'
 
 # Custom buffer
-./get-availability.ps1 -SubscriptionName 'POSTE-BANCOPOSTA-PRODUZIONE' -TransitionBufferMinutes 10
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -TransitionBufferMinutes 10
 ```
 
 ## Output
 
 Default table view:
 
-| Name | Kind | Location | AvailabilityPct | AvailableMinutes | EligibleMinutes | TotalMinutes | Explanation |
-|---|---|---|---:|---:|---:|---:|---|
-| `sabfpsql01azne/sabfpsqldb01azne` | `AzureSqlDatabase` | `northeurope` | `100` | `20160` | `20160` | `20160` | Fully eligible for the entire period |
-| `spiacomdgs01` | `VirtualMachine` | `northeurope` | `100` | `2794` | `2794` | `20160` | Stopped/deallocated for 17366 min; ... |
+| SubscriptionName | Name | Kind | Location | AvailabilityPct | AvailableMinutes | EligibleMinutes | TotalMinutes | Explanation |
+|---|---|---|---|---:|---:|---:|---:|---|
+| `POSTE-BANCOPOSTA-SVILUPPO` | `sabfpsql01azne/sabfpsqldb01azne` | `AzureSqlDatabase` | `northeurope` | `100` | `20160` | `20160` | `20160` | Fully eligible for the entire period |
+| `POSTE-BANCOPOSTA-SVILUPPO` | `spiacomdgs01` | `VirtualMachine` | `northeurope` | `100` | `2794` | `2794` | `20160` | Stopped/deallocated for 17366 min; ... |
 
-A summary by Kind + Location and an overall total are printed after the table.
+A per-subscription summary (by Kind + Location) is printed after each subscription's results. When multiple subscriptions are processed, a cross-subscription overall summary is printed at the end.
 
 Additional properties available on the pipeline object: `ResourceId`, `ResourceGroupName`, `CreatedAt`, `ExclusionWindows`.
 
