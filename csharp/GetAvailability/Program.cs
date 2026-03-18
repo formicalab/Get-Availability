@@ -124,28 +124,29 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
     // Step 4: Fetch Azure Monitor metrics per resource in parallel
     var metricResults = await MetricsService.QueryAsync(metricsClient, resources, utcStart, utcEnd, parallelism);
 
-    // Step 5: For resources with metric gaps (null or 0% datapoints), check Resource Health.
+    // Step 5: For resources with non-perfect metric minutes, check Resource Health.
     // Null gaps outside fault intervals → subtract from eligible (telemetry absence, VM off, etc.).
-    // 0% gaps only excused during Unknown health windows (Azure Monitor issue).
-    // All gaps inside fault intervals (Unavailable/Degraded) → stay in eligible, count as downtime.
-    var gapCandidates = new List<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks)>();
+    // 0% gaps are excused during Unknown or customer-initiated health windows.
+    // Positive degraded datapoints are also excused when they align with customer-initiated activity.
+    // All non-perfect minutes inside fault intervals (Unavailable/Degraded) stay in eligible and count as downtime.
+    var gapCandidates = new List<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks, MetricValueSample[]? DegradedSamples)>();
     foreach (var res in resources)
     {
         var key = res.ResourceId.ToLowerInvariant();
-        if (metricResults.TryGetValue(key, out var mr) && mr.GapMinutes > 0)
+        if (metricResults.TryGetValue(key, out var mr) && (mr.GapMinutes > 0 || (mr.DegradedSamples?.Length ?? 0) > 0))
         {
             var allTicks = new List<long>();
             if (mr.GapTicks is not null) allTicks.AddRange(mr.GapTicks);
             if (mr.ZeroAvailTicks is not null) allTicks.AddRange(mr.ZeroAvailTicks);
-            if (allTicks.Count > 0)
+            if (allTicks.Count > 0 || (mr.DegradedSamples?.Length ?? 0) > 0)
             {
                 var zeroSet = mr.ZeroAvailTicks is not null ? new HashSet<long>(mr.ZeroAvailTicks) : null;
-                gapCandidates.Add((res, allTicks.ToArray(), zeroSet));
+                gapCandidates.Add((res, allTicks.ToArray(), zeroSet, mr.DegradedSamples));
             }
         }
     }
 
-    ConcurrentDictionary<string, GapClassification>? healthResults = null;
+    ConcurrentDictionary<string, HealthClassification>? healthResults = null;
     if (gapCandidates.Count > 0)
         healthResults = await ResourceHealthService.CheckGapsAsync(credential, gapCandidates, utcStart, utcEnd, parallelism);
 
@@ -157,6 +158,15 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
 
         if (metricResults.TryGetValue(key, out var mr))
         {
+            if (mr.ExcludeFromAvailability)
+            {
+                elig.EligibleMinutes = 0;
+                elig.AvailableMinutes = 0;
+                elig.DegradedMinutes = 0;
+                Console.WriteLine($"  [{res.Name}] excluded from availability (no numeric availability datapoints in period)");
+                continue;
+            }
+
             // Apply Resource Health gap classification
             int healthFaults = 0;
             if (healthResults is not null && healthResults.TryGetValue(key, out var gc))
@@ -164,7 +174,12 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
                 if (gc.HealthyGapMinutes > 0)
                 {
                     elig.EligibleMinutes = Math.Max(0, elig.EligibleMinutes - gc.HealthyGapMinutes);
-                    Console.WriteLine($"  [{res.Name}] {gc.HealthyGapMinutes} gap min ignored (no fault in Resource Health)");
+                    Console.WriteLine($"  [{res.Name}] {gc.HealthyGapMinutes} non-perfect gap min excluded from eligibility (no fault / Unknown / customer-initiated in Resource Health)");
+                }
+                if (gc.CustomerExcusedDegradedMinutes > 0)
+                {
+                    elig.EligibleMinutes = Math.Max(0, elig.EligibleMinutes - gc.CustomerExcusedDegradedMinutes);
+                    Console.WriteLine($"  [{res.Name}] {gc.CustomerExcusedDegradedMinutes} degraded metric min excluded from eligibility (customer-initiated activity)");
                 }
                 if (gc.FaultMinutes > 0)
                 {
@@ -178,21 +193,18 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
                 }
             }
 
-            // DegradedMinutes = metric-level degraded (avail < 100%) + health-confirmed faults + trusted 0% downtimes
-            elig.DegradedMinutes = mr.DegradedMinutes + healthFaults;
-
-            // Flag resources where the primary metric returned 100% null (broken telemetry)
-            if (mr.NoData && elig.EligibleMinutes > 0)
-            {
-                elig.NoData = true;
-                Console.WriteLine($"  [{res.Name}] No metric data (telemetry not emitting)");
-            }
+            // DegradedMinutes = metric-level degraded (avail < 100%) minus customer-excused degraded datapoints
+            // + health-confirmed faults + trusted 0% downtimes.
+            elig.DegradedMinutes = Math.Max(0, mr.DegradedMinutes - (healthResults is not null && healthResults.TryGetValue(key, out var hc) ? hc.CustomerExcusedDegradedMinutes : 0) + healthFaults);
 
             // For Storage Accounts, subtract zero-transaction minutes from eligibility
             if (mr.ZeroTxMin > 0 && res.Kind == "StorageAccount")
                 elig.EligibleMinutes = Math.Max(0, elig.EligibleMinutes - mr.ZeroTxMin);
 
-            elig.AvailableMinutes = Math.Round(mr.AvailableSum, 2);
+            double customerExcusedAvail = healthResults is not null && healthResults.TryGetValue(key, out var availClass)
+                ? availClass.CustomerExcusedDegradedAvailableSum
+                : 0;
+            elig.AvailableMinutes = Math.Round(Math.Max(0, mr.AvailableSum - customerExcusedAvail), 2);
         }
     }
 

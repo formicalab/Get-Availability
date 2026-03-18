@@ -9,18 +9,19 @@ namespace GetAvailability.Services;
 /// <summary>
 /// Queries Azure Resource Health availability status history via REST API to verify
 /// metric gaps (null and 0% datapoints). Uses direct HTTP calls (no SDK dependency)
-/// for AOT compatibility. Null gaps outside faults are healthy; 0% gaps are only
-/// excused during Unknown health windows (Azure Monitor issue).
+/// for AOT compatibility. Non-perfect datapoints that align with customer-initiated
+/// activity are excluded from eligibility. Null gaps outside faults are healthy;
+/// 0% gaps are excused during Unknown or customer-initiated windows.
 /// </summary>
 public static class ResourceHealthService
 {
     /// <summary>
-    /// For resources with metric gaps, queries Resource Health history and classifies each
-    /// gap minute. Returns a dictionary keyed by lowercase resource ID with fault/trustedZero/healthy counts.
+    /// For resources with non-perfect metric minutes, queries Resource Health history and classifies
+    /// gap minutes plus degraded datapoints. Returns a dictionary keyed by lowercase resource ID.
     /// </summary>
-    public static async Task<ConcurrentDictionary<string, GapClassification>> CheckGapsAsync(
+    public static async Task<ConcurrentDictionary<string, HealthClassification>> CheckGapsAsync(
         TokenCredential credential,
-        IReadOnlyList<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks)> candidates,
+        IReadOnlyList<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks, MetricValueSample[]? DegradedSamples)> candidates,
         DateTimeOffset periodStart,
         DateTimeOffset periodEnd,
         int parallelism)
@@ -33,7 +34,7 @@ public static class ResourceHealthService
         using var http = new HttpClient();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
 
-        var results = new ConcurrentDictionary<string, GapClassification>(StringComparer.OrdinalIgnoreCase);
+        var results = new ConcurrentDictionary<string, HealthClassification>(StringComparer.OrdinalIgnoreCase);
         int done = 0;
         int total = candidates.Count;
 
@@ -41,8 +42,8 @@ public static class ResourceHealthService
             new ParallelOptions { MaxDegreeOfParallelism = parallelism },
             async (candidate, ct) =>
             {
-                var (res, allGapTicks, zeroTicks) = candidate;
-                var classification = await ClassifyGapsAsync(http, res, allGapTicks, zeroTicks, periodStart, periodEnd, ct);
+                var (res, allGapTicks, zeroTicks, degradedSamples) = candidate;
+                var classification = await ClassifyGapsAsync(http, res, allGapTicks, zeroTicks, degradedSamples, periodStart, periodEnd, ct);
                 results[res.ResourceId.ToLowerInvariant()] = classification;
 
                 int current = Interlocked.Increment(ref done);
@@ -60,14 +61,16 @@ public static class ResourceHealthService
     ///   - Null metric in fault interval (Unavailable/Degraded) → downtime
     ///   - Null metric outside fault interval → healthy gap (VM off, telemetry gap, etc.)
     ///   - 0% metric in fault interval → downtime (confirmed outage)
-    ///   - 0% metric in Unknown window → healthy gap (Azure Monitor issue)
+    ///   - 0% metric in Unknown or customer-initiated window → healthy gap
     ///   - 0% metric outside fault/Unknown → downtime (requests failed, no health explanation)
+    ///   - Positive degraded metric in customer-initiated window → excluded from eligibility
     /// </summary>
-    private static async Task<GapClassification> ClassifyGapsAsync(
+    private static async Task<HealthClassification> ClassifyGapsAsync(
         HttpClient http,
         TrackedResource resource,
         long[] allGapTicks,
         HashSet<long>? zeroTicks,
+        MetricValueSample[]? degradedSamples,
         DateTimeOffset periodStart,
         DateTimeOffset periodEnd,
         CancellationToken ct)
@@ -80,31 +83,40 @@ public static class ResourceHealthService
         catch (Exception ex)
         {
             Console.Error.WriteLine($"  WARNING: Resource Health query failed for '{resource.Name}': {ex.Message}");
-            // On failure, conservatively treat all gaps as faults (don't hide potential downtime)
-            return new GapClassification(allGapTicks.Length, 0, 0);
+            // On failure, conservatively treat all gaps as faults and keep degraded datapoints unchanged.
+            return new HealthClassification(allGapTicks.Length, 0, 0, 0, 0);
         }
 
         var faultIntervals = BuildFaultIntervals(transitions, periodStart, periodEnd);
         var unknownIntervals = BuildUnknownIntervals(transitions, periodStart, periodEnd);
+        var customerIntervals = BuildCustomerIntervals(transitions, periodStart, periodEnd);
 
         int faultMin = 0;
         int trustedZeroMin = 0;
         int healthyGapMin = 0;
+        int customerExcusedDegradedMin = 0;
+        double customerExcusedDegradedAvail = 0;
 
         foreach (long tick in allGapTicks)
         {
             bool inFault = IsInInterval(tick, faultIntervals);
             bool isZero = zeroTicks is not null && zeroTicks.Contains(tick);
+            bool inCustomer = IsInInterval(tick, customerIntervals);
 
             if (inFault)
             {
                 // Confirmed outage (Unavailable/Degraded) — counts as downtime
                 faultMin++;
             }
+            else if (inCustomer)
+            {
+                // Customer/user initiated stop/deallocate/restart — exclude from eligibility
+                healthyGapMin++;
+            }
             else if (isZero)
             {
-                // 0% metric: only excuse during Unknown windows (Azure Monitor issue).
-                // Outside Unknown, 0% with transactions is real downtime.
+                // 0% metric: excuse during Unknown windows (Azure Monitor issue).
+                // Outside Unknown/customer windows, 0% with transactions is real downtime.
                 if (IsInInterval(tick, unknownIntervals))
                     healthyGapMin++;
                 else
@@ -117,7 +129,19 @@ public static class ResourceHealthService
             }
         }
 
-        return new GapClassification(faultMin, trustedZeroMin, healthyGapMin);
+        if (degradedSamples is not null)
+        {
+            foreach (var sample in degradedSamples)
+            {
+                if (IsInInterval(sample.Tick, customerIntervals))
+                {
+                    customerExcusedDegradedMin++;
+                    customerExcusedDegradedAvail += sample.Value;
+                }
+            }
+        }
+
+        return new HealthClassification(faultMin, trustedZeroMin, healthyGapMin, customerExcusedDegradedMin, customerExcusedDegradedAvail);
     }
 
     private static bool IsInInterval(long tick, List<(DateTimeOffset From, DateTimeOffset To)> intervals)
@@ -304,6 +328,42 @@ public static class ResourceHealthService
     }
 
     /// <summary>
+    /// Builds intervals caused by customer/user activity. Any non-perfect datapoint inside
+    /// these windows is excluded from eligibility because it reflects a deliberate action,
+    /// not platform downtime.
+    /// </summary>
+    private static List<(DateTimeOffset From, DateTimeOffset To)> BuildCustomerIntervals(
+        List<HealthTransition> transitions,
+        DateTimeOffset periodStart,
+        DateTimeOffset periodEnd)
+    {
+        var intervals = new List<(DateTimeOffset, DateTimeOffset)>();
+        DateTimeOffset? customerStart = null;
+
+        foreach (var t in transitions)
+        {
+            bool isCustomer = IsCustomerInitiated(t);
+
+            if (isCustomer && customerStart is null)
+            {
+                customerStart = t.OccurredOn < periodStart ? periodStart : t.OccurredOn;
+            }
+            else if (!isCustomer && customerStart is not null)
+            {
+                var end = t.OccurredOn > periodEnd ? periodEnd : t.OccurredOn;
+                if (end > customerStart.Value)
+                    intervals.Add((customerStart.Value, end));
+                customerStart = null;
+            }
+        }
+
+        if (customerStart is not null)
+            intervals.Add((customerStart.Value, periodEnd));
+
+        return intervals;
+    }
+
+    /// <summary>
     /// Determines whether a health transition was caused by a customer/user action
     /// using multiple API fields for robust detection. Any positive signal is sufficient.
     /// </summary>
@@ -324,6 +384,13 @@ internal readonly record struct HealthTransition(
 
 /// <summary>Result of classifying unexplained metric gap minutes via Resource Health.</summary>
 /// <param name="FaultMinutes">Gap minutes inside confirmed fault intervals (Unavailable/Degraded).</param>
-/// <param name="TrustedZeroMinutes">0% metric minutes outside fault and Unknown intervals — trusted as real downtime.</param>
-/// <param name="HealthyGapMinutes">Null gaps outside faults + 0% in Unknown windows — subtracted from eligible.</param>
-public readonly record struct GapClassification(int FaultMinutes, int TrustedZeroMinutes, int HealthyGapMinutes);
+/// <param name="TrustedZeroMinutes">0% metric minutes outside fault, Unknown, and customer-initiated intervals — trusted as real downtime.</param>
+/// <param name="HealthyGapMinutes">Null gaps outside faults plus 0%/null minutes excused by Unknown or customer-initiated windows — subtracted from eligible.</param>
+/// <param name="CustomerExcusedDegradedMinutes">Positive degraded datapoints excused by customer-initiated activity and removed from eligibility.</param>
+/// <param name="CustomerExcusedDegradedAvailableSum">Fractional available minutes contributed by customer-excused degraded datapoints and removed from AvailableMinutes.</param>
+public readonly record struct HealthClassification(
+    int FaultMinutes,
+    int TrustedZeroMinutes,
+    int HealthyGapMinutes,
+    int CustomerExcusedDegradedMinutes,
+    double CustomerExcusedDegradedAvailableSum);

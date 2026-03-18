@@ -12,6 +12,10 @@ namespace GetAvailability.Services;
 /// (AvailableSum, GapMinutes, ZeroTxMin, DegradedMinutes) are returned, minimising cross-thread
 /// data and GC pressure. Null datapoints are collected as GapTicks and 0%-valued datapoints
 /// as ZeroAvailTicks, both verified via Resource Health with different classification rules.
+/// Positive degraded datapoints are also tracked so customer-initiated activity can exclude
+/// them from eligibility and available-minute math.
+/// Resources with no numeric availability datapoints across the full window are flagged for
+/// exclusion from availability calculations (Eligible=0, Available=0, Avail%=N/A).
 /// </summary>
 public static class MetricsService
 {
@@ -122,16 +126,17 @@ public static class MetricsService
         int gapMinutes = 0;
         int zeroTxMin = 0;
         int degradedMinutes = 0;
-        bool noData = false;
+        bool excludeFromAvailability = false;
         long[]? gapTicks = null;
         long[]? zeroAvailTicks = null;
+        MetricValueSample[]? degradedSamples = null;
 
         if (isStorage)
-            ProcessStorage(response, ref availSum, ref zeroTxMin, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks);
+            ProcessStorage(response, ref availSum, ref zeroTxMin, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks, out excludeFromAvailability, out degradedSamples);
         else
-            ProcessVmOrSql(response, isVm, ref availSum, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks, out noData);
+            ProcessVmOrSql(response, isVm, ref availSum, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks, out excludeFromAvailability, out degradedSamples);
 
-        return new MetricScalars(availSum, gapMinutes, zeroTxMin, noData, gapTicks, zeroAvailTicks, degradedMinutes);
+        return new MetricScalars(availSum, gapMinutes, zeroTxMin, excludeFromAvailability, gapTicks, zeroAvailTicks, degradedMinutes, degradedSamples);
     }
 
     /// <summary>
@@ -141,15 +146,19 @@ public static class MetricsService
     /// Availability values are 0–100, normalised to 0.0–1.0.
     /// Null availability with transactions is tracked as a gap tick for health checking.
     /// Exactly 0% availability with transactions is tracked separately as a zero-avail tick
-    /// (only excused during Unknown health windows, otherwise counted as real downtime).
-    /// Non-zero values below 100% are counted as degraded minutes.
+    /// (excused during Unknown or customer-initiated health windows, otherwise counted as real downtime).
+    /// Non-zero values below 100% are counted as degraded minutes and tracked so customer-
+    /// initiated activity can exclude them from availability math.
     /// </summary>
     private static void ProcessStorage(MetricsQueryResult response,
         ref double availSum, ref int zeroTxMin, ref int gapMinutes, ref int degradedMinutes,
-        out long[]? gapTicks, out long[]? zeroAvailTicks)
+        out long[]? gapTicks, out long[]? zeroAvailTicks, out bool excludeFromAvailability,
+        out MetricValueSample[]? degradedSamples)
     {
         var nullTicks = new List<long>();
         var zeroTicks = new List<long>();
+        var degraded = new List<MetricValueSample>();
+        int numericAvailabilityPoints = 0;
 
         // Build a lookup of transaction counts by minute (ticks)
         var txByTicks = new Dictionary<long, double>();
@@ -178,6 +187,7 @@ public static class MetricsService
                 if (hasTx && val.Minimum.HasValue)
                 {
                     double norm = val.Minimum.Value / 100.0;
+                    numericAvailabilityPoints++;
                     if (norm == 0.0)
                     {
                         // Exactly 0% with transactions — tracked separately for nuanced
@@ -187,7 +197,11 @@ public static class MetricsService
                     else
                     {
                         availSum += norm;
-                        if (norm < 1.0) degradedMinutes++;
+                        if (norm < 1.0)
+                        {
+                            degradedMinutes++;
+                            degraded.Add(new MetricValueSample(ticks, norm));
+                        }
                     }
                 }
                 else if (hasTx && !val.Minimum.HasValue)
@@ -205,21 +219,26 @@ public static class MetricsService
         gapMinutes = nullTicks.Count + zeroTicks.Count;
         gapTicks = nullTicks.Count > 0 ? nullTicks.ToArray() : null;
         zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
+        excludeFromAvailability = numericAvailabilityPoints == 0;
+        degradedSamples = degraded.Count > 0 ? degraded.ToArray() : null;
     }
 
     /// <summary>
     /// Processes VM or SQL DB metrics. Null datapoints are collected as gap ticks and
     /// 0%-valued datapoints as zero-avail ticks — both verified via Resource Health with
-    /// different rules. Non-zero values below 100% are counted as degraded minutes.
+    /// different rules. Non-zero values below 100% are counted as degraded minutes and
+    /// tracked so customer-initiated activity can exclude them from availability math.
     /// VM availability is 0.0–1.0 natively; SQL is 0–100, normalised to 0.0–1.0.
     /// </summary>
     private static void ProcessVmOrSql(MetricsQueryResult response,
         bool isVm, ref double availSum, ref int gapMinutes, ref int degradedMinutes,
-        out long[]? gapTicks, out long[]? zeroAvailTicks, out bool noData)
+        out long[]? gapTicks, out long[]? zeroAvailTicks, out bool excludeFromAvailability,
+        out MetricValueSample[]? degradedSamples)
     {
         var nullTicks = new List<long>();
         var zeroTicks = new List<long>();
-        int primaryDataPoints = 0;
+        var degraded = new List<MetricValueSample>();
+        int numericAvailabilityPoints = 0;
 
         foreach (var metric in response.Metrics)
         {
@@ -232,6 +251,7 @@ public static class MetricsService
             {
                 if (val.Minimum.HasValue)
                 {
+                    numericAvailabilityPoints++;
                     double v = val.Minimum.Value;
                     if (!isVm) v /= 100.0;  // SQL Availability is 0–100, normalise to 0–1
                     if (v == 0.0)
@@ -241,9 +261,12 @@ public static class MetricsService
                     }
                     else
                     {
-                        primaryDataPoints++;
                         availSum += v;
-                        if (v < 1.0) degradedMinutes++;
+                        if (v < 1.0)
+                        {
+                            degradedMinutes++;
+                            degraded.Add(new MetricValueSample(val.TimeStamp.UtcTicks, v));
+                        }
                     }
                 }
                 else
@@ -256,6 +279,7 @@ public static class MetricsService
         gapMinutes = nullTicks.Count + zeroTicks.Count;
         gapTicks = nullTicks.Count > 0 ? nullTicks.ToArray() : null;
         zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
-        noData = primaryDataPoints == 0 && gapMinutes == 0;
+        excludeFromAvailability = numericAvailabilityPoints == 0;
+        degradedSamples = degraded.Count > 0 ? degraded.ToArray() : null;
     }
 }

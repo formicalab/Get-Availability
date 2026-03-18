@@ -39,7 +39,7 @@ public static class SummaryWriter
     /// </summary>
     public static void WriteSubscriptionSummaries(EligibilityResult[] sorted)
     {
-        var eligible = sorted.Where(r => r.AvailabilityPct is not ("N/A" or "N/D")).ToArray();
+        var eligible = sorted.Where(r => r.AvailabilityPct != "N/A").ToArray();
 
         foreach (var subGroup in eligible.GroupBy(r => r.SubscriptionName).OrderBy(g => g.Key))
         {
