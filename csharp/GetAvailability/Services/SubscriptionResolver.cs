@@ -24,9 +24,9 @@ public static class SubscriptionResolver
                 string.Equals(s.Data.DisplayName, name, StringComparison.OrdinalIgnoreCase)).ToList();
 
             if (matches.Count == 0)
-                throw new InvalidOperationException($"Subscription '{name}' not found.");
+                throw new ArgumentException($"Subscription '{name}' not found.");
             if (matches.Count > 1)
-                throw new InvalidOperationException($"Multiple subscriptions named '{name}'.");
+                throw new ArgumentException($"Multiple subscriptions named '{name}'.");
 
             var sub = matches[0];
             resolved.Add((sub.Data.SubscriptionId!, sub.Data.DisplayName!));

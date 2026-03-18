@@ -10,12 +10,12 @@ namespace GetAvailability.Services;
 /// Uses Parallel.ForEachAsync for concurrent metric API calls with configurable parallelism.
 /// Each resource's metrics are processed entirely within the parallel task — only scalar results
 /// (AvailableSum, GapMinutes, ZeroTxMin, DegradedMinutes) are returned, minimising cross-thread
-/// data and GC pressure. Null datapoints are collected as GapTicks and 0%-valued datapoints
-/// as ZeroAvailTicks, both verified via Resource Health with different classification rules.
-/// Positive degraded datapoints are also tracked so customer-initiated activity can exclude
-/// them from eligibility and available-minute math.
-/// Resources with no numeric availability datapoints across the full window are flagged for
-/// exclusion from availability calculations (Eligible=0, Available=0, Avail%=N/A).
+/// data and GC pressure. Suspect minutes are collected in three forms:
+///   - null datapoints (GapTicks)
+///   - exactly 0%-valued datapoints (ZeroAvailTicks)
+///   - positive datapoints below 100% (DegradedSamples)
+/// Resources are only flagged for N/A exclusion when the metric API returns no usable datapoints
+/// at all for the full window.
 /// </summary>
 public static class MetricsService
 {
@@ -144,11 +144,9 @@ public static class MetricsService
     /// if there were actual transactions (Transactions > 0). Minutes with zero transactions
     /// have no availability signal and are tracked as zeroTxMin — later subtracted from eligibility.
     /// Availability values are 0–100, normalised to 0.0–1.0.
-    /// Null availability with transactions is tracked as a gap tick for health checking.
-    /// Exactly 0% availability with transactions is tracked separately as a zero-avail tick
-    /// (excused during Unknown or customer-initiated health windows, otherwise counted as real downtime).
-    /// Non-zero values below 100% are counted as degraded minutes and tracked so customer-
-    /// initiated activity can exclude them from availability math.
+    /// Null availability with transactions is tracked as a null suspect minute.
+    /// Exactly 0% availability with transactions is tracked separately as a 0%-valued suspect minute.
+    /// Non-zero values below 100% are tracked as degraded suspect minutes.
     /// </summary>
     private static void ProcessStorage(MetricsQueryResult response,
         ref double availSum, ref int zeroTxMin, ref int gapMinutes, ref int degradedMinutes,
@@ -190,8 +188,7 @@ public static class MetricsService
                     numericAvailabilityPoints++;
                     if (norm == 0.0)
                     {
-                        // Exactly 0% with transactions — tracked separately for nuanced
-                        // health classification (only excused during Unknown health windows)
+                        // Exactly 0% with transactions — tracked as a distinct suspect minute.
                         zeroTicks.Add(ticks);
                     }
                     else
@@ -206,7 +203,7 @@ public static class MetricsService
                 }
                 else if (hasTx && !val.Minimum.HasValue)
                 {
-                    // Transactions present but availability metric null — gap
+                    // Transactions present but availability metric null — suspect minute.
                     nullTicks.Add(ticks);
                 }
                 else if (!hasTx)
@@ -219,15 +216,15 @@ public static class MetricsService
         gapMinutes = nullTicks.Count + zeroTicks.Count;
         gapTicks = nullTicks.Count > 0 ? nullTicks.ToArray() : null;
         zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
-        excludeFromAvailability = numericAvailabilityPoints == 0;
+        excludeFromAvailability = numericAvailabilityPoints == 0 && nullTicks.Count == 0 && zeroTicks.Count == 0 && degraded.Count == 0;
         degradedSamples = degraded.Count > 0 ? degraded.ToArray() : null;
     }
 
     /// <summary>
-    /// Processes VM or SQL DB metrics. Null datapoints are collected as gap ticks and
-    /// 0%-valued datapoints as zero-avail ticks — both verified via Resource Health with
-    /// different rules. Non-zero values below 100% are counted as degraded minutes and
-    /// tracked so customer-initiated activity can exclude them from availability math.
+    /// Processes VM or SQL DB metrics. Null datapoints are collected as null suspect minutes and
+    /// 0%-valued datapoints as zero-valued suspect minutes. Non-zero values below 100% are counted
+    /// as degraded suspect minutes and tracked so lifecycle/customer explanations can later exclude
+    /// them from eligibility and available-minute math.
     /// VM availability is 0.0–1.0 natively; SQL is 0–100, normalised to 0.0–1.0.
     /// </summary>
     private static void ProcessVmOrSql(MetricsQueryResult response,
@@ -256,7 +253,7 @@ public static class MetricsService
                     if (!isVm) v /= 100.0;  // SQL Availability is 0–100, normalise to 0–1
                     if (v == 0.0)
                     {
-                        // Exactly 0 — tracked separately for nuanced health classification
+                        // Exactly 0 — tracked as a distinct suspect minute.
                         zeroTicks.Add(val.TimeStamp.UtcTicks);
                     }
                     else
@@ -279,7 +276,7 @@ public static class MetricsService
         gapMinutes = nullTicks.Count + zeroTicks.Count;
         gapTicks = nullTicks.Count > 0 ? nullTicks.ToArray() : null;
         zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
-        excludeFromAvailability = numericAvailabilityPoints == 0;
+        excludeFromAvailability = numericAvailabilityPoints == 0 && nullTicks.Count == 0 && zeroTicks.Count == 0 && degraded.Count == 0;
         degradedSamples = degraded.Count > 0 ? degraded.ToArray() : null;
     }
 }

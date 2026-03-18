@@ -7,25 +7,32 @@ using System.Text.Json;
 namespace GetAvailability.Services;
 
 /// <summary>
-/// Queries Azure Resource Health availability status history via REST API to verify
-/// metric gaps (null and 0% datapoints). Uses direct HTTP calls (no SDK dependency)
-/// for AOT compatibility. Resource Health is the primary classifier; for supported
-/// resource kinds, unresolved non-perfect minutes are also cross-checked against
-/// Activity Log lifecycle operations. Non-perfect datapoints that align with
-/// customer/admin-initiated activity are excluded from eligibility. Null gaps outside
-/// faults are healthy; 0% gaps are excused during Unknown or customer/admin-initiated
-/// windows.
+/// Investigates suspect availability minutes using Azure Activity Log and Resource Health.
+/// Suspect minutes are any metric datapoints that are null or below 100%.
+///
+/// Classification precedence is:
+///   1. Platform fault from Resource Health wins over any other explanation.
+///   2. Customer/admin lifecycle activity from Activity Log or customer-initiated
+///      health states excludes the minute from eligibility.
+///   3. Unknown health states excuse null/0% suspect minutes as monitoring artifacts.
+///   4. Remaining null minutes are treated as metric issues and excluded from eligibility.
+///   5. Remaining 0% minutes are treated as downtime.
+///   6. Remaining positive degraded datapoints stay as degraded availability.
+///
+/// Resource Health is only available for the overlap with the current 30-day retention
+/// window. This service is structured so older observation periods can later skip the
+/// health-history step while still using Activity Log and metric-based fallbacks.
 /// </summary>
 public static class ResourceHealthService
 {
-
     /// <summary>
-    /// For resources with non-perfect metric minutes, queries Resource Health history and classifies
-    /// gap minutes plus degraded datapoints. For supported resource kinds, unresolved minutes
-    /// after Resource Health are then cross-checked against Activity Log lifecycle operations.
+    /// For resources with suspect metric minutes, investigates null/0% suspect minutes plus
+    /// positive degraded datapoints. Activity Log is gathered first for supported kinds, then
+    /// Resource Health is consulted for the portion of the observation window still within the
+    /// current 30-day retention window.
     /// Returns a dictionary keyed by lowercase resource ID.
     /// </summary>
-    public static async Task<ConcurrentDictionary<string, HealthClassification>> CheckGapsAsync(
+    public static async Task<ConcurrentDictionary<string, SuspectGapClassification>> InvestigateSuspectGapsAsync(
         TokenCredential credential,
         IReadOnlyList<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks, MetricValueSample[]? DegradedSamples)> candidates,
         DateTimeOffset periodStart,
@@ -33,7 +40,7 @@ public static class ResourceHealthService
         int parallelism,
         int activityGraceMinutes)
     {
-        Console.WriteLine($"Checking Resource Health for {candidates.Count} resource(s) with metric gaps...");
+        Console.WriteLine($"Investigating suspect gaps for {candidates.Count} resource(s)...");
 
         var token = await credential.GetTokenAsync(
             new TokenRequestContext(["https://management.azure.com/.default"]), default);
@@ -41,7 +48,7 @@ public static class ResourceHealthService
         using var http = new HttpClient();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
 
-        var results = new ConcurrentDictionary<string, HealthClassification>(StringComparer.OrdinalIgnoreCase);
+        var results = new ConcurrentDictionary<string, SuspectGapClassification>(StringComparer.OrdinalIgnoreCase);
         int done = 0;
         int total = candidates.Count;
 
@@ -50,7 +57,7 @@ public static class ResourceHealthService
             async (candidate, ct) =>
             {
                 var (res, allGapTicks, zeroTicks, degradedSamples) = candidate;
-                var classification = await ClassifyGapsAsync(
+                var classification = await ClassifySuspectGapsAsync(
                     http,
                     res,
                     allGapTicks,
@@ -72,17 +79,10 @@ public static class ResourceHealthService
     }
 
     /// <summary>
-    /// Fetches health history for a single resource and classifies each gap-tick minute.
-    /// Classification rules differ by gap type:
-    ///   - Null metric in fault interval (Unavailable/Degraded) → downtime
-    ///   - Null metric outside fault interval → healthy gap (VM off, telemetry gap, etc.)
-    ///   - 0% metric in fault interval → downtime (confirmed outage)
-    ///   - 0% metric in Unknown or customer-initiated window → healthy gap
-    ///   - 0% metric outside fault/Unknown → unresolved; for supported kinds it can still be excused by Activity Log
-    ///   - Positive degraded metric in customer-initiated window → excluded from eligibility
-    ///   - Positive degraded metric with no health explanation → for supported kinds it can still be excused by Activity Log
+    /// Fetches lifecycle activity and health history for a single resource, then classifies
+    /// each suspect minute using the precedence documented on the class.
     /// </summary>
-    private static async Task<HealthClassification> ClassifyGapsAsync(
+    private static async Task<SuspectGapClassification> ClassifySuspectGapsAsync(
         HttpClient http,
         TrackedResource resource,
         long[] allGapTicks,
@@ -93,66 +93,92 @@ public static class ResourceHealthService
         int activityGraceMinutes,
         CancellationToken ct)
     {
-        List<HealthTransition> transitions;
-        try
+        var activityIntervals = new List<(DateTimeOffset From, DateTimeOffset To)>();
+        if (ActivityLogService.SupportsKind(resource.Kind) &&
+            (allGapTicks.Length > 0 || (degradedSamples?.Length ?? 0) > 0))
         {
-            transitions = await FetchHealthHistoryAsync(http, resource.ResourceId, ct);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"  WARNING: Resource Health query failed for '{resource.Name}': {ex.Message}");
-            // On failure, conservatively treat all gaps as faults and keep degraded datapoints unchanged.
-            return new HealthClassification(allGapTicks.Length, 0, 0, 0, 0, 0, 0, 0, 0);
+            try
+            {
+                activityIntervals = await ActivityLogService.BuildLifecycleIntervalsAsync(
+                    http,
+                    resource,
+                    periodStart,
+                    periodEnd,
+                    activityGraceMinutes,
+                    ct);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"  WARNING: Activity Log query failed for '{resource.Name}': {ex.Message}");
+            }
         }
 
-        var faultIntervals = BuildFaultIntervals(transitions, periodStart, periodEnd);
-        var unknownIntervals = BuildUnknownIntervals(transitions, periodStart, periodEnd);
-        var customerIntervals = BuildCustomerIntervals(transitions, periodStart, periodEnd);
+        var healthCoverageStart = GetHealthCoverageStart(periodStart);
+        bool healthHistoryApplied = healthCoverageStart < periodEnd;
 
-        int faultMin = 0;
-        int trustedZeroMin = 0;
-        int healthyGapMin = 0;
+        List<HealthTransition> transitions = [];
+        if (healthHistoryApplied)
+        {
+            try
+            {
+                transitions = await FetchHealthHistoryAsync(http, resource.ResourceId, ct);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"  WARNING: Resource Health query failed for '{resource.Name}': {ex.Message}");
+                // Conservative fallback: keep Activity Log results, but do not excuse any
+                // remaining suspect minutes via Resource Health when the query fails.
+                transitions = [];
+            }
+        }
+
+        var faultIntervals = healthHistoryApplied
+            ? BuildFaultIntervals(transitions, healthCoverageStart, periodEnd)
+            : [];
+        var unknownIntervals = healthHistoryApplied
+            ? BuildUnknownIntervals(transitions, healthCoverageStart, periodEnd)
+            : [];
+        var customerIntervals = healthHistoryApplied
+            ? BuildCustomerIntervals(transitions, healthCoverageStart, periodEnd)
+            : [];
+
+        int platformFaultGapMin = 0;
+        int unresolvedZeroDowntimeMin = 0;
+        int healthExplainedGapMin = 0;
+        int metricIssueNullMin = 0;
+        int activityLogExcludedGapMin = 0;
         int customerExcusedDegradedMin = 0;
         double customerExcusedDegradedAvail = 0;
-        int activityLogGapMin = 0;
         int activityLogDegradedMin = 0;
-        int activityLogCheckedGapMin = 0;
-        int activityLogCheckedDegradedMin = 0;
-
-        var pendingNullTicks = new List<long>();
-        var pendingZeroTicks = new List<long>();
-        var pendingDegradedSamples = new List<MetricValueSample>();
 
         foreach (long tick in allGapTicks)
         {
-            bool inFault = IsInInterval(tick, faultIntervals);
             bool isZero = zeroTicks is not null && zeroTicks.Contains(tick);
-            bool inCustomer = IsInInterval(tick, customerIntervals);
+            bool inActivity = IsInInterval(tick, activityIntervals);
+            bool inHealthCoverage = healthHistoryApplied && tick >= healthCoverageStart.UtcTicks;
+            bool inFault = inHealthCoverage && IsInInterval(tick, faultIntervals);
+            bool inUnknown = inHealthCoverage && IsInInterval(tick, unknownIntervals);
+            bool inCustomer = inHealthCoverage && IsInInterval(tick, customerIntervals);
 
             if (inFault)
             {
-                // Confirmed outage (Unavailable/Degraded) — counts as downtime
-                faultMin++;
+                platformFaultGapMin++;
             }
-            else if (inCustomer)
+            else if (inActivity)
             {
-                // Customer/user initiated stop/deallocate/restart — exclude from eligibility
-                healthyGapMin++;
+                activityLogExcludedGapMin++;
+            }
+            else if (inCustomer || inUnknown)
+            {
+                healthExplainedGapMin++;
             }
             else if (isZero)
             {
-                // 0% metric: excuse during Unknown windows (Azure Monitor issue).
-                // Outside Unknown/customer windows, defer to Activity Log if applicable.
-                if (IsInInterval(tick, unknownIntervals))
-                    healthyGapMin++;
-                else
-                    pendingZeroTicks.Add(tick);
+                unresolvedZeroDowntimeMin++;
             }
             else
             {
-                // Null metric outside fault interval — healthy gap. For supported kinds we still
-                // try to tie it to an explicit lifecycle action in Activity Log before finalizing.
-                pendingNullTicks.Add(tick);
+                metricIssueNullMin++;
             }
         }
 
@@ -160,86 +186,44 @@ public static class ResourceHealthService
         {
             foreach (var sample in degradedSamples)
             {
-                if (IsInInterval(sample.Tick, customerIntervals))
+                bool inActivity = IsInInterval(sample.Tick, activityIntervals);
+                bool inHealthCoverage = healthHistoryApplied && sample.Tick >= healthCoverageStart.UtcTicks;
+                bool inFault = inHealthCoverage && IsInInterval(sample.Tick, faultIntervals);
+                bool inCustomer = inHealthCoverage && IsInInterval(sample.Tick, customerIntervals);
+
+                if (inFault)
+                {
+                    continue;
+                }
+
+                if (inActivity || inCustomer)
                 {
                     customerExcusedDegradedMin++;
                     customerExcusedDegradedAvail += sample.Value;
-                }
-                else
-                {
-                    pendingDegradedSamples.Add(sample);
-                }
-            }
-        }
-
-        if (ActivityLogService.SupportsKind(resource.Kind) &&
-            (pendingNullTicks.Count > 0 || pendingZeroTicks.Count > 0 || pendingDegradedSamples.Count > 0))
-        {
-            try
-            {
-                activityLogCheckedGapMin = pendingNullTicks.Count + pendingZeroTicks.Count;
-                activityLogCheckedDegradedMin = pendingDegradedSamples.Count;
-                var activityIntervals = await ActivityLogService.BuildLifecycleIntervalsAsync(
-                    http,
-                    resource,
-                    periodStart,
-                    periodEnd,
-                    activityGraceMinutes,
-                    ct);
-
-                foreach (long tick in pendingNullTicks)
-                {
-                    if (IsInInterval(tick, activityIntervals))
-                        activityLogGapMin++;
-                    healthyGapMin++;
-                }
-
-                foreach (long tick in pendingZeroTicks)
-                {
-                    if (IsInInterval(tick, activityIntervals))
-                    {
-                        healthyGapMin++;
-                        activityLogGapMin++;
-                    }
-                    else
-                    {
-                        trustedZeroMin++;
-                    }
-                }
-
-                foreach (var sample in pendingDegradedSamples)
-                {
-                    if (IsInInterval(sample.Tick, activityIntervals))
-                    {
-                        customerExcusedDegradedMin++;
-                        customerExcusedDegradedAvail += sample.Value;
+                    if (inActivity)
                         activityLogDegradedMin++;
-                    }
                 }
             }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"  WARNING: Activity Log query failed for '{resource.Name}': {ex.Message}");
-                healthyGapMin += pendingNullTicks.Count;
-                trustedZeroMin += pendingZeroTicks.Count;
-            }
-        }
-        else
-        {
-            healthyGapMin += pendingNullTicks.Count;
-            trustedZeroMin += pendingZeroTicks.Count;
         }
 
-        return new HealthClassification(
-            faultMin,
-            trustedZeroMin,
-            healthyGapMin,
+        return new SuspectGapClassification(
+            healthHistoryApplied,
+            activityLogExcludedGapMin,
+            healthExplainedGapMin,
+            metricIssueNullMin,
+            platformFaultGapMin,
+            unresolvedZeroDowntimeMin,
             customerExcusedDegradedMin,
             customerExcusedDegradedAvail,
-            activityLogGapMin,
-            activityLogDegradedMin,
-            activityLogCheckedGapMin,
-            activityLogCheckedDegradedMin);
+            activityLogDegradedMin);
+    }
+
+    public static DateTimeOffset GetHealthCoverageStart(DateTimeOffset periodStart)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var currentMinute = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, TimeSpan.Zero);
+        var retentionStart = currentMinute.AddDays(-30);
+        return retentionStart > periodStart ? retentionStart : periodStart;
     }
 
     private static bool IsInInterval(long tick, List<(DateTimeOffset From, DateTimeOffset To)> intervals)
@@ -480,23 +464,23 @@ internal readonly record struct HealthTransition(
     string Context,
     string HealthEventCause);
 
-/// <summary>Result of classifying unexplained metric gap minutes via Resource Health.</summary>
-/// <param name="FaultMinutes">Gap minutes inside confirmed fault intervals (Unavailable/Degraded).</param>
-/// <param name="TrustedZeroMinutes">0% metric minutes outside fault, Unknown, and customer-initiated intervals — trusted as real downtime.</param>
-/// <param name="HealthyGapMinutes">Null gaps outside faults plus 0%/null minutes excused by Unknown, customer-initiated windows, or supported Activity Log lifecycle matches — subtracted from eligible.</param>
-/// <param name="CustomerExcusedDegradedMinutes">Positive degraded datapoints excused by customer/admin-initiated activity and removed from eligibility.</param>
-/// <param name="CustomerExcusedDegradedAvailableSum">Fractional available minutes contributed by customer/admin-excused degraded datapoints and removed from AvailableMinutes.</param>
-/// <param name="ActivityLogGapMinutes">Subset of HealthyGapMinutes explained specifically by supported Activity Log lifecycle operations.</param>
+/// <summary>Result of investigating suspect metric minutes for a resource.</summary>
+/// <param name="HealthHistoryApplied">Whether Resource Health was available for any part of the observation window.</param>
+/// <param name="ActivityLogExcludedGapMinutes">Null/0% suspect minutes excused by supported lifecycle operations in Activity Log.</param>
+/// <param name="HealthExplainedGapMinutes">Null/0% suspect minutes excused by Resource Health Unknown or customer-initiated windows.</param>
+/// <param name="MetricIssueNullMinutes">Remaining null suspect minutes treated as metric issues and removed from eligibility.</param>
+/// <param name="PlatformFaultGapMinutes">Null/0% suspect minutes confirmed as platform issues by Resource Health fault intervals.</param>
+/// <param name="UnresolvedZeroDowntimeMinutes">Remaining 0% suspect minutes trusted as downtime because no valid explanation was found.</param>
+/// <param name="CustomerExcusedDegradedMinutes">Positive degraded datapoints excused by lifecycle activity or customer-initiated health windows.</param>
+/// <param name="CustomerExcusedDegradedAvailableSum">Fractional available minutes contributed by customer-excused degraded datapoints and removed from AvailableMinutes.</param>
 /// <param name="ActivityLogDegradedMinutes">Subset of CustomerExcusedDegradedMinutes explained specifically by supported Activity Log lifecycle operations.</param>
-/// <param name="ActivityLogCheckedGapMinutes">Gap minutes that remained unresolved after Resource Health and were explicitly checked against Activity Log.</param>
-/// <param name="ActivityLogCheckedDegradedMinutes">Positive degraded minutes that remained unresolved after Resource Health and were explicitly checked against Activity Log.</param>
-public readonly record struct HealthClassification(
-    int FaultMinutes,
-    int TrustedZeroMinutes,
-    int HealthyGapMinutes,
+public readonly record struct SuspectGapClassification(
+    bool HealthHistoryApplied,
+    int ActivityLogExcludedGapMinutes,
+    int HealthExplainedGapMinutes,
+    int MetricIssueNullMinutes,
+    int PlatformFaultGapMinutes,
+    int UnresolvedZeroDowntimeMinutes,
     int CustomerExcusedDegradedMinutes,
     double CustomerExcusedDegradedAvailableSum,
-    int ActivityLogGapMinutes,
-    int ActivityLogDegradedMinutes,
-    int ActivityLogCheckedGapMinutes,
-    int ActivityLogCheckedDegradedMinutes);
+    int ActivityLogDegradedMinutes);

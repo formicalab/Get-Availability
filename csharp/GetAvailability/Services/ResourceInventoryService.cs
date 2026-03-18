@@ -24,16 +24,27 @@ public static class ResourceInventoryService
         ArmClient client, string[] subscriptionIds, Dictionary<string, string> subIdToName,
         string[] kinds, string? resourceName)
     {
+        var unsupportedKinds = kinds
+            .Where(k => !KindToType.ContainsKey(k))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(k => k, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (unsupportedKinds.Length > 0)
+            throw new ArgumentException($"Unsupported kind(s): {string.Join(", ", unsupportedKinds)}. Allowed values: vm, sql, storage.");
+
         // Build the type filter clause from selected kinds
         var types = kinds
             .Select(k => KindToType.TryGetValue(k, out var t) ? t : null)
             .Where(t => t != null)
             .ToArray();
+        if (types.Length == 0)
+            throw new ArgumentException("At least one supported kind must be specified.");
+
         string typeFilter = types.Length == 1
             ? $"type =~ '{types[0]}'"
             : string.Join(" or ", types.Select(t => $"type =~ '{t}'"));
 
-        string escapedResourceName = resourceName?.Replace("'", "\\'") ?? "";
+        string escapedResourceName = resourceName?.Replace("'", "''", StringComparison.Ordinal) ?? "";
         string nameFilter = resourceName != null
             ? $"| where displayName =~ '{escapedResourceName}' or name =~ '{escapedResourceName}'\n"
             : "";

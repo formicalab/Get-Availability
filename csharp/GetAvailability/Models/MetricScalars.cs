@@ -1,14 +1,14 @@
 namespace GetAvailability.Models;
 
 /// <summary>Compact result from per-resource metric computation.</summary>
-/// <param name="AvailableSum">Sum of metric values above 0% (each 0.0–1.0). Null and 0% are excluded (routed as gaps). Becomes AvailableMinutes.</param>
-/// <param name="GapMinutes">Total count of null-metric and 0%-metric minutes to verify via Resource Health.</param>
+/// <param name="AvailableSum">Sum of metric values above 0% (each 0.0–1.0). Becomes AvailableMinutes after customer-excused degraded contributions are removed.</param>
+/// <param name="GapMinutes">Count of null and 0%-valued suspect minutes.</param>
 /// <param name="ZeroTxMin">Storage only: minutes with zero transactions — subtracted from eligible.</param>
-/// <param name="ExcludeFromAvailability">True when the resource produced no numeric availability datapoints across the full window. These resources are excluded from availability calculations.</param>
-/// <param name="GapTicks">UTC ticks of null-metric minutes, for Resource Health-first gap classification with Activity Log fallback where applicable.</param>
-/// <param name="ZeroAvailTicks">UTC ticks of 0%-metric minutes — excused during Unknown, customer-initiated, or supported lifecycle-operation windows.</param>
-/// <param name="DegradedMinutes">Minutes where a metric datapoint was present but below 100% (and above 0%). These can later be excused if Resource Health or Activity Log shows customer/admin-initiated activity.</param>
-/// <param name="DegradedSamples">Normalized availability values for positive degraded datapoints, used to exclude customer/admin-initiated degraded minutes from eligibility and available minutes.</param>
+/// <param name="ExcludeFromAvailability">True when the metric API returned no usable datapoints at all for the window. These resources are excluded from availability calculations.</param>
+/// <param name="GapTicks">UTC ticks of null-valued suspect minutes.</param>
+/// <param name="ZeroAvailTicks">UTC ticks of 0%-valued suspect minutes.</param>
+/// <param name="DegradedMinutes">Minutes where a metric datapoint was present and strictly between 0% and 100%.</param>
+/// <param name="DegradedSamples">Normalized availability values for positive degraded datapoints, used to remove customer-excused degraded contributions from eligibility and available minutes.</param>
 public readonly record struct MetricScalars(
     double AvailableSum,
     int GapMinutes,
@@ -17,7 +17,10 @@ public readonly record struct MetricScalars(
     long[]? GapTicks = null,
     long[]? ZeroAvailTicks = null,
     int DegradedMinutes = 0,
-    MetricValueSample[]? DegradedSamples = null);
+    MetricValueSample[]? DegradedSamples = null)
+{
+    public int SuspectMinutes => GapMinutes + DegradedMinutes;
+}
 
 /// <summary>Minute-level normalized availability value for a degraded datapoint.</summary>
 public readonly record struct MetricValueSample(long Tick, double Value);

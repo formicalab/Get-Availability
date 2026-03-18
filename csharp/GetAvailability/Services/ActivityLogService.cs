@@ -4,8 +4,8 @@ using GetAvailability.Models;
 namespace GetAvailability.Services;
 
 /// <summary>
-/// Queries Azure Activity Log for lifecycle operations that can explain unresolved
-/// non-perfect availability minutes after Resource Health classification.
+/// Queries Azure Activity Log for lifecycle operations that can explain suspect availability
+/// minutes before Health History and fallback rules are applied.
 /// </summary>
 public static class ActivityLogService
 {
