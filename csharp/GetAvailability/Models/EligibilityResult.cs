@@ -1,7 +1,7 @@
 namespace GetAvailability.Models;
 
 /// <summary>Per-resource availability result. Eligible minutes start at the rolling
-/// 30-day total and are reduced by healthy gaps, customer-excused degraded minutes,
+/// 30-day total and are reduced by healthy gaps, customer/admin-excused degraded minutes,
 /// and zero-tx storage minutes during assembly.</summary>
 public sealed class EligibilityResult
 {
@@ -17,7 +17,7 @@ public sealed class EligibilityResult
     public double AvailableMinutes { get; set; }
 
     /// <summary>Minutes of confirmed degradation: metric datapoints below 100% that were not
-    /// excused by customer-initiated activity, plus gap minutes counted as downtime
+    /// excused by customer/admin-initiated activity, plus gap minutes counted as downtime
     /// (health-confirmed faults and trusted 0% metrics).</summary>
     public int DegradedMinutes { get; set; }
 

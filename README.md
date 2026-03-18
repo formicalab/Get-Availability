@@ -36,9 +36,22 @@ For each data point in the response:
 - **Value = 0% or null (missing)** → timestamp recorded as a **gap tick** for health verification. These are often caused by Azure Monitor issues rather than real outages.
 - **Storage only: Transactions = 0** → counted as `ZeroTxMin` (no availability signal to measure).
 
-### Step 3 — Classify metric gaps via Resource Health
+### Step 3 — Classify metric gaps via Resource Health, then Activity Log when needed
 
 For every resource that has non-perfect metric minutes (null, 0%, or a positive value below 100%), the tool queries the [Resource Health REST API](https://learn.microsoft.com/en-us/rest/api/resourcehealth/availability-statuses/list?view=rest-resourcehealth-2025-05-01) (`availabilityStatuses`, API version `2025-05-01`) to retrieve the health timeline.
+
+For **supported resource kinds**, if Resource Health still leaves a non-perfect minute unexplained, the tool falls back to the [Activity Log REST API](https://learn.microsoft.com/azure/azure-monitor/platform/rest-activity-log#retrieve-activity-log-data) for the same 30-day window and the exact resource ID. It only looks for lifecycle operations that represent deliberate administrative action:
+
+- **Virtual Machines**
+  - `Microsoft.Compute/virtualMachines/start/action`
+  - `Microsoft.Compute/virtualMachines/deallocate/action`
+  - `Microsoft.Compute/virtualMachines/powerOff/action`
+  - `Microsoft.Compute/virtualMachines/restart/action`
+- **Azure SQL Databases**
+  - `Microsoft.Sql/servers/databases/pause`
+  - `Microsoft.Sql/servers/databases/resume`
+
+If one of those operations overlaps the affected minute, that minute is treated as **not a real incident** and is removed from eligibility just like a customer-initiated Resource Health window. A short post-operation grace window is also applied to lifecycle operations that commonly leave trailing transition datapoints after the control-plane event finishes. The grace window is configurable through `--activity-grace-minutes` and defaults to `10` minutes.
 
 The health timeline is converted into **fault intervals** (periods of `Unavailable`/`Degraded`) and **Unknown intervals** (periods where Azure cannot determine health). Each gap tick is classified according to its type:
 
@@ -46,19 +59,19 @@ The health timeline is converted into **fault intervals** (periods of `Unavailab
 
 - In a fault interval → **fault minute**: stays in eligible, contributes 0 to available. Added to `DegradedMinutes`.
 - In a customer-initiated interval → **healthy gap**: subtracted from eligible (deliberate stop/deallocate/restart).
-- Outside any fault interval → **healthy gap**: subtracted from eligible (no impact on availability %).
+- Outside any fault interval → **healthy gap**: subtracted from eligible (no impact on availability %). For supported kinds, the tool also checks Activity Log so the gap can be explicitly tied to a lifecycle operation when present.
 
 **0% metric gaps** (metric explicitly reported 0% with active transactions):
 
 - In a fault interval → **fault minute**: stays in eligible, contributes 0 to available. Added to `DegradedMinutes`.
 - In a customer-initiated interval → **healthy gap**: subtracted from eligible.
 - In an Unknown interval → **healthy gap**: subtracted from eligible. The 0% is likely an Azure Monitor artefact during a monitoring outage.
-- Outside fault and Unknown intervals → **downtime**: stays in eligible, contributes 0 to available. Added to `DegradedMinutes`. The metric is trusted — requests were failing with no health explanation.
+- Outside fault and Unknown intervals → for supported kinds, cross-check Activity Log. If a matching lifecycle operation is found, the minute becomes a **healthy gap** and is subtracted from eligible. Otherwise it is **downtime**: stays in eligible, contributes 0 to available. Added to `DegradedMinutes`.
 
 **Positive degraded metric values** (`0% < value < 100%`):
 
 - In a customer-initiated interval → **customer-excused degraded minute**: subtracted from eligible and removed from `AvailableMinutes`.
-- Outside a customer-initiated interval → counted normally as degraded availability: stays in eligible, contributes its fractional value to available, and increments `DegradedMinutes`.
+- Outside a customer-initiated interval → for supported kinds, cross-check Activity Log. If a matching lifecycle operation is found, the minute is excused exactly like a customer-initiated health interval. Otherwise it is counted normally as degraded availability: stays in eligible, contributes its fractional value to available, and increments `DegradedMinutes`.
 
 States that are **not** considered faults (close any open fault interval):
 
@@ -68,12 +81,12 @@ States that are **not** considered faults (close any open fault interval):
 | `Unknown` | Azure cannot determine health — typically says *"unable to determine health due to Azure Monitor issue"*. A monitoring gap, not a confirmed outage. |
 | Customer-initiated | Deliberate stop/deallocate/restart — detected via `reasonType`, `context`, or `healthEventCause` fields |
 
-Customer-initiated events are detected via multiple API fields for robustness:
+Customer-initiated Resource Health events are detected via multiple API fields for robustness:
 - `reasonType`: `"Customer Initiated"` or `"User Initiated"`
 - `context`: `"Customer Initiated"`
 - `healthEventCause`: `"UserInitiated"`
 
-If the Resource Health API call fails for a resource, all its gaps are conservatively treated as faults (no potential downtime is hidden).
+If the Resource Health API call fails for a resource, all its gaps are conservatively treated as faults (no potential downtime is hidden). If Resource Health succeeds but the Activity Log call fails for a supported kind, the tool keeps the Resource Health decision only: unexplained 0% minutes remain downtime, unexplained degraded datapoints remain degraded, and null gaps remain non-downtime.
 
 ### Step 4 — Assemble results
 
@@ -85,8 +98,8 @@ AvailabilityPct  = AvailableMinutes / EligibleMinutes × 100
 ```
 
 - **Fault gap minutes** (null or 0% in fault intervals, or 0% outside fault/Unknown/customer intervals) remain in `EligibleMinutes` and contribute 0 to `AvailableMinutes`, reducing the percentage.
-- **Healthy gap minutes** (null metrics outside faults, or 0% metrics during `Unknown` or customer-initiated health windows) are removed from `EligibleMinutes`, so they don't affect the percentage.
-- **Customer-excused degraded minutes** (positive degraded datapoints during customer-initiated health windows) are removed from both `EligibleMinutes` and `AvailableMinutes`, so deliberate stop/start transitions do not distort the percentage.
+- **Healthy gap minutes** (null metrics outside faults, or 0% metrics during `Unknown`, customer-initiated, or matched Activity Log lifecycle windows) are removed from `EligibleMinutes`, so they don't affect the percentage.
+- **Customer-excused degraded minutes** (positive degraded datapoints during customer-initiated health windows or matched Activity Log lifecycle windows) are removed from both `EligibleMinutes` and `AvailableMinutes`, so deliberate stop/start transitions do not distort the percentage.
 - **Zero-transaction storage minutes** are removed from `EligibleMinutes` (no availability signal when there are no transactions).
 - **DegradedMinutes** consolidates metric-level degradation that remains eligible (non-zero values below 100%) and all gap minutes counted as downtime (fault-confirmed or trusted 0%).
 - Resources with zero eligible minutes show `N/A`.
@@ -129,6 +142,7 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 | `--kinds` | `-k` | `vm sql storage` | Resource kinds to process |
 | `--resource` | `-r` | *(all)* | Filter to a single resource name |
 | `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
+| `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
 
 The reporting window is automatically set to the last 30 days. No date parameter is needed.
 
@@ -160,6 +174,12 @@ dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/p
 # Single resource
 ./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO --resource spiacomdgs01
 
+# SQL database by displayed server/database name
+./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO --resource tabfpsql01azne/tabfpsqldb01azne
+
+# Override the Activity Log grace window
+./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO --resource spocovm01a --activity-grace-minutes 15
+
 # Or run directly without publishing
 cd csharp/GetAvailability
 dotnet run -- --subscriptions POSTE-BANCOPOSTA-PRODUZIONE
@@ -186,20 +206,22 @@ A per-subscription summary is printed grouping numerically-counted resources by 
 Console output also reports per-resource classification details:
 
 ```
-  [spiacomdgs01] 21578 non-perfect gap min excluded from eligibility (no fault / Unknown / customer-initiated in Resource Health)
-  [trepomndgw01a] 64 degraded metric min excluded from eligibility (customer-initiated activity)
-  [pbckbptstaticsa03azin] 4 gap min confirmed as downtime (Resource Health fault)
-  [tabfpfuncsa01azne] 9 gap min counted as downtime (0% metric, no health explanation)
+  [spocovm01a] metric scan found 38906 gap min (null/0% availability values)
+  [spocovm01a] checked against Resource Health: 38787 gap min explained as no-fault / Unknown / customer-initiated, 0 confirmed as downtime
+  [spocovm01a] checked 119 still-unexplained gap min against Activity Log: 119 explained by admin lifecycle events
+  [spocovm01a] eligible min = 43200 - 38787 gap min excluded by Resource Health - 119 gap min excluded by Activity Log = 4294
+  [trepomndgw01a] 64 degraded metric min excluded from eligibility (customer-admin lifecycle explanation)
 ```
 
 ## Architecture notes
 
 - **Single metric API call per resource.** Storage Accounts fetch 2 metrics (availability + transactions) in one call. VMs and SQL DBs fetch 1 metric each.
-- **No Activity Log dependency.** All gap verification is done via Resource Health — no `resourcechanges` or Activity Log queries.
+- **Activity Log fallback for supported lifecycle-driven resources.** Resource Health remains the primary classifier. Virtual Machines use `start`, `deallocate`, `powerOff`, and `restart`; Azure SQL Databases use `pause` and `resume`.
 - **Any non-perfect minute can be customer-excused.** Nulls, 0% datapoints, and positive degraded datapoints are excluded from eligibility when Resource Health marks the interval as customer/user initiated.
-- **0% = gap with nuance.** Metric values of exactly 0% are routed through Resource Health rather than blindly counted as outages. During `Unknown` or customer-initiated health windows they are treated as non-downtime (subtracted from eligible). During confirmed faults or when health shows no issue, the 0% is trusted as real downtime.
+- **0% = gap with nuance.** Metric values of exactly 0% are routed through Resource Health rather than blindly counted as outages. During `Unknown` or customer-initiated health windows they are treated as non-downtime (subtracted from eligible). For supported kinds, unresolved 0% minutes get one more chance through Activity Log. Only if both sources fail to explain them are they treated as real downtime.
 - **Unknown ≠ fault.** Resource Health `Unknown` state (typically *"unable to determine health due to Azure Monitor issue"*) does not open a fault interval. Only `Unavailable` and `Degraded` count as faults.
-- **Customer-initiated awareness.** Resource Health events with `context: "Customer Initiated"`, `reasonType: "Customer Initiated"` / `"User Initiated"`, or `healthEventCause: "UserInitiated"` create customer intervals. Any availability metric minute below 100% inside those windows is excluded from availability math.
+- **Customer/admin-initiated awareness.** Resource Health events with `context: "Customer Initiated"`, `reasonType: "Customer Initiated"` / `"User Initiated"`, or `healthEventCause: "UserInitiated"` create customer intervals. For supported kinds, Activity Log lifecycle operations create the same effect for unresolved minutes. Any availability metric minute below 100% inside those windows is excluded from availability math.
+- **Configurable grace for transition tails.** `--activity-grace-minutes` defaults to `10` and extends lifecycle-operation intervals that are known to leave trailing anomalous datapoints after the control-plane operation finishes.
 - **Conservative on failure.** If a Resource Health API call fails, gaps are treated as faults to avoid hiding potential downtime.
 - **Transaction-aware storage.** Zero-transaction minutes are excluded from eligibility rather than counted as unavailable, giving an accurate picture of actual storage service availability.
 - **Whole-window no-signal exclusion.** If a resource produces no numeric availability datapoints across the full period, it is excluded from availability calculations and shown as `N/A`.

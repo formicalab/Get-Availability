@@ -33,25 +33,27 @@ public static class ResourceInventoryService
             ? $"type =~ '{types[0]}'"
             : string.Join(" or ", types.Select(t => $"type =~ '{t}'"));
 
-        // Build optional resource name filter
+        string escapedResourceName = resourceName?.Replace("'", "\\'") ?? "";
         string nameFilter = resourceName != null
-            ? $"| where name =~ '{resourceName.Replace("'", "\\'")}'\n"
+            ? $"| where displayName =~ '{escapedResourceName}' or name =~ '{escapedResourceName}'\n"
             : "";
 
         string query = $"""
             resources
             | where {typeFilter}
-            {nameFilter}| extend idParts = split(id, '/')
+            | extend idParts = split(id, '/')
             | extend sqlServerName = iff(type =~ 'microsoft.sql/servers/databases', tostring(idParts[8]), '')
             | extend databaseName = iff(type =~ 'microsoft.sql/servers/databases', tostring(idParts[10]), '')
             | where not(type =~ 'microsoft.sql/servers/databases' and databaseName =~ 'master')
+            | extend displayName = iff(type =~ 'microsoft.sql/servers/databases', strcat(sqlServerName, '/', databaseName), name)
+            {nameFilter}
             | extend resourceKind = case(
                 type =~ 'microsoft.compute/virtualmachines', 'VirtualMachine',
                 type =~ 'microsoft.sql/servers/databases', 'AzureSqlDatabase',
                 type =~ 'microsoft.storage/storageaccounts', 'StorageAccount',
                 'Other'
             )
-            | project id, name, type, subscriptionId, resourceGroup, location, resourceKind,
+            | project id, name, displayName, type, subscriptionId, resourceGroup, location, resourceKind,
                       sqlServerName, databaseName
             """;
 
@@ -81,19 +83,7 @@ public static class ResourceInventoryService
                     var kind = row.GetProperty("resourceKind").GetString()!;
                     var subId = row.GetProperty("subscriptionId").GetString()!;
 
-                    // SQL DB names are shown as "server/database" for clarity
-                    string name;
-                    if (kind == "AzureSqlDatabase")
-                    {
-                        var server = row.GetProperty("sqlServerName").GetString() ?? "";
-                        var db = row.GetProperty("databaseName").GetString() ?? "";
-                        name = !string.IsNullOrEmpty(server) && !string.IsNullOrEmpty(db)
-                            ? $"{server}/{db}" : row.GetProperty("name").GetString()!;
-                    }
-                    else
-                    {
-                        name = row.GetProperty("name").GetString()!;
-                    }
+                    string name = row.GetProperty("displayName").GetString() ?? row.GetProperty("name").GetString()!;
 
                     resources.Add(new TrackedResource
                     {

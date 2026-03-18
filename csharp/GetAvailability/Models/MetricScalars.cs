@@ -5,10 +5,10 @@ namespace GetAvailability.Models;
 /// <param name="GapMinutes">Total count of null-metric and 0%-metric minutes to verify via Resource Health.</param>
 /// <param name="ZeroTxMin">Storage only: minutes with zero transactions — subtracted from eligible.</param>
 /// <param name="ExcludeFromAvailability">True when the resource produced no numeric availability datapoints across the full window. These resources are excluded from availability calculations.</param>
-/// <param name="GapTicks">UTC ticks of null-metric minutes, for Resource Health gap classification.</param>
-/// <param name="ZeroAvailTicks">UTC ticks of 0%-metric minutes — excused during Unknown or customer-initiated health windows.</param>
-/// <param name="DegradedMinutes">Minutes where a metric datapoint was present but below 100% (and above 0%). These can later be excused if Resource Health shows customer-initiated activity.</param>
-/// <param name="DegradedSamples">Normalized availability values for positive degraded datapoints, used to exclude customer-initiated degraded minutes from eligibility and available minutes.</param>
+/// <param name="GapTicks">UTC ticks of null-metric minutes, for Resource Health-first gap classification with Activity Log fallback where applicable.</param>
+/// <param name="ZeroAvailTicks">UTC ticks of 0%-metric minutes — excused during Unknown, customer-initiated, or supported lifecycle-operation windows.</param>
+/// <param name="DegradedMinutes">Minutes where a metric datapoint was present but below 100% (and above 0%). These can later be excused if Resource Health or Activity Log shows customer/admin-initiated activity.</param>
+/// <param name="DegradedSamples">Normalized availability values for positive degraded datapoints, used to exclude customer/admin-initiated degraded minutes from eligibility and available minutes.</param>
 public readonly record struct MetricScalars(
     double AvailableSum,
     int GapMinutes,
