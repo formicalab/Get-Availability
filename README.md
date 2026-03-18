@@ -1,196 +1,137 @@
 # Get-Availability
 
-Reports rolling 14-day availability for Azure Virtual Machines, Azure SQL Databases, and Azure Storage Accounts across one or more Azure subscriptions.
+Reports rolling 30-day availability for Azure Virtual Machines, Azure SQL Databases, and Azure Storage Accounts across one or more Azure subscriptions.
 
-Available in two implementations:
+The reporting window is always the last 30 days (now − 30 days → now), aligned with the [Resource Health API retention](https://learn.microsoft.com/en-us/azure/service-health/resource-health-overview) (~30 days).
 
-| | PowerShell | C# (.NET 10, Native AOT) |
-|---|---|---|
-| **Location** | `get-availability.ps1` | `csharp/GetAvailability/` |
-| **Runtime** | PowerShell 7+ with Az modules | Standalone `.exe` — no runtime required |
-| **Auth** | `Connect-AzAccount` | `DefaultAzureCredential` (az login, managed identity, etc.) |
-| **Parallelism** | `ForEach-Object -Parallel` | `Parallel.ForEachAsync` (async/await) |
-| **Typical speed** | ~9 min (237 resources, 3 subs) | ~1 min (same workload, ~9× faster) |
-| **Binary size** | N/A | ~15 MB self-contained |
+Built with .NET 10 and published as a **Native AOT** self-contained executable (~15 MB, no runtime required).
 
-Both implementations share identical business logic, produce identical results, and support the same parameters.
+For each resource, the tool answers:
 
-For each resource, the script answers:
-
-- How many minutes was it **eligible** (expected to be running/available)?
+- How many minutes was it **eligible** (expected to be available)?
 - How many of those minutes was it **available** (confirmed by Azure Monitor)?
-- What is the **availability percentage** (Available / Eligible × 100)?
+- What is the **availability percentage** (Available ÷ Eligible × 100)?
+- How many minutes were **degraded** (availability < 100% or confirmed faults)?
 
 ## How it works
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  1. Resource Graph — Inventory query (resources table)                  │
-│     → VMs + SQL DBs + Storage Accounts, current state, creation date   │
-│                                                                         │
-│  2. Resource Graph — Change events (resourcechanges table)              │
-│     → start/stop/create/delete lifecycle transitions, 14-day retention  │
-│                                                                         │
-│  3. Azure Monitor Metrics REST API (parallel, per-resource)             │
-│     → VMs: VmAvailabilityMetric + CPU + Network (3 metrics, one call)  │
-│     → SQL DBs: Availability (single metric)                            │
-│     → Storage: Availability + Transactions (2 metrics, one call)       │
-│                                                                         │
-│  4. Per-resource: build exclusion windows → eligible minutes            │
-│  5. Per-resource: filter metric data points against windows → available │
-│  6. Per-resource: inline gap recovery via supplementary metrics (VMs)   │
-│  7. Per-resource: zero-transaction exclusion (Storage Accounts)         │
-│  8. Output: availability % per resource + summary by kind/location      │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
 ### Step 1 — Resource inventory
 
-A single KQL query against the `resources` table returns all VMs, SQL databases (excluding system `master` DBs), and Storage Accounts with their **current state** inline — no per-resource REST calls needed.
+A single KQL query against the Resource Graph `resources` table returns all VMs, SQL databases (excluding system `master` DBs), and Storage Accounts. Server-side KQL filters are applied when `--kinds` or `--resource` are provided, minimising data transfer.
 
-- VMs: `properties.extended.instanceView.powerState.code` → stripped to `running`, `deallocated`, etc.
-- SQL DBs: `properties.status` → `Online`, `Paused`, `Resuming`, etc.
-- Storage Accounts: `properties.creationTime` for creation date (no power state concept).
+### Step 2 — Fetch availability metrics
 
-### Step 2 — Lifecycle events
+Azure Monitor is queried per-resource in parallel (configurable via `--parallelism`, default auto-scales to CPU cores) with retry on 429/5xx errors. Granularity is PT1M (one data point per minute).
 
-Three KQL queries against the `resourcechanges` table (VMs, SQL DBs, Storage Accounts) detect lifecycle transitions within the 14-day window. Each change is normalized into one of four event kinds:
-
-| Source state | Event kind | Resource types |
-|---|---|---|
-| `PowerState/running`, `Online` | **Start** | VM, SQL DB |
-| `PowerState/deallocated`, `PowerState/stopped`, `PowerState/deallocating`, `PowerState/stopping`, `Paused`, `Pausing` | **Stop** | VM, SQL DB |
-| changeType = `Create` | **Create** | VM, SQL DB, Storage |
-| changeType = `Delete` | **Delete** | VM, SQL DB, Storage |
-
-**Shutdown-direction intermediates** (`Pausing`, `deallocating`, `stopping`) are mapped to `Stop` so the exclusion window starts as soon as shutdown begins — independent of the transition tolerance. Startup-direction intermediates (`Resuming`, `starting`) are intentionally **not** mapped; the `Online`/`running` event marks actual availability.
-
-Storage Accounts only track Create/Delete events (no start/stop concept).
-
-### Step 3 — Availability metrics
-
-Azure Monitor is queried per-resource in parallel (configurable parallelism, default 8) with exponential backoff on 429/5xx errors:
-
-| Resource type | Metrics requested | Scale | Aggregation |
+| Resource type | Metrics requested | Native scale | Aggregation |
 |---|---|---|---|
-| Virtual Machine | `VmAvailabilityMetric`, `Percentage CPU`, `Network In Total` | 0.0–1.0 (primary) | Minimum, Average |
-| Azure SQL Database | `Availability` | 0–100 → normalized to 0.0–1.0 | Minimum |
-| Storage Account | `Availability`, `Transactions` | 0–100 → normalized to 0.0–1.0 | Minimum, Total |
+| Virtual Machine | `VmAvailabilityMetric` | 0.0–1.0 | Minimum |
+| Azure SQL Database | `Availability` | 0–100 → normalised to 0.0–1.0 | Minimum |
+| Storage Account | `Availability`, `Transactions` | 0–100 → normalised to 0.0–1.0 | Minimum, Total |
 
-Granularity is PT1M (one data point per minute). VMs fetch 3 metrics in a single API call (~4MB, under the 8MB Azure response limit). The supplementary CPU and Network metrics enable inline gap recovery without a separate API call.
+For each data point in the response:
 
-## Availability calculation
+- **Value > 0 and < 100%** → added to `AvailableSum` as a fractional contribution (e.g. 99.5% → 0.995). Counted as a **degraded minute**.
+- **Value = 100%** → adds 1.0 to `AvailableSum` (fully available).
+- **Value = 0% or null (missing)** → timestamp recorded as a **gap tick** for health verification. These are often caused by Azure Monitor issues rather than real outages.
+- **Storage only: Transactions = 0** → counted as `ZeroTxMin` (no availability signal to measure).
 
-### Eligible minutes
+### Step 3 — Classify metric gaps via Resource Health
+
+For every resource that has gap ticks (null or 0% datapoints), the tool queries the [Resource Health REST API](https://learn.microsoft.com/en-us/rest/api/resourcehealth/availability-statuses/list?view=rest-resourcehealth-2025-05-01) (`availabilityStatuses`, API version `2025-05-01`) to retrieve the health timeline.
+
+The health timeline is converted into **fault intervals** (periods of `Unavailable`/`Degraded`) and **Unknown intervals** (periods where Azure cannot determine health). Each gap tick is classified according to its type:
+
+**Null metric gaps** (metric absent — VM off, telemetry gap, etc.):
+
+- In a fault interval → **fault minute**: stays in eligible, contributes 0 to available. Added to `DegradedMinutes`.
+- Outside any fault interval → **healthy gap**: subtracted from eligible (no impact on availability %).
+
+**0% metric gaps** (metric explicitly reported 0% with active transactions):
+
+- In a fault interval → **fault minute**: stays in eligible, contributes 0 to available. Added to `DegradedMinutes`.
+- In an Unknown interval → **healthy gap**: subtracted from eligible. The 0% is likely an Azure Monitor artefact during a monitoring outage.
+- Outside fault and Unknown intervals → **downtime**: stays in eligible, contributes 0 to available. Added to `DegradedMinutes`. The metric is trusted — requests were failing with no health explanation.
+
+States that are **not** considered faults (close any open fault interval):
+
+| Health state | Rationale |
+|---|---|
+| `Available` | Resource confirmed healthy |
+| `Unknown` | Azure cannot determine health — typically says *"unable to determine health due to Azure Monitor issue"*. A monitoring gap, not a confirmed outage. |
+| Customer-initiated | Deliberate stop/deallocate/restart — detected via `reasonType`, `context`, or `healthEventCause` fields |
+
+Customer-initiated events are detected via multiple API fields for robustness:
+- `reasonType`: `"Customer Initiated"` or `"User Initiated"`
+- `context`: `"Customer Initiated"`
+- `healthEventCause`: `"UserInitiated"`
+
+If the Resource Health API call fails for a resource, all its gaps are conservatively treated as faults (no potential downtime is hidden).
+
+### Step 4 — Assemble results
 
 ```
-EligibleMinutes = TotalMinutes − ExcludedMinutes
+EligibleMinutes  = TotalMinutes − HealthyGapMinutes − ZeroTxMinutes
+AvailableMinutes = Σ non-gap metric values (each 0.0–1.0)
+DegradedMinutes  = metric minutes < 100% (non-zero, non-null) + fault-confirmed gap minutes + trusted 0% downtimes
+AvailabilityPct  = AvailableMinutes / EligibleMinutes × 100
 ```
 
-Exclusion windows are built in three phases:
+- **Fault gap minutes** (null or 0% in fault intervals, or 0% outside fault/Unknown) remain in `EligibleMinutes` and contribute 0 to `AvailableMinutes`, reducing the percentage.
+- **Healthy gap minutes** (null metrics outside faults, or 0% metrics during `Unknown` health windows) are removed from `EligibleMinutes`, so they don't affect the percentage.
+- **Zero-transaction storage minutes** are removed from `EligibleMinutes` (no availability signal when there are no transactions).
+- **DegradedMinutes** consolidates metric-level degradation (non-zero values below 100%) and all gap minutes counted as downtime (fault-confirmed or trusted 0%).
+- Resources with zero eligible minutes show `N/A`. Resources with no metric data at all show `N/D`.
 
-**Phase 1 — Non-existence:** Delete→Create pairs mark periods when the resource didn't exist. If the resource was created during the 14-day window with no prior delete, the time before creation is also excluded.
+### Worked example
 
-**Phase 2 — Purposeful stops:** Stop→Start pairs mark periods when the resource was intentionally stopped (deallocated, paused). If the first observed event is a Start, the resource was stopped before the window → excluded from period start. If the current power state is stopped/deallocated/paused with no events at all → entire period excluded.
+Consider a VM over a 30-day window (43,200 total minutes):
 
-**Phase 3 — Transition tolerance:** Every power event (Start or Stop) gets a **symmetric ±N minute tolerance zone** (default N=5). This excludes the ramp-down before shutdown and ramp-up after boot where metrics may be degraded.
-
-Multiple consecutive events naturally extend the exclusion: events at 18:00 and 18:02 with N=5 produce a merged window [17:55, 18:07].
-
-All windows are merged and snapped to whole-minute boundaries (floor the start, ceil the end) so that discrete metric data points align with eligible minute counts.
-
-### Available minutes
-
-Each metric data point at time T covers the interval [T, T+1min). A data point is counted toward availability only if **no part** of its interval overlaps any exclusion window.
+| Category | Minutes | Effect |
+|---|---:|---|
+| Metric = 1.0 (fully available) | 40,000 | +40,000 to AvailableSum |
+| Metric = 0.7 (degraded) | 100 | +70 to AvailableSum, +100 DegradedMins |
+| Metric = null — fault confirmed (Unavailable/Degraded) | 10 | +0 to available, stays in eligible, +10 DegradedMins |
+| Metric = 0% — fault or no health explanation | 10 | +0 to available, stays in eligible, +10 DegradedMins |
+| Metric = null — no fault (Available/Unknown/customer) | 3,070 | Subtracted from eligible |
+| Metric = 0% — during Unknown health window | 10 | Subtracted from eligible (monitoring artefact) |
 
 ```
-AvailableMinutes = Σ metric.Value  (for non-excluded data points)
+EligibleMinutes  = 43,200 − 3,070 − 10 = 40,120
+AvailableMinutes = 40,000 + 70 = 40,070
+DegradedMinutes  = 100 + 10 + 10 = 120
+AvailabilityPct  = 40,070 / 40,120 × 100 = 99.88%
 ```
-
-Since the metric values are 0.0–1.0, a fully available minute contributes 1.0 and a degraded minute contributes its fractional value.
-
-### Inline gap recovery (VMs only)
-
-Azure's `VmAvailabilityMetric` occasionally has null data points even when the VM is fully operational (a known telemetry gap). Since the script fetches CPU and Network metrics alongside the primary metric in a single API call, gap recovery is performed inline — no additional API calls needed.
-
-A gap minute is **recovered** (counted as available = 1.0) only if **both** supplementary metrics (`Percentage CPU` and `Network In Total`) report non-null data at that minute.
 
 ### Storage Account — transaction-based eligibility
 
-Storage Account `Availability` is a transaction-success-rate metric — it is only meaningful when there are actual transactions. Minutes with zero transactions have no availability signal and are **excluded from eligible minutes** rather than counted as unavailable.
+Storage Account `Availability` is a transaction-success-rate metric — it is only meaningful when there are actual transactions. The tool fetches both `Availability` and `Transactions` in a single API call. For each minute:
 
-The script fetches both `Availability` and `Transactions` in a single API call. For each minute:
-- **Transactions > 0 and Availability not null:** use the Availability value as the data point
-- **Transactions = 0 or null:** subtract this minute from eligible minutes
-
-### Final formula
-
-```
-AvailabilityPct = AvailableMinutes / EligibleMinutes × 100
-```
-
-Resources that are stopped/non-existent for the entire period show `N/A` (zero eligible minutes).
+- **Transactions > 0 and Availability > 0%:** the Availability value (0–100, normalised to 0.0–1.0) counts toward available minutes. Values below 100% count as degraded.
+- **Transactions > 0 and Availability null or 0%:** recorded as a gap tick, checked via Resource Health.
+- **Transactions = 0 or null:** subtracted from eligible minutes (no availability signal).
 
 ## Parameters
-
-### PowerShell
-
-| Parameter | Default | Description |
-|---|---|---|
-| `SubscriptionNames` | *(required)* | One or more Azure subscription display names (string array) |
-| `ResourceKinds` | `vm,sql,storage` | Resource kinds to process |
-| `ResourceName` | *(all)* | Filter to a single resource. Use `server/db` format for SQL DBs |
-| `TransitionToleranceMinutes` | `5` | Symmetric ±N tolerance around each start/stop event (0–120) |
-| `Parallelism` | *(auto)* | Max concurrent metric API calls (1–64) |
-
-### C# (CLI)
 
 | Option | Short | Default | Description |
 |---|---|---|---|
 | `--subscriptions` | `-s` | *(required)* | One or more Azure subscription display names |
 | `--kinds` | `-k` | `vm sql storage` | Resource kinds to process |
 | `--resource` | `-r` | *(all)* | Filter to a single resource name |
-| `--tolerance` | `-t` | `5` | Symmetric ±N tolerance around each start/stop event |
-| `--parallelism` | `-p` | *(auto)* | Max concurrent metric API calls |
+| `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
+
+The reporting window is automatically set to the last 30 days. No date parameter is needed.
 
 ## Prerequisites
 
-### PowerShell
-
 | Requirement | Detail |
 |---|---|
-| PowerShell | 7.0 or later |
-| Az modules | `Az.Accounts`, `Az.ResourceGraph` |
-| Azure context | `Connect-AzAccount` must already be established |
-
-### C# (build from source)
-
-| Requirement | Detail |
-|---|---|
-| .NET SDK | 10.0 or later |
+| .NET SDK | 10.0 or later (build from source only) |
 | Azure auth | `az login` or any method supported by `DefaultAzureCredential` |
 
 The published binary (`GetAvailability.exe`) requires no .NET runtime — it is a Native AOT self-contained executable.
 
 ## Usage
-
-### PowerShell
-
-```powershell
-# Single subscription
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE'
-
-# Multiple subscriptions
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO','POSTE-BANCOPOSTA-PRODUZIONE','POSTE-BANCOPOSTA-CERTIFICAZIONE'
-
-# Single resource (searched across all specified subscriptions)
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO' -ResourceName 'spiacomdgs01'
-
-# Custom tolerance
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -TransitionToleranceMinutes 10
-```
-
-### C#
 
 ```bash
 # Build the Native AOT binary (one-time)
@@ -201,16 +142,13 @@ dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/p
 ./GetAvailability --subscriptions POSTE-BANCOPOSTA-PRODUZIONE
 
 # Multiple subscriptions
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO POSTE-BANCOPOSTA-PRODUZIONE POSTE-BANCOPOSTA-CERTIFICAZIONE
+./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO POSTE-BANCOPOSTA-PRODUZIONE
 
 # Filter by resource kind
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --kinds VirtualMachine StorageAccount
+./GetAvailability --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --kinds vm sql
 
 # Single resource
 ./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO --resource spiacomdgs01
-
-# Custom tolerance and parallelism
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --tolerance 10 --parallelism 8
 
 # Or run directly without publishing
 cd csharp/GetAvailability
@@ -219,32 +157,40 @@ dotnet run -- --subscriptions POSTE-BANCOPOSTA-PRODUZIONE
 
 ## Output
 
-Default table view:
+The header line shows the reporting window and total minutes:
 
-| SubscriptionName | Name | Kind | Location | AvailabilityPct | AvailableMinutes | EligibleMinutes | TotalMinutes | Explanation |
-|---|---|---|---|---:|---:|---:|---:|---|
-| PRODUZIONE | `sabfpsql01azne/sabfpsqldb01azne` | AzureSqlDatabase | northeurope | 100 | 20160 | 20160 | 20160 | Fully eligible for the entire period |
-| PRODUZIONE | `spiacomdgs01` | VirtualMachine | northeurope | 100 | 2794 | 2794 | 20160 | Stopped/deallocated for 17366 min; ... |
-| PRODUZIONE | `mystorageacct` | StorageAccount | westeurope | 99.99 | 8540 | 8541 | 20160 | Fully eligible for the entire period |
+```
+Period: rolling 30 days (2026-02-16 10:34:00Z -> 2026-03-18 10:34:00Z, 43200 min)
+```
+
+Table view:
+
+| SubscriptionName | Name | Kind | Location | Avail% | AvailMin | EligMin | DegradedMins |
+|---|---|---|---|---:|---:|---:|---:|
+| PRODUZIONE | `sabfpsql01azne/sabfpsqldb01azne` | AzureSqlDatabase | northeurope | 100.00 | 43200 | 43200 | |
+| SVILUPPO | `spiacomdgs01` | VirtualMachine | northeurope | 99.48 | 4300 | 4322 | 22 |
+| PRODUZIONE | `mystorageacct` | StorageAccount | westeurope | 99.99 | 8540 | 8541 | 1 |
 
 A per-subscription summary is printed grouping resources by Kind + Location with resource count and aggregate availability. When multiple subscriptions are processed, a cross-subscription overall summary is printed at the end.
 
-Additional properties available on the pipeline object: `ResourceId`, `ResourceGroupName`, `CreatedAt`, `ExclusionWindows`.
+Console output also reports per-resource gap classification details:
+
+```
+  [spiacomdgs01] 21578 gap min ignored (no fault in Resource Health)
+  [pbckbptstaticsa03azin] 4 gap min confirmed as downtime (Resource Health fault)
+  [tabfpfuncsa01azne] 9 gap min counted as downtime (0% metric, no health explanation)
+```
 
 ## Architecture notes
 
-Both implementations share the same algorithmic design:
-
-- **Single API call per resource.** VMs fetch 3 metrics (availability + CPU + network) in one call (~4MB, under Azure's 8MB limit). Storage Accounts fetch 2 metrics (availability + transactions) in one call. SQL DBs fetch 1 metric.
-- **No per-resource REST calls for inventory or power state.** The Resource Graph `resources` table returns current state inline.
-- **No Activity Log dependency.** The `resourcechanges` table provides 14-day lifecycle history with a single paginated query per resource type.
-- **Shutdown intermediates captured early.** `Pausing`/`deallocating`/`stopping` map to Stop events so exclusion starts immediately.
-- **Metric boundary alignment.** Exclusion windows are floor/ceil-snapped to whole minutes so discrete metric data points match eligible minute counts exactly.
-- **Inline gap recovery.** Supplementary CPU and Network metrics are fetched alongside the primary metric — no second-pass API calls needed. A gap minute requires both metrics to be non-null.
+- **Single metric API call per resource.** Storage Accounts fetch 2 metrics (availability + transactions) in one call. VMs and SQL DBs fetch 1 metric each.
+- **No Activity Log dependency.** All gap verification is done via Resource Health — no `resourcechanges` or Activity Log queries.
+- **0% = gap with nuance.** Metric values of exactly 0% are routed through Resource Health rather than blindly counted as outages. During `Unknown` health windows they are treated as monitoring artefacts (subtracted from eligible). During confirmed faults or when health shows no issue, the 0% is trusted as real downtime.
+- **Unknown ≠ fault.** Resource Health `Unknown` state (typically *"unable to determine health due to Azure Monitor issue"*) does not open a fault interval. Only `Unavailable` and `Degraded` count as faults.
+- **Customer-initiated awareness.** Resource Health events with `context: "Customer Initiated"`, `reasonType: "Customer Initiated"` / `"User Initiated"`, or `healthEventCause: "UserInitiated"` are not counted as faults — deliberate stops/deallocations don't penalise availability.
+- **Conservative on failure.** If a Resource Health API call fails, gaps are treated as faults to avoid hiding potential downtime.
 - **Transaction-aware storage.** Zero-transaction minutes are excluded from eligibility rather than counted as unavailable, giving an accurate picture of actual storage service availability.
-
-The C# port adds:
-
-- **`Parallel.ForEachAsync`** for concurrent metric queries with configurable parallelism.
-- **Ticks-based metric keying** (`long` instead of `DateTime.ToString`) — zero-allocation per data point.
-- **Native AOT** — ~15 MB standalone binary, no .NET runtime required, ~7× faster than PowerShell.
+- **`Parallel.ForEachAsync`** for concurrent metric and health queries with configurable parallelism.
+- **Ticks-based metric keying** (`long` instead of `DateTime`) — zero-allocation per data point.
+- **Rolling 30-day window.** The reporting period is always the last 30 days, matching the Resource Health API retention. No date parameter is needed.
+- **Native AOT** — ~15 MB standalone binary, no .NET runtime required.

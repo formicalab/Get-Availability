@@ -1,19 +1,431 @@
-Month: febbraio 2026 (2026-02-01 00:00:00Z -> 2026-03-01 00:00:00Z, 40320 min, tolerance: +/-5 min)
-Processing 3 subscription(s): POSTE-BANCOPOSTA-SVILUPPO, POSTE-BANCOPOSTA-PRODUZIONE, POSTE-BANCOPOSTA-CERTIFICAZIONE
+Period: rolling 30 days (2026-02-16 10:52:00Z -> 2026-03-18 10:52:00Z, 43200 min)
+Processing 3 subscription(s): POSTE-BANCOPOSTA-PRODUZIONE, POSTE-BANCOPOSTA-SVILUPPO, POSTE-BANCOPOSTA-CERTIFICAZIONE
 Querying resource inventory... Found 237 resource(s) across 3 subscription(s) (kinds: vm, sql, storage).
-Unhandled exception. System.Net.Http.HttpRequestException: Response status code does not indicate success: 400 (Bad Request).
-   at System.Net.Http.HttpResponseMessage.EnsureSuccessStatusCode() + 0xd4
-   at GetAvailability.Services.ActivityLogService.<GetWithRetryAsync>d__3.MoveNext() + 0x291
---- End of stack trace from previous location ---
-   at GetAvailability.Services.ActivityLogService.<>c__DisplayClass2_0.<<QueryAsync>b__0>d.MoveNext() + 0xa5
---- End of stack trace from previous location ---
-   at System.Threading.Tasks.Parallel.<>c__53`1.<<ForEachAsync>b__53_0>d.MoveNext() + 0x12d
---- End of stack trace from previous location ---
-   at GetAvailability.Services.ActivityLogService.<QueryAsync>d__2.MoveNext() + 0x52b
---- End of stack trace from previous location ---
-   at Program.<<<Main>$>g__RunAsync|0_0>d.MoveNext() + 0x6a6
---- End of stack trace from previous location ---
-   at Program.<<Main>$>d__0.MoveNext() + 0x70
---- End of stack trace from previous location ---
-   at Program.<Main>(String[] args) + 0x28
-Querying activity log... 
+Querying metrics for 237 resource(s) with parallelism 16...
+
+  [10 / 237] cbancopostastaticrunbook                          
+  [20 / 237] creengareatraspsa01a                              
+  [30 / 237] cpocovm01a                                        
+  [40 / 237] pcesopsql01azne/CESOP                             
+  [50 / 237] ppocosql01azin/Logon                              
+  [60 / 237] cmacehdihba2dlake01azwe                           
+  [70 / 237] pbfmsaf01azwe                                     
+  [80 / 237] pabfpfuncsa01azwe                                 
+  [90 / 237] pdnamrtsa01azwe                                   
+  [100 / 237] pbckbptms01azin                                   
+  [110 / 237] probofiles01azwe                                  
+  [120 / 237] ppiacomdgs02                                      
+  [130 / 237] probodgs01                                        
+  [140 / 237] tcesopsql01azne/Cesop_Config                      
+  [150 / 237] spocosql01azne/WorkFlow                           
+  [160 / 237] sabfpfuncsa02azne                                 
+  [170 / 237] smacesa01azne                                     
+  [180 / 237] tdgaetlsa01azne                                   
+  [190 / 237] torssastatics01azne                               
+  [200 / 237] tpvpdsa01azne                                     
+  [210 / 237] spiacomring01                                     
+  [220 / 237] tdnamrtsa01azne                                   
+  [230 / 237] tpiacomdgs02                                      
+  [237 / 237] vm-test                                           
+Checking Resource Health for 106 resource(s) with metric gaps...
+
+  [10 / 106] cpiacomdgs02                                      
+  [20 / 106] cpocovm01a                                        
+  [30 / 106] vm-db-import                                      
+  [40 / 106] pbpaa01a                                          
+  [50 / 106] pmaceal02azwe                                     
+  [60 / 106] rhel8ans0-PROD                                    
+  [70 / 106] sdnamrtdatagata                                   
+  [80 / 106] probosfc01                                        
+  [90 / 106] test-hbase                                        
+  [100 / 106] tmaceal01azne                                     
+  [106 / 106] vm-test                                           
+  [cdgaetlsa01azwe] 8 gap min ignored (no fault in Resource Health)
+  [cloansa01azwe] 3 gap min ignored (no fault in Resource Health)
+  [corssastatics01azin] 1 gap min ignored (no fault in Resource Health)
+  [cppborselesa01azwe] 2 gap min ignored (no fault in Resource Health)
+  [crdswebsastatic01a] 1 gap min ignored (no fault in Resource Health)
+  [creengareatraspsa01a] 1 gap min ignored (no fault in Resource Health)
+  [tstatecommonbpcert] 1 gap min ignored (no fault in Resource Health)
+  [azcopy-test] 43200 gap min ignored (no fault in Resource Health)
+  [ccesopas01a] 43200 gap min ignored (no fault in Resource Health)
+  [cmaceal01azwe] 43200 gap min ignored (no fault in Resource Health)
+  [cmaceal02azwe] 43200 gap min ignored (no fault in Resource Health)
+  [cpiacomdgs01] 41911 gap min ignored (no fault in Resource Health)
+  [cpiacomdgs02] 41910 gap min ignored (no fault in Resource Health)
+  [cpiacomring01] 41910 gap min ignored (no fault in Resource Health)
+  [cpiacomsfc01] 41909 gap min ignored (no fault in Resource Health)
+  [cpocovm01a] 43200 gap min ignored (no fault in Resource Health)
+  [crobodgs01] 41918 gap min ignored (no fault in Resource Health)
+  [crobosfc01] 41916 gap min ignored (no fault in Resource Health)
+  [vm-db-import] 43200 gap min ignored (no fault in Resource Health)
+  [dbstorageo3lfs3qmhycu6] 2 gap min ignored (no fault in Resource Health)
+  [pabfpsa02azwe] 2 gap min ignored (no fault in Resource Health)
+  [pbancopostastaticrunbook] 1 gap min ignored (no fault in Resource Health)
+  [pbckbpdls01azwe] 6 gap min ignored (no fault in Resource Health)
+  [pbckbpmssa01azwe] 1 gap min ignored (no fault in Resource Health)
+  [pbckbpsa02azwe] 1 gap min ignored (no fault in Resource Health)
+  [pbckbptdls01azin] 1 gap min ignored (no fault in Resource Health)
+  [pbckbptstaticsa03azin] 4 gap min ignored (no fault in Resource Health)
+  [pdgaetlsa01azwe] 6 gap min ignored (no fault in Resource Health)
+  [ploansa01azwe] 1 gap min ignored (no fault in Resource Health)
+  [porssastatics01azin] 1 gap min ignored (no fault in Resource Health)
+  [pppborselesa01azwe] 14 gap min ignored (no fault in Resource Health)
+  [prdswebsastatic01a] 2 gap min ignored (no fault in Resource Health)
+  [prepomnbesa01azwe] 1 gap min ignored (no fault in Resource Health)
+  [258d804cddaf43609187b5d23c2ffed8] 20 gap min ignored (no fault in Resource Health)
+  [5c931eae550b48bbb41b0e36e2b08bf5] 42 gap min ignored (no fault in Resource Health)
+  [688c2cbaa7144ae583efef5f4dac2599] 183 gap min ignored (no fault in Resource Health)
+  [722cd26acd654040a10845517ac4c5a0] 40 gap min ignored (no fault in Resource Health)
+  [azcopy-test] 48 gap min ignored (no fault in Resource Health)
+  [PBCKBPTAS01AZIN] 1 gap min ignored (no fault in Resource Health)
+  [pbckbptms01azin] 43200 gap min ignored (no fault in Resource Health)
+  [pbpaa01a] 27 gap min ignored (no fault in Resource Health)
+  [pbpms01a] 43200 gap min ignored (no fault in Resource Health)
+  [pcesopas01a] 110 gap min ignored (no fault in Resource Health)
+  [pdnamrtdg01a] 56 gap min ignored (no fault in Resource Health)
+  [pdnamrtdgw01a] 19 gap min ignored (no fault in Resource Health)
+  [pdnamrtdgw02a] 30 gap min ignored (no fault in Resource Health)
+  [pdnarepmonvm01a] 11 gap min ignored (no fault in Resource Health)
+  [pgsql-import] 16 gap min ignored (no fault in Resource Health)
+  [plabrisckmnvm01] 43200 gap min ignored (no fault in Resource Health)
+  [plabrisckmnvm02] 43200 gap min ignored (no fault in Resource Health)
+  [pmaceal01azwe] 205 gap min ignored (no fault in Resource Health)
+  [pmaceal02azwe] 23 gap min ignored (no fault in Resource Health)
+  [ppiacomdgs01] 39 gap min ignored (no fault in Resource Health)
+  [ppiacomdgs02] 53 gap min ignored (no fault in Resource Health)
+  [ppiacomring01] 55 gap min ignored (no fault in Resource Health)
+  [ppiacomsfc01] 213 gap min ignored (no fault in Resource Health)
+  [ppocovm01a] 1 gap min ignored (no fault in Resource Health)
+  [ppocovm02a] 26 gap min ignored (no fault in Resource Health)
+  [prepomndgw01a] 32 gap min ignored (no fault in Resource Health)
+  [probodgs01] 23 gap min ignored (no fault in Resource Health)
+  [probosfc01] 65 gap min ignored (no fault in Resource Health)
+  [psmcseavm01azwe] 48 gap min ignored (no fault in Resource Health)
+  [rhel8ans0-PROD] 42054 gap min ignored (no fault in Resource Health)
+  [rhel9ans0-PROD] 20775 gap min ignored (no fault in Resource Health)
+  [win19ans0-PROD] 37686 gap min ignored (no fault in Resource Health)
+  [win22ans0-PROD] 37702 gap min ignored (no fault in Resource Health)
+  [sdgaetlsa01azne] 1 gap min ignored (no fault in Resource Health)
+  [sloansa01azne] 1 gap min ignored (no fault in Resource Health)
+  [sloanstatics01azne] 2 gap min ignored (no fault in Resource Health)
+  [spmrsastaticazne] 1 gap min ignored (no fault in Resource Health)
+  [srdswebsastatic01a] 1 gap min ignored (no fault in Resource Health)
+  [tpmrsastaticazne] 2 gap min ignored (no fault in Resource Health)
+  [trdswebsastatic01a] 1 gap min ignored (no fault in Resource Health)
+  [sautkpidg01azne] 43200 gap min ignored (no fault in Resource Health)
+  [sdnamrtdatagata] 43200 gap min ignored (no fault in Resource Health)
+  [sdnarepmonvm01a] 43200 gap min ignored (no fault in Resource Health)
+  [smaceal01azne] 43200 gap min ignored (no fault in Resource Health)
+  [spiacomdgs01] 37970 gap min ignored (no fault in Resource Health)
+  [spiacomdgs02] 37964 gap min ignored (no fault in Resource Health)
+  [spiacomring01] 37971 gap min ignored (no fault in Resource Health)
+  [spiacomsfc01] 37943 gap min ignored (no fault in Resource Health)
+  [spocovm01a] 38873 gap min ignored (no fault in Resource Health)
+  [srepomndgw01a] 43200 gap min ignored (no fault in Resource Health)
+  [srobodgs01] 37982 gap min ignored (no fault in Resource Health)
+  [srobosfc01] 37968 gap min ignored (no fault in Resource Health)
+  [ssmcseavm01azne] 43200 gap min ignored (no fault in Resource Health)
+  [tautkpidg01azne] 43200 gap min ignored (no fault in Resource Health)
+  [tcesopas01a] 42935 gap min ignored (no fault in Resource Health)
+  [tdnamrtdatagata] 29979 gap min ignored (no fault in Resource Health)
+  [tdnarepmonvm01a] 27330 gap min ignored (no fault in Resource Health)
+  [test-cert] 43200 gap min ignored (no fault in Resource Health)
+  [test-hbase] 43200 gap min ignored (no fault in Resource Health)
+  [test-reset] 43200 gap min ignored (no fault in Resource Health)
+  [test-reset2] 43200 gap min ignored (no fault in Resource Health)
+  [tmaceal01azne] 27321 gap min ignored (no fault in Resource Health)
+  [tpiacomdgs01] 37969 gap min ignored (no fault in Resource Health)
+  [tpiacomdgs02] 37953 gap min ignored (no fault in Resource Health)
+  [tpiacomring01] 37943 gap min ignored (no fault in Resource Health)
+  [tpiacomsfc01] 37925 gap min ignored (no fault in Resource Health)
+  [tpocovm01a] 42267 gap min ignored (no fault in Resource Health)
+  [trepomndgw01a] 27345 gap min ignored (no fault in Resource Health)
+  [trobodgs01] 38306 gap min ignored (no fault in Resource Health)
+  [trobosfc01] 38297 gap min ignored (no fault in Resource Health)
+  [tsmcseavm01azne] 43200 gap min ignored (no fault in Resource Health)
+  [vm-db-import] 43200 gap min ignored (no fault in Resource Health)
+  [vm-test] 43200 gap min ignored (no fault in Resource Health)
+
+SubscriptionName               Name                                Kind               Location             Avail%     AvailMin      EligMin   DegradedMins
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+POSTE-BANCOPOSTA-CERTIFICAZ... cabfpsql01azwe/cabfpsqldb01azwe     AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... ccesopsql01azwe/CESOP               AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... ccesopsql01azwe/Cesop_Config        AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... ccesopsql01azwe/Logon               AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... cpocosql01azin/Logon                AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... cpocosql01azin/MDP                  AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... cpocosql01azin/PoCo                 AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... cpocosql01azin/WorkFlow             AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... cppborselesql01azwe/cppborselesq... AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-CERTIFICAZ... cabfpfuncsa01azwe                   StorageAccount     westeurope        100,00000        43197        43197               
+POSTE-BANCOPOSTA-CERTIFICAZ... cabfpfuncsa02azwe                   StorageAccount     westeurope        100,00000        43195        43195               
+POSTE-BANCOPOSTA-CERTIFICAZ... cabfpsastatic01azwe                 StorageAccount     westeurope        100,00000          106          106               
+POSTE-BANCOPOSTA-CERTIFICAZ... cbancopostastaticrunbook            StorageAccount     westeurope        100,00000          293          293               
+POSTE-BANCOPOSTA-CERTIFICAZ... cbfmsaf01azwe                       StorageAccount     westeurope        100,00000           94           94               
+POSTE-BANCOPOSTA-CERTIFICAZ... cbptstaticrnbooksa01azin            StorageAccount     italynorth        100,00000          184          184               
+POSTE-BANCOPOSTA-CERTIFICAZ... ccesopsa01azwe                      StorageAccount     westeurope        100,00000           94           94               
+POSTE-BANCOPOSTA-CERTIFICAZ... cdgaetlsa01azwe                     StorageAccount     westeurope        100,00000        40400        40400               
+POSTE-BANCOPOSTA-CERTIFICAZ... cloansa01azwe                       StorageAccount     westeurope        100,00000        11039        11039               
+POSTE-BANCOPOSTA-CERTIFICAZ... cmacehdihba2dlake01azwe             StorageAccount     westeurope         99,99769        43199        43200              1
+POSTE-BANCOPOSTA-CERTIFICAZ... corssastatics01azin                 StorageAccount     italynorth        100,00000        42802        42802               
+POSTE-BANCOPOSTA-CERTIFICAZ... corssastatics01azne                 StorageAccount     northeurope       100,00000           94           94               
+POSTE-BANCOPOSTA-CERTIFICAZ... cpiacombatchsa01azwe                StorageAccount     westeurope         98,91304           91           92              1
+POSTE-BANCOPOSTA-CERTIFICAZ... cpiacompiafiles01azwe               StorageAccount     westeurope        100,00000         1560         1560               
+POSTE-BANCOPOSTA-CERTIFICAZ... cpmrsastaticazwe                    StorageAccount     westeurope         98,87640           88           89              1
+POSTE-BANCOPOSTA-CERTIFICAZ... cppborselesa01azwe                  StorageAccount     westeurope        100,00000         8711         8711               
+POSTE-BANCOPOSTA-CERTIFICAZ... cprestonlsa01a                      StorageAccount     westeurope        100,00000          188          188               
+POSTE-BANCOPOSTA-CERTIFICAZ... crdswebsastatic01a                  StorageAccount     westeurope        100,00000        42302        42302               
+POSTE-BANCOPOSTA-CERTIFICAZ... creengareatraspsa01a                StorageAccount     westeurope        100,00000        42637        42637               
+POSTE-BANCOPOSTA-CERTIFICAZ... crobobatchsa01azwe                  StorageAccount     westeurope        100,00000           83           83               
+POSTE-BANCOPOSTA-CERTIFICAZ... crobofiles01azwe                    StorageAccount     westeurope        100,00000         1460         1460               
+POSTE-BANCOPOSTA-CERTIFICAZ... tstatecommonbpcert                  StorageAccount     westeurope        100,00000          312          312               
+POSTE-BANCOPOSTA-CERTIFICAZ... azcopy-test                         VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-CERTIFICAZ... ccesopas01a                         VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-CERTIFICAZ... cmaceal01azwe                       VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-CERTIFICAZ... cmaceal02azwe                       VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-CERTIFICAZ... cpiacomdgs01                        VirtualMachine     westeurope         99,30178         1280         1289              9
+POSTE-BANCOPOSTA-CERTIFICAZ... cpiacomdgs02                        VirtualMachine     westeurope         99,45736         1283         1290              7
+POSTE-BANCOPOSTA-CERTIFICAZ... cpiacomring01                       VirtualMachine     westeurope         99,45736         1283         1290              7
+POSTE-BANCOPOSTA-CERTIFICAZ... cpiacomsfc01                        VirtualMachine     westeurope         99,38033         1283         1291              8
+POSTE-BANCOPOSTA-CERTIFICAZ... cpocovm01a                          VirtualMachine     italynorth              N/A            0            0               
+POSTE-BANCOPOSTA-CERTIFICAZ... crobodgs01                          VirtualMachine     westeurope         99,53198         1276         1282              6
+POSTE-BANCOPOSTA-CERTIFICAZ... crobosfc01                          VirtualMachine     westeurope         99,45483         1277         1284              7
+POSTE-BANCOPOSTA-CERTIFICAZ... vm-db-import                        VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-PRODUZIONE    drppborselesql01azne/drppborsele... AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pabfpsql01azwe/pabfpsqldb01azwe     AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopsql01azne/CESOP               AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopsql01azne/Cesop_Config        AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopsql01azne/Logon               AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopsql01azwe/CESOP               AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopsql01azwe/Cesop_Config        AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopsql01azwe/Logon               AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    plabrisckmngsql01azwe/plabrisckm... AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    ppocosql01azin/Logon                AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    ppocosql01azin/MDP                  AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    ppocosql01azin/PoCo                 AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    ppocosql01azin/WorkFlow             AzureSqlDatabase   italynorth        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    pppborselesql01azwe/pppborselesq... AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    psmcseasql01azwe/psmcseasqldb01azwe AzureSqlDatabase   westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    dbstorageo3lfs3qmhycu6              StorageAccount     westeurope        100,00000        10284        10284               
+POSTE-BANCOPOSTA-PRODUZIONE    drbckbpdls01azne                    StorageAccount     northeurope       100,00000          303          303               
+POSTE-BANCOPOSTA-PRODUZIONE    drorssastatics01azne                StorageAccount     northeurope       100,00000          211          211               
+POSTE-BANCOPOSTA-PRODUZIONE    pabfpfuncsa01azwe                   StorageAccount     westeurope         99,99769        43199        43200              1
+POSTE-BANCOPOSTA-PRODUZIONE    pabfpfuncsa02azwe                   StorageAccount     westeurope         99,95138        43174        43195             21
+POSTE-BANCOPOSTA-PRODUZIONE    pabfpsa01azwe                       StorageAccount     westeurope        100,00000        10157        10157               
+POSTE-BANCOPOSTA-PRODUZIONE    pabfpsa02azwe                       StorageAccount     westeurope        100,00000        23373        23373               
+POSTE-BANCOPOSTA-PRODUZIONE    pabfpsastatic01azwe                 StorageAccount     westeurope        100,00000          207          207               
+POSTE-BANCOPOSTA-PRODUZIONE    pafapcsa01azwe                      StorageAccount     westeurope        100,00000          616          616               
+POSTE-BANCOPOSTA-PRODUZIONE    pbancopostastaticrunbook            StorageAccount     westeurope        100,00000          294          294               
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbpdls01azwe                     StorageAccount     westeurope         99,99527        42319        42321              2
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbpmssa01azwe                    StorageAccount     westeurope        100,00000          298          298               
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbpsa01azwe                      StorageAccount     westeurope        100,00000          819          819               
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbpsa02azwe                      StorageAccount     westeurope        100,00000          476          476               
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbpsa03azwe                      StorageAccount     westeurope         99,99305        43146        43149              3
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbptdls01azin                    StorageAccount     italynorth         99,97277        40380        40391             11
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbptmssa01azin                   StorageAccount     italynorth        100,00000          237          237               
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbptstaticsa01azin               StorageAccount     italynorth        100,00000          278          278               
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbptstaticsa02azin               StorageAccount     italynorth        100,00000          302          302               
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbptstaticsa03azin               StorageAccount     italynorth        100,00000        13031        13031               
+POSTE-BANCOPOSTA-PRODUZIONE    pbfmsaf01azwe                       StorageAccount     westeurope        100,00000          253          253               
+POSTE-BANCOPOSTA-PRODUZIONE    pbptstaticrnbooksa01azin            StorageAccount     italynorth        100,00000          223          223               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopcachefbsa01azne               StorageAccount     northeurope       100,00000          231          231               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopcachefosa01azwe               StorageAccount     westeurope         99,98379        43189        43196              7
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopsa01azwe                      StorageAccount     westeurope        100,00000         2598         2598               
+POSTE-BANCOPOSTA-PRODUZIONE    pdgaetlsa01azwe                     StorageAccount     westeurope         99,99156        11847        11848              1
+POSTE-BANCOPOSTA-PRODUZIONE    pdnamrtsa01azwe                     StorageAccount     westeurope        100,00000        43200        43200               
+POSTE-BANCOPOSTA-PRODUZIONE    plabrisckmnautacc01azwe             StorageAccount     westeurope        100,00000          289          289               
+POSTE-BANCOPOSTA-PRODUZIONE    ploansa01azwe                       StorageAccount     westeurope        100,00000          282          282               
+POSTE-BANCOPOSTA-PRODUZIONE    pmacehdihba2dlake01azwe             StorageAccount     westeurope         99,85185        43136        43200             64
+POSTE-BANCOPOSTA-PRODUZIONE    pmacesa02azwe                       StorageAccount     westeurope         93,79771         2949         3144            195
+POSTE-BANCOPOSTA-PRODUZIONE    porssastatics01azin                 StorageAccount     italynorth        100,00000        42624        42624               
+POSTE-BANCOPOSTA-PRODUZIONE    ppiacombatchsa01azwe                StorageAccount     westeurope        100,00000          216          216               
+POSTE-BANCOPOSTA-PRODUZIONE    ppiacompiafiles01azwe               StorageAccount     westeurope        100,00000        43199        43199               
+POSTE-BANCOPOSTA-PRODUZIONE    ppmrsastaticazwe                    StorageAccount     westeurope        100,00000          283          283               
+POSTE-BANCOPOSTA-PRODUZIONE    pppborselesa01azwe                  StorageAccount     westeurope        100,00000        12305        12305               
+POSTE-BANCOPOSTA-PRODUZIONE    pprestonlsa01a                      StorageAccount     westeurope        100,00000         1671         1671               
+POSTE-BANCOPOSTA-PRODUZIONE    prdswebsastatic01a                  StorageAccount     westeurope         99,99528        42415        42417              2
+POSTE-BANCOPOSTA-PRODUZIONE    preengareatraspsa01a                StorageAccount     westeurope         99,87729        43140        43193             53
+POSTE-BANCOPOSTA-PRODUZIONE    prepomnbesa01azwe                   StorageAccount     westeurope        100,00000          235          235               
+POSTE-BANCOPOSTA-PRODUZIONE    probobatchsa01azwe                  StorageAccount     westeurope        100,00000          214          214               
+POSTE-BANCOPOSTA-PRODUZIONE    probofiles01azwe                    StorageAccount     westeurope        100,00000        43195        43195               
+POSTE-BANCOPOSTA-PRODUZIONE    psmcseablobst01azwe                 StorageAccount     westeurope        100,00000          392          392               
+POSTE-BANCOPOSTA-PRODUZIONE    tstatecommonbpprod                  StorageAccount     westeurope        100,00000          405          405               
+POSTE-BANCOPOSTA-PRODUZIONE    258d804cddaf43609187b5d23c2ffed8    VirtualMachine     westeurope        100,00000        43180        43180               
+POSTE-BANCOPOSTA-PRODUZIONE    5c931eae550b48bbb41b0e36e2b08bf5    VirtualMachine     westeurope        100,00000        43158        43158               
+POSTE-BANCOPOSTA-PRODUZIONE    688c2cbaa7144ae583efef5f4dac2599    VirtualMachine     westeurope        100,00000        43017        43017               
+POSTE-BANCOPOSTA-PRODUZIONE    722cd26acd654040a10845517ac4c5a0    VirtualMachine     westeurope        100,00000        43160        43160               
+POSTE-BANCOPOSTA-PRODUZIONE    azcopy-test                         VirtualMachine     westeurope        100,00000        43152        43152               
+POSTE-BANCOPOSTA-PRODUZIONE    PBCKBPTAS01AZIN                     VirtualMachine     italynorth         99,99769        43198        43199              1
+POSTE-BANCOPOSTA-PRODUZIONE    pbckbptms01azin                     VirtualMachine     italynorth              N/A            0            0               
+POSTE-BANCOPOSTA-PRODUZIONE    pbpaa01a                            VirtualMachine     westeurope         99,99768        43172        43173              1
+POSTE-BANCOPOSTA-PRODUZIONE    pbpms01a                            VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-PRODUZIONE    pcesopas01a                         VirtualMachine     westeurope        100,00000        43090        43090               
+POSTE-BANCOPOSTA-PRODUZIONE    pdnamrtdg01a                        VirtualMachine     westeurope        100,00000        43144        43144               
+POSTE-BANCOPOSTA-PRODUZIONE    pdnamrtdgw01a                       VirtualMachine     westeurope        100,00000        43181        43181               
+POSTE-BANCOPOSTA-PRODUZIONE    pdnamrtdgw02a                       VirtualMachine     westeurope        100,00000        43170        43170               
+POSTE-BANCOPOSTA-PRODUZIONE    pdnarepmonvm01a                     VirtualMachine     northeurope       100,00000        43189        43189               
+POSTE-BANCOPOSTA-PRODUZIONE    pgsql-import                        VirtualMachine     westeurope        100,00000        43184        43184               
+POSTE-BANCOPOSTA-PRODUZIONE    plabrisckmnvm01                     VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-PRODUZIONE    plabrisckmnvm02                     VirtualMachine     westeurope              N/A            0            0               
+POSTE-BANCOPOSTA-PRODUZIONE    pmaceal01azwe                       VirtualMachine     westeurope         99,99302        42992        42995              3
+POSTE-BANCOPOSTA-PRODUZIONE    pmaceal02azwe                       VirtualMachine     westeurope         99,99537        43175        43177              2
+POSTE-BANCOPOSTA-PRODUZIONE    ppiacomdgs01                        VirtualMachine     westeurope         99,99537        43159        43161              2
+POSTE-BANCOPOSTA-PRODUZIONE    ppiacomdgs02                        VirtualMachine     westeurope         99,98841        43142        43147              5
+POSTE-BANCOPOSTA-PRODUZIONE    ppiacomring01                       VirtualMachine     westeurope         99,98609        43139        43145              6
+POSTE-BANCOPOSTA-PRODUZIONE    ppiacomsfc01                        VirtualMachine     westeurope         99,98139        42979        42987              8
+POSTE-BANCOPOSTA-PRODUZIONE    ppocovm01a                          VirtualMachine     italynorth        100,00000        43199        43199               
+POSTE-BANCOPOSTA-PRODUZIONE    ppocovm02a                          VirtualMachine     northeurope       100,00000        43174        43174               
+POSTE-BANCOPOSTA-PRODUZIONE    prepomndgw01a                       VirtualMachine     westeurope        100,00000        43168        43168               
+POSTE-BANCOPOSTA-PRODUZIONE    probodgs01                          VirtualMachine     westeurope         99,97452        43166        43177             11
+POSTE-BANCOPOSTA-PRODUZIONE    probosfc01                          VirtualMachine     westeurope         99,97218        43123        43135             12
+POSTE-BANCOPOSTA-PRODUZIONE    psmcseavm01azwe                     VirtualMachine     westeurope        100,00000        43152        43152               
+POSTE-BANCOPOSTA-PRODUZIONE    rhel8ans0-PROD                      VirtualMachine     westeurope         99,82548         1144         1146              2
+POSTE-BANCOPOSTA-PRODUZIONE    rhel9ans0-PROD                      VirtualMachine     westeurope         99,99108        22423        22425              2
+POSTE-BANCOPOSTA-PRODUZIONE    win19ans0-PROD                      VirtualMachine     westeurope         99,47407         5485         5514             29
+POSTE-BANCOPOSTA-PRODUZIONE    win22ans0-PROD                      VirtualMachine     westeurope         99,78174         5486         5498             12
+POSTE-BANCOPOSTA-SVILUPPO      sabfpsql01azne/sabfpsqldb01azne     AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      spocosql01azne/Logon                AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      spocosql01azne/MDP                  AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      spocosql01azne/PoCo                 AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      spocosql01azne/WorkFlow             AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      sppborselesql01azne/sppborselesq... AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      ssmcseasql01azne/ssmcseasqldb01azne AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tabfpsql01azne/tabfpsqldb01azne     AzureSqlDatabase   northeurope        99,93287        43171        43200             29
+POSTE-BANCOPOSTA-SVILUPPO      tcesopsql01azne/CESOP               AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tcesopsql01azne/Cesop_Config        AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tcesopsql01azne/Logon               AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tpocosql01azne/Logon                AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tpocosql01azne/MDP                  AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tpocosql01azne/PoCo                 AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tpocosql01azne/WorkFlow             AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tppborselesql01azne/tppborselesq... AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tsmcseasql01azne/tsmcseasqldb01azne AzureSqlDatabase   northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      sabfpfuncsa01azne                   StorageAccount     northeurope       100,00000        43197        43197               
+POSTE-BANCOPOSTA-SVILUPPO      sabfpfuncsa02azne                   StorageAccount     northeurope       100,00000        43194        43194               
+POSTE-BANCOPOSTA-SVILUPPO      sabfpsa01azne                       StorageAccount     northeurope       100,00000          157          157               
+POSTE-BANCOPOSTA-SVILUPPO      sabfpsastatic01azne                 StorageAccount     northeurope       100,00000           92           92               
+POSTE-BANCOPOSTA-SVILUPPO      sbancopostastaticrunbook            StorageAccount     northeurope       100,00000          376          376               
+POSTE-BANCOPOSTA-SVILUPPO      sdgaetlsa01azne                     StorageAccount     northeurope       100,00000        42252        42252               
+POSTE-BANCOPOSTA-SVILUPPO      sdnamrtsa01azne                     StorageAccount     northeurope       100,00000          595          595               
+POSTE-BANCOPOSTA-SVILUPPO      sinstantcredsastatic01az            StorageAccount     northeurope       100,00000           90           90               
+POSTE-BANCOPOSTA-SVILUPPO      sloansa01azne                       StorageAccount     northeurope       100,00000         1041         1041               
+POSTE-BANCOPOSTA-SVILUPPO      sloanstatics01azne                  StorageAccount     northeurope       100,00000        30264        30264               
+POSTE-BANCOPOSTA-SVILUPPO      smacesa01azne                       StorageAccount     northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      smifidiposastatic01azne             StorageAccount     northeurope       100,00000          168          168               
+POSTE-BANCOPOSTA-SVILUPPO      sorssastatics01azne                 StorageAccount     northeurope       100,00000        42897        42897               
+POSTE-BANCOPOSTA-SVILUPPO      spiacompiabatch01azne               StorageAccount     northeurope       100,00000           89           89               
+POSTE-BANCOPOSTA-SVILUPPO      spiacompiafiles01azne               StorageAccount     northeurope       100,00000         5314         5314               
+POSTE-BANCOPOSTA-SVILUPPO      spmrsastaticazne                    StorageAccount     northeurope       100,00000        42277        42277               
+POSTE-BANCOPOSTA-SVILUPPO      sppborselesa01azne                  StorageAccount     northeurope       100,00000         1899         1899               
+POSTE-BANCOPOSTA-SVILUPPO      sprestonlsa01a                      StorageAccount     northeurope       100,00000        42244        42244               
+POSTE-BANCOPOSTA-SVILUPPO      spvaccesssa01azne                   StorageAccount     northeurope       100,00000        42352        42352               
+POSTE-BANCOPOSTA-SVILUPPO      spvpdsa01azne                       StorageAccount     northeurope       100,00000          292          292               
+POSTE-BANCOPOSTA-SVILUPPO      srdswebsastatic01a                  StorageAccount     northeurope       100,00000        42240        42240               
+POSTE-BANCOPOSTA-SVILUPPO      sreengareatraspsa01a                StorageAccount     northeurope       100,00000        42636        42636               
+POSTE-BANCOPOSTA-SVILUPPO      srepomnbesa01azne                   StorageAccount     northeurope       100,00000           85           85               
+POSTE-BANCOPOSTA-SVILUPPO      srobobatch01azne                    StorageAccount     northeurope       100,00000           85           85               
+POSTE-BANCOPOSTA-SVILUPPO      srobofiles01azne                    StorageAccount     northeurope       100,00000         5302         5302               
+POSTE-BANCOPOSTA-SVILUPPO      ssmcseablobst01azne                 StorageAccount     northeurope       100,00000           87           87               
+POSTE-BANCOPOSTA-SVILUPPO      tabfpfuncsa01azne                   StorageAccount     northeurope        99,97917        43190        43199              9
+POSTE-BANCOPOSTA-SVILUPPO      tabfpfuncsa02azne                   StorageAccount     northeurope        99,97222        43184        43196             12
+POSTE-BANCOPOSTA-SVILUPPO      tabfpsastatic01azne                 StorageAccount     northeurope       100,00000           79           79               
+POSTE-BANCOPOSTA-SVILUPPO      tafapcsa01azne                      StorageAccount     northeurope       100,00000          193          193               
+POSTE-BANCOPOSTA-SVILUPPO      tcesopsa01azne                      StorageAccount     northeurope       100,00000          146          146               
+POSTE-BANCOPOSTA-SVILUPPO      tdgaetlsa01azne                     StorageAccount     northeurope       100,00000        42251        42251               
+POSTE-BANCOPOSTA-SVILUPPO      tdnamrtsa01azne                     StorageAccount     northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tinstantcredsastatic01az            StorageAccount     northeurope       100,00000          126          126               
+POSTE-BANCOPOSTA-SVILUPPO      tloansa01azne                       StorageAccount     northeurope       100,00000         1088         1088               
+POSTE-BANCOPOSTA-SVILUPPO      tloanstatics01azne                  StorageAccount     northeurope       100,00000        30322        30322               
+POSTE-BANCOPOSTA-SVILUPPO      tmacesa01azne                       StorageAccount     northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      torssastatics01azne                 StorageAccount     northeurope       100,00000        42552        42552               
+POSTE-BANCOPOSTA-SVILUPPO      tpiacombatchsa01azne                StorageAccount     northeurope       100,00000           86           86               
+POSTE-BANCOPOSTA-SVILUPPO      tpiacompiafiles01azne               StorageAccount     northeurope       100,00000        43197        43197               
+POSTE-BANCOPOSTA-SVILUPPO      tpmrsastaticazne                    StorageAccount     northeurope       100,00000        42262        42262               
+POSTE-BANCOPOSTA-SVILUPPO      tppborselesa01azne                  StorageAccount     northeurope       100,00000        43200        43200               
+POSTE-BANCOPOSTA-SVILUPPO      tprestonlsa01a                      StorageAccount     northeurope       100,00000          233          233               
+POSTE-BANCOPOSTA-SVILUPPO      tpvaccesssa01azne                   StorageAccount     northeurope       100,00000        42305        42305               
+POSTE-BANCOPOSTA-SVILUPPO      tpvpdsa01azne                       StorageAccount     northeurope       100,00000          290          290               
+POSTE-BANCOPOSTA-SVILUPPO      trdswebsastatic01a                  StorageAccount     northeurope       100,00000        42236        42236               
+POSTE-BANCOPOSTA-SVILUPPO      treengareatraspsa01a                StorageAccount     northeurope       100,00000        42317        42317               
+POSTE-BANCOPOSTA-SVILUPPO      trepomnbesa01azne                   StorageAccount     northeurope       100,00000           83           83               
+POSTE-BANCOPOSTA-SVILUPPO      trobobatchsa01azne                  StorageAccount     northeurope       100,00000           82           82               
+POSTE-BANCOPOSTA-SVILUPPO      trobofiles01azne                    StorageAccount     northeurope       100,00000        43197        43197               
+POSTE-BANCOPOSTA-SVILUPPO      tsmcseablobst01azne                 StorageAccount     northeurope       100,00000           89           89               
+POSTE-BANCOPOSTA-SVILUPPO      tstatecommonbpsvil                  StorageAccount     northeurope       100,00000          333          333               
+POSTE-BANCOPOSTA-SVILUPPO      sautkpidg01azne                     VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      sdnamrtdatagata                     VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      sdnarepmonvm01a                     VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      smaceal01azne                       VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      spiacomdgs01                        VirtualMachine     northeurope        99,36902         5197         5230             33
+POSTE-BANCOPOSTA-SVILUPPO      spiacomdgs02                        VirtualMachine     northeurope        99,46524         5208         5236             28
+POSTE-BANCOPOSTA-SVILUPPO      spiacomring01                       VirtualMachine     northeurope        99,54102         5205         5229             24
+POSTE-BANCOPOSTA-SVILUPPO      spiacomsfc01                        VirtualMachine     northeurope        99,42933         5227         5257             30
+POSTE-BANCOPOSTA-SVILUPPO      spocovm01a                          VirtualMachine     northeurope        99,23735         4294         4327             33
+POSTE-BANCOPOSTA-SVILUPPO      srepomndgw01a                       VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      srobodgs01                          VirtualMachine     northeurope        99,52089         5193         5218             25
+POSTE-BANCOPOSTA-SVILUPPO      srobosfc01                          VirtualMachine     northeurope        99,44572         5203         5232             29
+POSTE-BANCOPOSTA-SVILUPPO      ssmcseavm01azne                     VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      tautkpidg01azne                     VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      tcesopas01a                         VirtualMachine     northeurope        98,86792          262          265              3
+POSTE-BANCOPOSTA-SVILUPPO      tdnamrtdatagata                     VirtualMachine     northeurope        99,56130        13163        13221             58
+POSTE-BANCOPOSTA-SVILUPPO      tdnarepmonvm01a                     VirtualMachine     northeurope        99,59672        15806        15870             64
+POSTE-BANCOPOSTA-SVILUPPO      test-cert                           VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      test-hbase                          VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      test-reset                          VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      test-reset2                         VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      tmaceal01azne                       VirtualMachine     northeurope        99,50879        15801        15879             78
+POSTE-BANCOPOSTA-SVILUPPO      tpiacomdgs01                        VirtualMachine     northeurope        99,36915         5198         5231             33
+POSTE-BANCOPOSTA-SVILUPPO      tpiacomdgs02                        VirtualMachine     northeurope        99,33295         5212         5247             35
+POSTE-BANCOPOSTA-SVILUPPO      tpiacomring01                       VirtualMachine     northeurope        99,44835         5228         5257             29
+POSTE-BANCOPOSTA-SVILUPPO      tpiacomsfc01                        VirtualMachine     northeurope        99,35545         5241         5275             34
+POSTE-BANCOPOSTA-SVILUPPO      tpocovm01a                          VirtualMachine     northeurope        99,35691          927          933              6
+POSTE-BANCOPOSTA-SVILUPPO      trepomndgw01a                       VirtualMachine     northeurope        99,59634        15791        15855             64
+POSTE-BANCOPOSTA-SVILUPPO      trobodgs01                          VirtualMachine     northeurope        99,48917         4869         4894             25
+POSTE-BANCOPOSTA-SVILUPPO      trobosfc01                          VirtualMachine     northeurope        99,44932         4876         4903             27
+POSTE-BANCOPOSTA-SVILUPPO      tsmcseavm01azne                     VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      vm-db-import                        VirtualMachine     northeurope             N/A            0            0               
+POSTE-BANCOPOSTA-SVILUPPO      vm-test                             VirtualMachine     northeurope             N/A            0            0               
+
+--- POSTE-BANCOPOSTA-CERTIFICAZIONE Summary ---
+  AzureSqlDatabase, italynorth [4 res]: 100% (172800 / 172800 eligible min)
+  AzureSqlDatabase, westeurope [5 res]: 100% (216000 / 216000 eligible min)
+  StorageAccount, italynorth [2 res]: 100% (42986 / 42986 eligible min)
+  StorageAccount, northeurope [1 res]: 100% (94 / 94 eligible min)
+  StorageAccount, westeurope [19 res]: 99,99892% (279049 / 279052 eligible min)
+  VirtualMachine, westeurope [6 res]: 99,43049% (7682 / 7726 eligible min)
+  TOTAL [37 res]: 99,99346% (718611 / 718658 eligible min)
+
+--- POSTE-BANCOPOSTA-PRODUZIONE Summary ---
+  AzureSqlDatabase, italynorth [4 res]: 100% (172800 / 172800 eligible min)
+  AzureSqlDatabase, northeurope [4 res]: 100% (172800 / 172800 eligible min)
+  AzureSqlDatabase, westeurope [7 res]: 100% (302400 / 302400 eligible min)
+  StorageAccount, italynorth [7 res]: 99,98867% (97075 / 97086 eligible min)
+  StorageAccount, northeurope [3 res]: 100% (745 / 745 eligible min)
+  StorageAccount, westeurope [34 res]: 99,93702% (553775 / 554124 eligible min)
+  VirtualMachine, italynorth [2 res]: 99,99884% (86397 / 86398 eligible min)
+  VirtualMachine, northeurope [2 res]: 100% (86363 / 86363 eligible min)
+  VirtualMachine, westeurope [25 res]: 99,9899% (940341 / 940436 eligible min)
+  TOTAL [88 res]: 99,9811% (2412696 / 2413152 eligible min)
+
+--- POSTE-BANCOPOSTA-SVILUPPO Summary ---
+  AzureSqlDatabase, northeurope [17 res]: 99,99605% (734371 / 734400 eligible min)
+  StorageAccount, northeurope [52 res]: 99,99802% (1061866 / 1061887 eligible min)
+  VirtualMachine, northeurope [19 res]: 99,48817% (127901 / 128559 eligible min)
+  TOTAL [88 res]: 99,96322% (1924138 / 1924846 eligible min)
+
+══════════════════════════════════════════════════════════════
+               OVERALL (all subscriptions)
+══════════════════════════════════════════════════════════════
+  AzureSqlDatabase, italynorth [8 res]: 100% (345600 / 345600 eligible min)
+  AzureSqlDatabase, northeurope [21 res]: 99,9968% (907171 / 907200 eligible min)
+  AzureSqlDatabase, westeurope [12 res]: 100% (518400 / 518400 eligible min)
+  StorageAccount, italynorth [9 res]: 99,99215% (140061 / 140072 eligible min)
+  StorageAccount, northeurope [56 res]: 99,99802% (1062705 / 1062726 eligible min)
+  StorageAccount, westeurope [53 res]: 99,95775% (832824 / 833176 eligible min)
+  VirtualMachine, italynorth [2 res]: 99,99884% (86397 / 86398 eligible min)
+  VirtualMachine, northeurope [21 res]: 99,69384% (214264 / 214922 eligible min)
+  VirtualMachine, westeurope [31 res]: 99,98534% (948023 / 948162 eligible min)
+  OVERALL [213 res]: 99,97605% (5055445 / 5056656 eligible min)
+
+Completed in 00:01:02.61

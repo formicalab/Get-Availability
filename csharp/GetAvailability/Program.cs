@@ -1,12 +1,20 @@
-﻿// Get-Availability — monthly calendar Azure resource availability reporter (C# / Native AOT)
+﻿// Get-Availability — rolling 30-day Azure resource availability reporter (C# / Native AOT)
 //
-// Pipeline: resolve subscriptions → inventory (Resource Graph) → lifecycle events (Activity Log)
-//         → compute eligibility (exclusion windows) → fetch metrics (Azure Monitor, parallel)
+// Pipeline: resolve subscriptions → inventory (Resource Graph)
+//         → fetch metrics (Azure Monitor, parallel) → verify gaps (Resource Health)
 //         → assemble results → print table + summaries
 //
-// Uses Azure Activity Log (90-day retention) instead of Resource Graph resourcechanges (14-day)
-// to support analysis of past calendar months (--month -1, -2, -3, or 0 for current).
+// Metric gaps (null datapoints) are verified against Resource Health:
+//   – fault confirmed (Unavailable/Degraded) → counts as downtime
+//   – no fault → subtracted from eligible minutes
+// Zero-percent metric values (0% with active transactions) get nuanced handling:
+//   – during Unknown health windows (Azure Monitor issue) → subtracted from eligible
+//   – during confirmed faults or with no health explanation → counts as downtime
+//
+// The reporting window is a rolling 30-day period (now − 30 days → now) to match
+// Resource Health API retention (~30 days).
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Azure.Identity;
 using Azure.Monitor.Query;
@@ -16,14 +24,12 @@ using GetAvailability.Output;
 using GetAvailability.Services;
 
 // ── CLI argument parsing ─────────────────────────────────────────────────────
-// Supports: --subscriptions (required), --kinds, --resource, --tolerance, --parallelism, --help
+// Supports: --subscriptions (required), --kinds, --resource, --parallelism, --help
 
 string[] subscriptionNames = [];
 string[] kinds = ["vm", "sql", "storage"];
 string? resourceName = null;
-int tolerance = 5;  // symmetric ±N minutes around each start/stop event
 int parallelism = Math.Max(4, Math.Min(16, Environment.ProcessorCount)); // auto-scale to CPU cores
-int monthOffset = -1; // -1 = previous month (default), -2 = two months ago, -3 = three months ago, 0 = current month
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -44,23 +50,15 @@ for (int i = 0; i < args.Length; i++)
         case "--resource" or "-r":
             resourceName = args[++i];
             break;
-        case "--tolerance" or "-t":
-            tolerance = int.Parse(args[++i]);
-            break;
         case "--parallelism" or "-p":
             parallelism = int.Parse(args[++i]);
-            break;
-        case "--month" or "-m":
-            monthOffset = int.Parse(args[++i]);
             break;
         case "--help" or "-h":
             Console.WriteLine("Usage: GetAvailability --subscriptions <name1> [name2 ...] [options]");
             Console.WriteLine("  --subscriptions, -s  Required. One or more Azure subscription display names.");
             Console.WriteLine("  --kinds, -k          Resource kinds: vm, sql, storage (default: all).");
             Console.WriteLine("  --resource, -r       Filter to a single resource name.");
-            Console.WriteLine("  --tolerance, -t      +/- minute tolerance around events (default: 5).");
             Console.WriteLine("  --parallelism, -p    Max concurrent metric calls (default: auto).");
-            Console.WriteLine("  --month, -m          Month offset: -1 (previous, default), -2, -3, 0 (current).");
             return 0;
     }
 }
@@ -71,40 +69,28 @@ if (subscriptionNames.Length == 0)
     return 1;
 }
 
-await RunAsync(subscriptionNames, kinds, resourceName, tolerance, parallelism, monthOffset);
+await RunAsync(subscriptionNames, kinds, resourceName, parallelism);
 return 0;
 
 // ── Main orchestration ───────────────────────────────────────────────────────
 
 static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? resourceName,
-    int tolerance, int parallelism, int monthOffset)
+    int parallelism)
 {
     var sw = Stopwatch.StartNew();
 
-    // Compute calendar month boundaries based on --month offset.
-    // -1 = previous full month, -2 = two months ago, -3 = three months ago, 0 = current month (partial, to now).
+    // Rolling 30-day window: aligned to Resource Health API retention (~30 days)
     var now = DateTimeOffset.UtcNow;
-    var target = now.AddMonths(monthOffset);
-    var utcStart = new DateTimeOffset(target.Year, target.Month, 1, 0, 0, 0, TimeSpan.Zero);
-    var utcEnd = monthOffset == 0
-        ? new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, TimeSpan.Zero)
-        : utcStart.AddMonths(1);
+    var utcEnd = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, TimeSpan.Zero);
+    var utcStart = utcEnd.AddDays(-30);
     int totalMinutes = (int)(utcEnd - utcStart).TotalMinutes;
 
-    // Activity Log retains 90 days — validate the requested month is within range
-    if ((DateTimeOffset.UtcNow - utcStart).TotalDays > 89)
-    {
-        Console.Error.WriteLine("Error: Activity Log retains only 90 days. The requested month is too far back.");
-        return;
-    }
-
-    var monthName = utcStart.ToString("MMMM yyyy");
-    Console.WriteLine($"Month: {monthName} ({utcStart:u} -> {utcEnd:u}, {totalMinutes} min, tolerance: +/-{tolerance} min)");
+    Console.WriteLine($"Period: rolling 30 days ({utcStart:u} -> {utcEnd:u}, {totalMinutes} min)");
 
     // Authenticate using DefaultAzureCredential (az login, managed identity, etc.)
     var credential = new DefaultAzureCredential();
-    var armClient = new ArmClient(credential);              // ARM operations (inventory, changes)
-    var metricsClient = new MetricsQueryClient(credential); // Azure Monitor metric queries
+    var armClient = new ArmClient(credential);
+    var metricsClient = new MetricsQueryClient(credential);
 
     // Step 1: Resolve subscription display names → subscription IDs
     var resolved = await SubscriptionResolver.ResolveAsync(armClient, subscriptionNames);
@@ -114,82 +100,56 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
 
     // Step 2: Query Resource Graph for all VMs, SQL DBs, and Storage Accounts
     Console.Write("Querying resource inventory... ");
-    var resources = await ResourceInventoryService.QueryAsync(armClient, subIds, subIdToName);
-
-    // Map CLI kind abbreviations (vm/sql/storage) to internal kind names
-    var kindMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-    {
-        ["vm"] = "VirtualMachine",
-        ["sql"] = "AzureSqlDatabase",
-        ["storage"] = "StorageAccount"
-    };
-    var selectedKinds = kinds.Select(k => kindMap.TryGetValue(k, out var v) ? v : k).ToHashSet();
-    resources = resources.Where(r => selectedKinds.Contains(r.Kind)).ToList();
+    var resources = await ResourceInventoryService.QueryAsync(armClient, subIds, subIdToName, kinds, resourceName);
     Console.WriteLine($"Found {resources.Count} resource(s) across {resolved.Count} subscription(s) (kinds: {string.Join(", ", kinds)}).");
 
-    if (resourceName != null)
-    {
-        resources = resources.Where(r => string.Equals(r.Name, resourceName, StringComparison.OrdinalIgnoreCase)).ToList();
-        if (resources.Count == 0)
-            throw new InvalidOperationException($"Resource '{resourceName}' not found.");
-        Console.WriteLine($"  Filtered to {resources.Count} resource(s) matching '{resourceName}'.");
-    }
     if (resources.Count == 0) { Console.WriteLine("No resources found."); return; }
 
-    // Step 3: Query Activity Log for lifecycle events (start/stop/delete)
-    // Activity Log retains 90 days (vs 14 for resourcechanges), enabling monthly analysis.
-    // The query includes a 30-day lookback before utcStart to capture pre-period power state.
-    Console.Write("Querying activity log... ");
-    var allEvents = await ActivityLogService.QueryAsync(credential, subIds, utcStart, utcEnd, subIdToName);
-
-    // Synthesize Create events from inventory CreatedAt timestamps.
-    // Activity Log write operations can't reliably distinguish creation from updates,
-    // so we use the creation time recorded in Resource Graph inventory instead.
-    // The 30-day lookback in the query window ensures Delete→Create pairs are matched
-    // even when the deletion happened before the analysis period.
-    var lookbackStart = utcStart.AddDays(-30);
-    foreach (var res in resources)
-    {
-        if (res.CreatedAt is { } created && created >= lookbackStart && created < utcEnd)
-            allEvents.Add(new LifecycleEvent(res.ResourceId, created, "Create"));
-    }
-    Console.WriteLine($"{allEvents.Count} lifecycle event(s) found.");
-
-    // Group lifecycle events by resource ID for quick lookup
-    var eventsByRes = new Dictionary<string, List<LifecycleEvent>>(StringComparer.OrdinalIgnoreCase);
-    foreach (var evt in allEvents)
-    {
-        var key = evt.ResourceId.ToLowerInvariant();
-        if (!eventsByRes.TryGetValue(key, out var list))
-        {
-            list = [];
-            eventsByRes[key] = list;
-        }
-        list.Add(evt);
-    }
-
-    // Step 4: Pre-compute eligibility — build exclusion windows per resource
-    // This determines how many minutes each resource was expected to be available.
-    // Done BEFORE metric fetch so we can pass exclusion tick arrays into the parallel block.
-    Console.WriteLine("Computing eligibility...");
+    // Step 3: Build initial eligibility (all minutes eligible — gaps handled via Resource Health)
     var eligByRes = new Dictionary<string, EligibilityResult>(StringComparer.OrdinalIgnoreCase);
     foreach (var res in resources)
     {
-        var key = res.ResourceId.ToLowerInvariant();
-        var events = eventsByRes.TryGetValue(key, out var list) ? (IReadOnlyList<LifecycleEvent>)list : [];
-        var elig = EligibilityCalculator.Compute(res, events, utcStart, utcEnd, totalMinutes, tolerance);
-        eligByRes[key] = elig;
-
-        // Copy exclusion windows as flat tick arrays — these are passed into the parallel
-        // metric block so each task can check exclusions without sharing the full object graph
-        res.ExclFromTicks = elig.ExclusionWindows.Select(w => w.FromTicks).ToArray();
-        res.ExclToTicks = elig.ExclusionWindows.Select(w => w.ToTicks).ToArray();
+        eligByRes[res.ResourceId.ToLowerInvariant()] = new EligibilityResult
+        {
+            Name = res.Name,
+            Kind = res.Kind,
+            ResourceId = res.ResourceId,
+            ResourceGroupName = res.ResourceGroupName,
+            Location = res.Location,
+            SubscriptionName = res.SubscriptionName,
+            EligibleMinutes = totalMinutes,
+        };
     }
 
-    // Step 5: Fetch Azure Monitor metrics per resource in parallel + compute available minutes inline
+    // Step 4: Fetch Azure Monitor metrics per resource in parallel
     var metricResults = await MetricsService.QueryAsync(metricsClient, resources, utcStart, utcEnd, parallelism);
 
-    // Step 6: Assemble final results — apply recovered gap minutes and zero-tx storage exclusions
+    // Step 5: For resources with metric gaps (null or 0% datapoints), check Resource Health.
+    // Null gaps outside fault intervals → subtract from eligible (telemetry absence, VM off, etc.).
+    // 0% gaps only excused during Unknown health windows (Azure Monitor issue).
+    // All gaps inside fault intervals (Unavailable/Degraded) → stay in eligible, count as downtime.
+    var gapCandidates = new List<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks)>();
+    foreach (var res in resources)
+    {
+        var key = res.ResourceId.ToLowerInvariant();
+        if (metricResults.TryGetValue(key, out var mr) && mr.GapMinutes > 0)
+        {
+            var allTicks = new List<long>();
+            if (mr.GapTicks is not null) allTicks.AddRange(mr.GapTicks);
+            if (mr.ZeroAvailTicks is not null) allTicks.AddRange(mr.ZeroAvailTicks);
+            if (allTicks.Count > 0)
+            {
+                var zeroSet = mr.ZeroAvailTicks is not null ? new HashSet<long>(mr.ZeroAvailTicks) : null;
+                gapCandidates.Add((res, allTicks.ToArray(), zeroSet));
+            }
+        }
+    }
+
+    ConcurrentDictionary<string, GapClassification>? healthResults = null;
+    if (gapCandidates.Count > 0)
+        healthResults = await ResourceHealthService.CheckGapsAsync(credential, gapCandidates, utcStart, utcEnd, parallelism);
+
+    // Step 6: Assemble final results — apply health-verified gap adjustments and zero-tx storage exclusions
     foreach (var res in resources)
     {
         var key = res.ResourceId.ToLowerInvariant();
@@ -197,9 +157,29 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
 
         if (metricResults.TryGetValue(key, out var mr))
         {
-            // Log supplementary-metric gap recovery for VMs
-            if (mr.Recovered > 0)
-                Console.WriteLine($"  [{res.Name}] Recovered {mr.Recovered} gap min via supplementary metrics");
+            // Apply Resource Health gap classification
+            int healthFaults = 0;
+            if (healthResults is not null && healthResults.TryGetValue(key, out var gc))
+            {
+                if (gc.HealthyGapMinutes > 0)
+                {
+                    elig.EligibleMinutes = Math.Max(0, elig.EligibleMinutes - gc.HealthyGapMinutes);
+                    Console.WriteLine($"  [{res.Name}] {gc.HealthyGapMinutes} gap min ignored (no fault in Resource Health)");
+                }
+                if (gc.FaultMinutes > 0)
+                {
+                    healthFaults += gc.FaultMinutes;
+                    Console.WriteLine($"  [{res.Name}] {gc.FaultMinutes} gap min confirmed as downtime (Resource Health fault)");
+                }
+                if (gc.TrustedZeroMinutes > 0)
+                {
+                    healthFaults += gc.TrustedZeroMinutes;
+                    Console.WriteLine($"  [{res.Name}] {gc.TrustedZeroMinutes} gap min counted as downtime (0% metric, no health explanation)");
+                }
+            }
+
+            // DegradedMinutes = metric-level degraded (avail < 100%) + health-confirmed faults + trusted 0% downtimes
+            elig.DegradedMinutes = mr.DegradedMinutes + healthFaults;
 
             // Flag resources where the primary metric returned 100% null (broken telemetry)
             if (mr.NoData && elig.EligibleMinutes > 0)
@@ -209,7 +189,6 @@ static async Task RunAsync(string[] subscriptionNames, string[] kinds, string? r
             }
 
             // For Storage Accounts, subtract zero-transaction minutes from eligibility
-            // (no transactions = no availability signal, so those minutes shouldn't count)
             if (mr.ZeroTxMin > 0 && res.Kind == "StorageAccount")
                 elig.EligibleMinutes = Math.Max(0, elig.EligibleMinutes - mr.ZeroTxMin);
 

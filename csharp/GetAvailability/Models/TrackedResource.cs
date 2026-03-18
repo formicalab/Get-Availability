@@ -10,10 +10,4 @@ public sealed record TrackedResource
     public required string SubscriptionName { get; init; }
     public required string ResourceGroupName { get; init; }
     public required string Location { get; init; }
-    public DateTimeOffset? CreatedAt { get; init; }
-    public string CurrentPowerState { get; init; } = "Unknown";
-
-    // Populated after eligibility calculation — exclusion windows as tick arrays
-    public long[] ExclFromTicks { get; set; } = [];
-    public long[] ExclToTicks { get; set; } = [];
 }

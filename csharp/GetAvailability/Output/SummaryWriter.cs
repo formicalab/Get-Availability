@@ -9,15 +9,16 @@ public static class SummaryWriter
     public static void WriteResults(EligibilityResult[] sorted)
     {
         // Table header
-        const string fmt = "{0,-30} {1,-35} {2,-18} {3,-14} {4,12} {5,12} {6,12} {7,10}";
+        const string fmt = "{0,-30} {1,-35} {2,-18} {3,-14} {4,12} {5,12} {6,12} {7,14}";
         Console.WriteLine();
         Console.WriteLine(string.Format(fmt,
             "SubscriptionName", "Name", "Kind", "Location",
-            "Avail%", "AvailMin", "EligMin", "TotalMin"));
-        Console.WriteLine(new string('─', 155));
+            "Avail%", "AvailMin", "EligMin", "DegradedMins"));
+        Console.WriteLine(new string('─', 150));
 
         foreach (var r in sorted)
         {
+            string degradedCol = r.DegradedMinutes > 0 ? $"{r.DegradedMinutes}" : "";
             Console.WriteLine(string.Format(fmt,
                 Truncate(r.SubscriptionName, 30),
                 Truncate(r.Name, 35),
@@ -26,7 +27,7 @@ public static class SummaryWriter
                 r.AvailabilityPct,
                 Math.Round(r.AvailableMinutes, 2),
                 r.EligibleMinutes,
-                r.TotalMinutes));
+                degradedCol));
         }
         Console.WriteLine();
     }

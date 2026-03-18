@@ -1,6 +1,5 @@
 using Azure.Monitor.Query;
 using Azure.Monitor.Query.Models;
-using GetAvailability.Helpers;
 using GetAvailability.Models;
 using System.Collections.Concurrent;
 
@@ -10,7 +9,9 @@ namespace GetAvailability.Services;
 /// Fetches Azure Monitor metrics per resource in parallel and computes available minutes inline.
 /// Uses Parallel.ForEachAsync for concurrent metric API calls with configurable parallelism.
 /// Each resource's metrics are processed entirely within the parallel task — only scalar results
-/// (AvailableSum, Recovered, ZeroTxMin) are returned, minimizing cross-thread data and GC pressure.
+/// (AvailableSum, GapMinutes, ZeroTxMin, DegradedMinutes) are returned, minimising cross-thread
+/// data and GC pressure. Null datapoints are collected as GapTicks and 0%-valued datapoints
+/// as ZeroAvailTicks, both verified via Resource Health with different classification rules.
 /// </summary>
 public static class MetricsService
 {
@@ -50,11 +51,9 @@ public static class MetricsService
     /// <summary>
     /// Fetches metrics for a single resource with retry logic, then computes available minutes.
     /// Metrics requested per resource type:
-    ///   VM:      VmAvailabilityMetric (0–1) + CPU + Network (for gap recovery) — 3 metrics, 1 API call
-    ///   SQL DB:  Availability (0–100, normalized to 0–1) — 1 metric
+    ///   VM:      VmAvailabilityMetric (0–1) — 1 metric
+    ///   SQL DB:  Availability (0–100, normalised to 0–1) — 1 metric
     ///   Storage: Availability (0–100) + Transactions — 2 metrics, 1 API call
-    /// For VMs with time ranges longer than 15 days, the query is split into two halves to stay
-    /// under Azure Monitor's 8MB response limit (3 metrics × 40k+ minutes exceeds it).
     /// Retries up to 5 times on 429 (throttle) and 5xx errors with exponential backoff.
     /// </summary>
     private static async Task<MetricScalars> QuerySingleResourceAsync(
@@ -67,73 +66,20 @@ public static class MetricsService
         bool isVm = resource.Kind == "VirtualMachine";
         bool isStorage = resource.Kind == "StorageAccount";
 
-        // VMs fetch 3 metrics in a single API call (~4MB for 14 days, under Azure's 8MB limit).
-        // For periods > 15 days, split into two calls to avoid exceeding 8MB.
         string[] metricNames;
         if (isVm)
-            metricNames = ["VmAvailabilityMetric", "Percentage CPU", "Network In Total"];
+            metricNames = ["VmAvailabilityMetric"];
         else if (isStorage)
             metricNames = ["Availability", "Transactions"];
         else
             metricNames = ["Availability"];
 
-        // Build excluded ticks set from pre-computed tick arrays
-        var windows = new ExclusionWindow[resource.ExclFromTicks.Length];
-        for (int i = 0; i < windows.Length; i++)
-            windows[i] = new ExclusionWindow(resource.ExclFromTicks[i], resource.ExclToTicks[i]);
-        var excluded = ExclusionWindowHelper.BuildExcludedTickSet(windows);
-
-        // Determine whether to split the time range (VMs only, > 15 days)
-        double totalDays = (endDate - startDate).TotalDays;
-        bool needsSplit = isVm && totalDays > 15;
-
-        if (needsSplit)
-        {
-            var mid = startDate.AddTicks((endDate - startDate).Ticks / 2);
-            // Floor mid to the nearest minute to keep alignment clean
-            mid = new DateTimeOffset(mid.Year, mid.Month, mid.Day, mid.Hour, mid.Minute, 0, TimeSpan.Zero);
-
-            var r1 = await FetchAndProcessAsync(metricsClient, resource, metricNames, isVm, isStorage,
-                startDate, mid, excluded, ct);
-            var r2 = await FetchAndProcessAsync(metricsClient, resource, metricNames, isVm, isStorage,
-                mid, endDate, excluded, ct);
-
-            return new MetricScalars(r1.AvailableSum + r2.AvailableSum,
-                                     r1.Recovered + r2.Recovered,
-                                     r1.ZeroTxMin + r2.ZeroTxMin,
-                                     r1.NoData && r2.NoData);
-        }
-
-        return await FetchAndProcessAsync(metricsClient, resource, metricNames, isVm, isStorage,
-            startDate, endDate, excluded, ct);
-    }
-
-    /// <summary>
-    /// Fetches metrics for a single time range and processes them into scalar results.
-    /// Separated from QuerySingleResourceAsync to allow split-range calls to reuse logic.
-    /// </summary>
-    private static async Task<MetricScalars> FetchAndProcessAsync(
-        MetricsQueryClient metricsClient,
-        TrackedResource resource,
-        string[] metricNames,
-        bool isVm,
-        bool isStorage,
-        DateTimeOffset startDate,
-        DateTimeOffset endDate,
-        HashSet<long> excluded,
-        CancellationToken ct)
-    {
         var options = new MetricsQueryOptions
         {
             Granularity = TimeSpan.FromMinutes(1),
             TimeRange = new QueryTimeRange(startDate, endDate),
         };
-        if (isVm)
-        {
-            options.Aggregations.Add(MetricAggregationType.Minimum);
-            options.Aggregations.Add(MetricAggregationType.Average);
-        }
-        else if (isStorage)
+        if (isStorage)
         {
             options.Aggregations.Add(MetricAggregationType.Minimum);
             options.Aggregations.Add(MetricAggregationType.Total);
@@ -173,28 +119,39 @@ public static class MetricsService
         }
 
         double availSum = 0.0;
-        int recovered = 0;
+        int gapMinutes = 0;
         int zeroTxMin = 0;
+        int degradedMinutes = 0;
         bool noData = false;
+        long[]? gapTicks = null;
+        long[]? zeroAvailTicks = null;
 
         if (isStorage)
-            ProcessStorage(response, excluded, ref availSum, ref zeroTxMin);
+            ProcessStorage(response, ref availSum, ref zeroTxMin, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks);
         else
-            ProcessVmOrSql(response, excluded, isVm, ref availSum, ref recovered, out noData);
+            ProcessVmOrSql(response, isVm, ref availSum, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks, out noData);
 
-        return new MetricScalars(availSum, recovered, zeroTxMin, noData);
+        return new MetricScalars(availSum, gapMinutes, zeroTxMin, noData, gapTicks, zeroAvailTicks, degradedMinutes);
     }
 
     /// <summary>
     /// Processes Storage Account metrics. A storage minute is only counted toward availability
     /// if there were actual transactions (Transactions > 0). Minutes with zero transactions
     /// have no availability signal and are tracked as zeroTxMin — later subtracted from eligibility.
-    /// Availability values are 0–100, normalized to 0.0–1.0.
+    /// Availability values are 0–100, normalised to 0.0–1.0.
+    /// Null availability with transactions is tracked as a gap tick for health checking.
+    /// Exactly 0% availability with transactions is tracked separately as a zero-avail tick
+    /// (only excused during Unknown health windows, otherwise counted as real downtime).
+    /// Non-zero values below 100% are counted as degraded minutes.
     /// </summary>
-    private static void ProcessStorage(MetricsQueryResult response, HashSet<long> excluded,
-        ref double availSum, ref int zeroTxMin)
+    private static void ProcessStorage(MetricsQueryResult response,
+        ref double availSum, ref int zeroTxMin, ref int gapMinutes, ref int degradedMinutes,
+        out long[]? gapTicks, out long[]? zeroAvailTicks)
     {
-        // Build a lookup of transaction counts by minute (ticks) for cross-referencing with availability
+        var nullTicks = new List<long>();
+        var zeroTicks = new List<long>();
+
+        // Build a lookup of transaction counts by minute (ticks)
         var txByTicks = new Dictionary<long, double>();
         var txMetric = response.Metrics.FirstOrDefault(m =>
             string.Equals(m.Name, "Transactions", StringComparison.OrdinalIgnoreCase));
@@ -208,9 +165,6 @@ public static class MetricsService
             }
         }
 
-        // For each availability data point, check if there were transactions at that minute.
-        // Tx > 0 + avail present → count toward availability (normalized /100).
-        // No transactions → count as zero-tx minute (subtracted from eligibility later).
         var availMetric = response.Metrics.FirstOrDefault(m =>
             string.Equals(m.Name, "Availability", StringComparison.OrdinalIgnoreCase));
         if (availMetric != null)
@@ -223,83 +177,85 @@ public static class MetricsService
 
                 if (hasTx && val.Minimum.HasValue)
                 {
-                    if (!excluded.Contains(ticks))
-                        availSum += val.Minimum.Value / 100.0;
+                    double norm = val.Minimum.Value / 100.0;
+                    if (norm == 0.0)
+                    {
+                        // Exactly 0% with transactions — tracked separately for nuanced
+                        // health classification (only excused during Unknown health windows)
+                        zeroTicks.Add(ticks);
+                    }
+                    else
+                    {
+                        availSum += norm;
+                        if (norm < 1.0) degradedMinutes++;
+                    }
+                }
+                else if (hasTx && !val.Minimum.HasValue)
+                {
+                    // Transactions present but availability metric null — gap
+                    nullTicks.Add(ticks);
                 }
                 else if (!hasTx)
                 {
-                    if (!excluded.Contains(ticks))
-                        zeroTxMin++;
+                    zeroTxMin++;
                 }
             }
         }
+
+        gapMinutes = nullTicks.Count + zeroTicks.Count;
+        gapTicks = nullTicks.Count > 0 ? nullTicks.ToArray() : null;
+        zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
     }
 
     /// <summary>
-    /// Processes VM or SQL DB metrics. For VMs, also performs inline gap recovery:
-    /// when VmAvailabilityMetric is null but both CPU and Network report data, the minute
-    /// is recovered as available (1.0). This compensates for known Azure telemetry gaps.
-    /// VM availability is 0.0–1.0 natively; SQL is 0–100, normalized to 0.0–1.0.
+    /// Processes VM or SQL DB metrics. Null datapoints are collected as gap ticks and
+    /// 0%-valued datapoints as zero-avail ticks — both verified via Resource Health with
+    /// different rules. Non-zero values below 100% are counted as degraded minutes.
+    /// VM availability is 0.0–1.0 natively; SQL is 0–100, normalised to 0.0–1.0.
     /// </summary>
-    private static void ProcessVmOrSql(MetricsQueryResult response, HashSet<long> excluded,
-        bool isVm, ref double availSum, ref int recovered, out bool noData)
+    private static void ProcessVmOrSql(MetricsQueryResult response,
+        bool isVm, ref double availSum, ref int gapMinutes, ref int degradedMinutes,
+        out long[]? gapTicks, out long[]? zeroAvailTicks, out bool noData)
     {
-        // Key supplementary metrics (CPU, Network) by ticks for O(1) gap recovery lookup.
-        // Using long ticks avoids DateTime.ToString allocation per datapoint.
-        // suppByTicks[minute] = count of supplementary metrics with non-null Average at that minute.
-        // Gap recovery requires count >= 2 (both CPU and Network present).
-        var suppByTicks = new Dictionary<long, int>();
-        var nullTicks = new List<long>();  // primary metric minutes that were null (gaps)
-        int primaryDataPoints = 0;  // count of non-null primary metric values
+        var nullTicks = new List<long>();
+        var zeroTicks = new List<long>();
+        int primaryDataPoints = 0;
 
         foreach (var metric in response.Metrics)
         {
             bool isPrimary = string.Equals(metric.Name, "VmAvailabilityMetric", StringComparison.OrdinalIgnoreCase)
                           || string.Equals(metric.Name, "Availability", StringComparison.OrdinalIgnoreCase);
+            if (!isPrimary) continue;
 
             foreach (var ts in metric.TimeSeries)
             foreach (var val in ts.Values)
             {
-                long ticks = val.TimeStamp.UtcTicks;
-
-                if (isPrimary)
+                if (val.Minimum.HasValue)
                 {
-                    if (val.Minimum.HasValue)
+                    double v = val.Minimum.Value;
+                    if (!isVm) v /= 100.0;  // SQL Availability is 0–100, normalise to 0–1
+                    if (v == 0.0)
                     {
-                        primaryDataPoints++;
-                        double v = val.Minimum.Value;
-                        if (!isVm) v /= 100.0;  // SQL Availability is 0–100, normalize to 0–1
-                        if (!excluded.Contains(ticks))
-                            availSum += v;
+                        // Exactly 0 — tracked separately for nuanced health classification
+                        zeroTicks.Add(val.TimeStamp.UtcTicks);
                     }
                     else
                     {
-                        nullTicks.Add(ticks);  // track for gap recovery
+                        primaryDataPoints++;
+                        availSum += v;
+                        if (v < 1.0) degradedMinutes++;
                     }
                 }
-                else if (isVm && val.Average.HasValue)  // supplementary metric (CPU or Network)
+                else
                 {
-                    long key = val.TimeStamp.UtcTicks;
-                    suppByTicks[key] = suppByTicks.GetValueOrDefault(key) + 1;
+                    nullTicks.Add(val.TimeStamp.UtcTicks);
                 }
             }
         }
 
-        // Inline gap recovery: require both CPU + Network non-null at the same minute
-        if (isVm && nullTicks.Count > 0)
-        {
-            foreach (long nt in nullTicks)
-            {
-                if (!excluded.Contains(nt) && suppByTicks.GetValueOrDefault(nt) >= 2)
-                {
-                    recovered++;
-                    availSum += 1.0;
-                }
-            }
-        }
-
-        // NoData = primary metric returned zero non-null values (broken telemetry pipeline).
-        // After gap recovery, also check if all available minutes came only from recovery.
-        noData = primaryDataPoints == 0 && recovered == 0;
+        gapMinutes = nullTicks.Count + zeroTicks.Count;
+        gapTicks = nullTicks.Count > 0 ? nullTicks.ToArray() : null;
+        zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
+        noData = primaryDataPoints == 0 && gapMinutes == 0;
     }
 }
