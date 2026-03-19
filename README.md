@@ -178,6 +178,8 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 
 The published binary (`GetAvailability.exe`) requires no .NET runtime — it is a Native AOT self-contained executable.
 
+If cached Azure credentials have expired, the tool now exits with a concise authentication error that tells the operator to re-authenticate. For Azure CLI-based auth, run `az login` and retry.
+
 ## Usage
 
 ```bash

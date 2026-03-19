@@ -95,6 +95,11 @@ try
     await RunAsync(subscriptionNames, kinds, resourceName, monthParameter, parallelism, activityGraceMinutes);
     return 0;
 }
+catch (Exception ex) when (TryGetAzureAuthenticationMessage(ex, out var authMessage))
+{
+    Console.Error.WriteLine($"Authentication error: {authMessage}");
+    return 1;
+}
 catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
 {
     Console.Error.WriteLine($"Error: {ex.Message}");
@@ -437,4 +442,100 @@ static int ParseIntOption(string rawValue, string optionName, int minValue)
         throw new ArgumentException($"{optionName} must be >= {minValue}.");
 
     return value;
+}
+
+static bool TryGetAzureAuthenticationMessage(Exception exception, out string message)
+{
+    foreach (var candidate in EnumerateExceptions(exception))
+    {
+        switch (candidate)
+        {
+            case CredentialUnavailableException credentialUnavailableException
+                when LooksLikeReauthenticationIssue(credentialUnavailableException.Message):
+                message = BuildAuthenticationMessage(credentialUnavailableException.Message);
+                return true;
+
+            case AuthenticationFailedException authenticationFailedException:
+                message = BuildAuthenticationMessage(authenticationFailedException.Message);
+                return true;
+
+            case Azure.RequestFailedException requestFailedException
+                when requestFailedException.Status is 401 or 403
+                     && LooksLikeReauthenticationIssue(requestFailedException.Message):
+                message = BuildAuthenticationMessage(requestFailedException.Message);
+                return true;
+        }
+    }
+
+    message = string.Empty;
+    return false;
+}
+
+static IEnumerable<Exception> EnumerateExceptions(Exception exception)
+{
+    var pending = new Stack<Exception>();
+    pending.Push(exception);
+
+    while (pending.Count > 0)
+    {
+        var current = pending.Pop();
+        yield return current;
+
+        if (current is AggregateException aggregateException)
+        {
+            foreach (var inner in aggregateException.Flatten().InnerExceptions)
+                pending.Push(inner);
+            continue;
+        }
+
+        if (current.InnerException is not null)
+            pending.Push(current.InnerException);
+    }
+}
+
+static string BuildAuthenticationMessage(string details)
+{
+    const string reauthHint = "Re-authenticate and run the command again. If you use Azure CLI credentials, run 'az login'.";
+
+    if (LooksLikeExpiredCredential(details))
+        return $"The current Azure credentials appear to be expired or no longer valid. {reauthHint}";
+
+    return $"The configured Azure credentials are not usable for this request. {reauthHint}";
+}
+
+static bool LooksLikeReauthenticationIssue(string? details)
+{
+    if (string.IsNullOrWhiteSpace(details))
+        return false;
+
+    string normalized = details.ToLowerInvariant();
+    return normalized.Contains("az login", StringComparison.Ordinal)
+        || normalized.Contains("authentication failed", StringComparison.Ordinal)
+        || normalized.Contains("interaction required", StringComparison.Ordinal)
+        || normalized.Contains("reauth", StringComparison.Ordinal)
+        || normalized.Contains("re-auth", StringComparison.Ordinal)
+        || normalized.Contains("sign in again", StringComparison.Ordinal)
+        || normalized.Contains("sign-in again", StringComparison.Ordinal)
+        || normalized.Contains("refresh token", StringComparison.Ordinal)
+        || normalized.Contains("token", StringComparison.Ordinal) && normalized.Contains("expired", StringComparison.Ordinal)
+        || normalized.Contains("invalid_grant", StringComparison.Ordinal)
+        || normalized.Contains("unauthorized", StringComparison.Ordinal)
+        || normalized.Contains("forbidden", StringComparison.Ordinal)
+        || normalized.Contains("credential is unavailable", StringComparison.Ordinal);
+}
+
+static bool LooksLikeExpiredCredential(string? details)
+{
+    if (string.IsNullOrWhiteSpace(details))
+        return false;
+
+    string normalized = details.ToLowerInvariant();
+    return normalized.Contains("expired", StringComparison.Ordinal)
+        || normalized.Contains("expiry", StringComparison.Ordinal)
+        || normalized.Contains("refresh token", StringComparison.Ordinal)
+        || normalized.Contains("invalid_grant", StringComparison.Ordinal)
+        || normalized.Contains("aadsts700082", StringComparison.Ordinal)
+        || normalized.Contains("aadsts70043", StringComparison.Ordinal)
+        || normalized.Contains("aadsts50173", StringComparison.Ordinal)
+        || normalized.Contains("az login", StringComparison.Ordinal) && normalized.Contains("again", StringComparison.Ordinal);
 }
