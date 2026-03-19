@@ -16,9 +16,12 @@ public sealed class EligibilityResult
     // Set after metric computation in the assembly step
     public double AvailableMinutes { get; set; }
 
-    /// <summary>Minutes of remaining degradation: positive degraded datapoints that stay eligible,
-    /// plus suspect gap minutes counted as downtime (platform-fault gaps and unresolved 0% gaps).</summary>
-    public int DegradedMinutes { get; set; }
+    /// <summary>Suspect minutes confirmed as platform issues by Resource Health fault intervals.</summary>
+    public int ConfirmedDowntimeMinutes { get; set; }
+
+    /// <summary>Suspect minutes that remain unexplained after Activity Log, Resource Health,
+    /// and fallback classification have been applied.</summary>
+    public int UnexplainedSuspectMinutes { get; set; }
 
     /// <summary>Availability percentage (5 decimal places), or "N/A" if fully excluded.</summary>
     public string AvailabilityPct => EligibleMinutes > 0

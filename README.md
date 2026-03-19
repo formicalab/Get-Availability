@@ -17,7 +17,8 @@ For each resource, the tool answers:
 - How many minutes was it **eligible** (expected to be available)?
 - How many of those minutes was it **available** (confirmed by Azure Monitor)?
 - What is the **availability percentage** (Available ÷ Eligible × 100)?
-- How many minutes were **degraded** (availability < 100% or confirmed faults)?
+- How many suspect minutes were **confirmed as downtime by Resource Health**?
+- How many suspect minutes remained **unexplained** after all resolution attempts?
 
 ## How it works
 
@@ -111,7 +112,8 @@ If the Resource Health API call fails for a resource while Health History should
 ```
 EligibleMinutes  = TotalMinutes − ActivityLogExcludedGapMinutes − HealthExplainedGapMinutes − MetricIssueNullMinutes − CustomerExcusedDegradedMinutes − ZeroTxMinutes
 AvailableMinutes = Σ metric values above 0% (each 0.0–1.0) − CustomerExcusedDegradedAvailableSum
-DegradedMinutes  = remaining metric minutes where value < 100% + platform-fault gap minutes + unresolved 0% gap minutes
+ConfirmedDowntimeMinutes = PlatformFaultGapMinutes + HealthConfirmedDegradedMinutes
+UnexplainedMinutes = UnresolvedZeroDowntimeMinutes + RemainingPositiveDegradedMinutes
 AvailabilityPct  = AvailableMinutes / EligibleMinutes × 100
 ```
 
@@ -122,7 +124,8 @@ AvailabilityPct  = AvailableMinutes / EligibleMinutes × 100
 - **Unresolved 0% gap minutes** remain in `EligibleMinutes` and contribute `0` to `AvailableMinutes`.
 - **Customer-excused degraded minutes** are removed from both `EligibleMinutes` and `AvailableMinutes`.
 - **Zero-transaction storage minutes** are removed from `EligibleMinutes` (no availability signal when there are no transactions).
-- **DegradedMinutes** consolidates metric-level degradation that remains eligible plus all gap minutes counted as downtime.
+- **ConfirmedDowntimeMinutes** counts suspect minutes that Resource Health explicitly confirms as platform issues.
+- **UnexplainedMinutes** counts suspect minutes that still reduce confidence in the availability result after fallback classification, specifically unresolved `0%` minutes and remaining positive degraded datapoints.
 - Resources with zero eligible minutes show `N/A`.
 - If the metric API returns no usable datapoints at all across the full period, the resource is excluded from availability calculations by setting `EligibleMinutes = 0` and `AvailableMinutes = 0`.
 
@@ -133,18 +136,19 @@ Consider a 30-day month for a VM (43,200 total minutes):
 | Category | Minutes | Effect |
 |---|---:|---|
 | Metric = 1.0 (fully available) | 40,000 | +40,000 to AvailableSum |
-| Metric = 0.7 (degraded) | 100 | +70 to AvailableSum, +100 DegradedMins |
+| Metric = 0.7 (degraded, unexplained) | 100 | +70 to AvailableSum, +100 UnexplainedMins |
 | Metric = 0.8 during restart lifecycle event | 5 | Subtracted from eligible, remove 4 from AvailableSum |
 | Metric = null — explained by Activity Log | 40 | Subtracted from eligible |
 | Metric = null — explained by Health `Unknown` | 3,000 | Subtracted from eligible |
 | Metric = null — unresolved metric issue | 30 | Subtracted from eligible |
-| Metric = 0% — fault confirmed | 10 | +0 to available, stays in eligible, +10 DegradedMins |
-| Metric = 0% — unresolved | 10 | +0 to available, stays in eligible, +10 DegradedMins |
+| Metric = 0% — fault confirmed | 10 | +0 to available, stays in eligible, +10 ConfirmedDowntimeMins |
+| Metric = 0% — unresolved | 10 | +0 to available, stays in eligible, +10 UnexplainedMins |
 
 ```
 EligibleMinutes  = 43,200 − 40 − 3,000 − 30 − 5 = 40,125
 AvailableMinutes = 40,000 + 70 − 4 = 40,066
-DegradedMinutes  = 100 + 10 + 10 = 120
+ConfirmedDowntimeMinutes = 10
+UnexplainedMinutes = 100 + 10 = 110
 AvailabilityPct  = 40,066 / 40,125 × 100 = 99.85390%
 ```
 
@@ -178,7 +182,7 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 
 The published binary (`GetAvailability.exe`) requires no .NET runtime — it is a Native AOT self-contained executable.
 
-If cached Azure credentials have expired, the tool now exits with a concise authentication error that tells the operator to re-authenticate. For Azure CLI-based auth, run `az login` and retry.
+If Azure authentication fails, the tool prints the SDK exception message directly. For Azure CLI-based auth, re-run `az login` and retry if the message indicates the cached login is no longer valid.
 
 ## Usage
 
@@ -232,11 +236,11 @@ WARNING: Resource Health history does not cover this period. All suspect minutes
 
 Table view:
 
-| SubscriptionName | Name | Kind | Location | Avail% | AvailMin | EligMin | DegradedMins |
-|---|---|---|---|---:|---:|---:|---:|
-| PRODUZIONE | `pabfpsql01azwe/pabfpsqldb01azwe` | AzureSqlDatabase | westeurope | 100.00000 | 40320 | 40320 | |
-| SVILUPPO | `trepomndgw01a` | VirtualMachine | northeurope | 100.00000 | 14369 | 14369 | |
-| PRODUZIONE | `pcesopcachefosa01azwe` | StorageAccount | westeurope | 99.97520 | 40306 | 40316 | 10 |
+| SubscriptionName | Name | Kind | Location | Avail% | AvailMin | EligMin | ConfirmedDownMin | UnexplainedMin |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| PRODUZIONE | `pabfpsql01azwe/pabfpsqldb01azwe` | AzureSqlDatabase | westeurope | 100.00000 | 40320 | 40320 | | |
+| SVILUPPO | `trepomndgw01a` | VirtualMachine | northeurope | 100.00000 | 14369 | 14369 | | |
+| PRODUZIONE | `pcesopcachefosa01azwe` | StorageAccount | westeurope | 99.97520 | 40306 | 40316 | | 10 |
 
 A per-subscription summary is printed grouping numerically-counted resources by Kind + Location with resource count and aggregate availability. Resources excluded as `N/A` are not included in summary math. When multiple subscriptions are processed, a cross-subscription overall summary is printed at the end.
 

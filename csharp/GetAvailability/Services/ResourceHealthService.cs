@@ -150,6 +150,7 @@ public static class ResourceHealthService
         int customerExcusedDegradedMin = 0;
         double customerExcusedDegradedAvail = 0;
         int activityLogDegradedMin = 0;
+        int healthConfirmedDegradedMin = 0;
 
         foreach (long tick in allGapTicks)
         {
@@ -193,6 +194,7 @@ public static class ResourceHealthService
 
                 if (inFault)
                 {
+                    healthConfirmedDegradedMin++;
                     continue;
                 }
 
@@ -215,7 +217,8 @@ public static class ResourceHealthService
             unresolvedZeroDowntimeMin,
             customerExcusedDegradedMin,
             customerExcusedDegradedAvail,
-            activityLogDegradedMin);
+            activityLogDegradedMin,
+            healthConfirmedDegradedMin);
     }
 
     public static DateTimeOffset GetHealthCoverageStart(DateTimeOffset periodStart)
@@ -474,6 +477,7 @@ internal readonly record struct HealthTransition(
 /// <param name="CustomerExcusedDegradedMinutes">Positive degraded datapoints excused by lifecycle activity or customer-initiated health windows.</param>
 /// <param name="CustomerExcusedDegradedAvailableSum">Fractional available minutes contributed by customer-excused degraded datapoints and removed from AvailableMinutes.</param>
 /// <param name="ActivityLogDegradedMinutes">Subset of CustomerExcusedDegradedMinutes explained specifically by supported Activity Log lifecycle operations.</param>
+/// <param name="HealthConfirmedDegradedMinutes">Positive degraded datapoints confirmed as platform issues by Resource Health fault intervals.</param>
 public readonly record struct SuspectGapClassification(
     bool HealthHistoryApplied,
     int ActivityLogExcludedGapMinutes,
@@ -483,4 +487,5 @@ public readonly record struct SuspectGapClassification(
     int UnresolvedZeroDowntimeMinutes,
     int CustomerExcusedDegradedMinutes,
     double CustomerExcusedDegradedAvailableSum,
-    int ActivityLogDegradedMinutes);
+    int ActivityLogDegradedMinutes,
+    int HealthConfirmedDegradedMinutes);

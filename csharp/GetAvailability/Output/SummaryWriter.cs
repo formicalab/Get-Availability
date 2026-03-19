@@ -9,16 +9,17 @@ public static class SummaryWriter
     public static void WriteResults(EligibilityResult[] sorted)
     {
         // Table header
-        const string fmt = "{0,-30} {1,-35} {2,-18} {3,-14} {4,12} {5,12} {6,12} {7,14}";
+        const string fmt = "{0,-30} {1,-35} {2,-18} {3,-14} {4,12} {5,12} {6,12} {7,18} {8,18}";
         Console.WriteLine();
         Console.WriteLine(string.Format(fmt,
             "SubscriptionName", "Name", "Kind", "Location",
-            "Avail%", "AvailMin", "EligMin", "DegradedMins"));
-        Console.WriteLine(new string('─', 150));
+            "Avail%", "AvailMin", "EligMin", "ConfirmedDownMin", "UnexplainedMin"));
+        Console.WriteLine(new string('─', 169));
 
         foreach (var r in sorted)
         {
-            string degradedCol = r.DegradedMinutes > 0 ? $"{r.DegradedMinutes}" : "";
+            string confirmedDowntimeCol = r.ConfirmedDowntimeMinutes > 0 ? $"{r.ConfirmedDowntimeMinutes}" : "";
+            string unexplainedSuspectCol = r.UnexplainedSuspectMinutes > 0 ? $"{r.UnexplainedSuspectMinutes}" : "";
             Console.WriteLine(string.Format(fmt,
                 Truncate(r.SubscriptionName, 30),
                 Truncate(r.Name, 35),
@@ -27,7 +28,8 @@ public static class SummaryWriter
                 r.AvailabilityPct,
                 Math.Round(r.AvailableMinutes, 2),
                 r.EligibleMinutes,
-                degradedCol));
+                confirmedDowntimeCol,
+                unexplainedSuspectCol));
         }
         Console.WriteLine();
     }

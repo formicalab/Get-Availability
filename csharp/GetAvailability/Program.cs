@@ -95,9 +95,9 @@ try
     await RunAsync(subscriptionNames, kinds, resourceName, monthParameter, parallelism, activityGraceMinutes);
     return 0;
 }
-catch (Exception ex) when (TryGetAzureAuthenticationMessage(ex, out var authMessage))
+catch (Exception ex) when (ex is AuthenticationFailedException or CredentialUnavailableException)
 {
-    Console.Error.WriteLine($"Authentication error: {authMessage}");
+    Console.Error.WriteLine(ex.Message);
     return 1;
 }
 catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
@@ -148,11 +148,12 @@ static async Task RunAsync(
     var subIds = resolved.Select(r => r.Id).ToArray();
     var subIdToName = resolved.ToDictionary(r => r.Id, r => r.Name);
     Console.WriteLine($"Processing {resolved.Count} subscription(s): {string.Join(", ", resolved.Select(r => r.Name))}");
+    Console.WriteLine($"Kinds: {string.Join(", ", kinds)}");
 
     // Step 2: Query Resource Graph for all VMs, SQL DBs, and Storage Accounts
     Console.Write("Querying resource inventory... ");
     var resources = await ResourceInventoryService.QueryAsync(armClient, subIds, subIdToName, kinds, resourceName);
-    Console.WriteLine($"Found {resources.Count} resource(s) across {resolved.Count} subscription(s) (kinds: {string.Join(", ", kinds)}).");
+    Console.WriteLine($"Found {resources.Count} resource(s) across {resolved.Count} subscription(s).");
 
     if (resources.Count == 0) { Console.WriteLine("No resources found."); return; }
 
@@ -217,7 +218,8 @@ static async Task RunAsync(
             {
                 elig.EligibleMinutes = 0;
                 elig.AvailableMinutes = 0;
-                elig.DegradedMinutes = 0;
+                elig.ConfirmedDowntimeMinutes = 0;
+                elig.UnexplainedSuspectMinutes = 0;
                 Console.WriteLine($"  [{res.Name}] excluded from availability (no numeric availability datapoints in period)");
                 continue;
             }
@@ -297,6 +299,10 @@ static async Task RunAsync(
                     downtimeGapMinutes += gc.PlatformFaultGapMinutes;
                     Console.WriteLine($"  [{res.Name}] {gc.PlatformFaultGapMinutes} gap min confirmed as downtime (Health History platform issue)");
                 }
+                if (gc.HealthConfirmedDegradedMinutes > 0)
+                {
+                    Console.WriteLine($"  [{res.Name}] {gc.HealthConfirmedDegradedMinutes} degraded suspect min confirmed as downtime (Health History platform issue)");
+                }
                 if (gc.UnresolvedZeroDowntimeMinutes > 0)
                 {
                     downtimeGapMinutes += gc.UnresolvedZeroDowntimeMinutes;
@@ -304,9 +310,21 @@ static async Task RunAsync(
                 }
             }
 
-            // DegradedMinutes = metric-level degraded datapoints that remain eligible
-            // + gap minutes counted as downtime.
-            elig.DegradedMinutes = Math.Max(0, mr.DegradedMinutes - (suspectResults is not null && suspectResults.TryGetValue(key, out var hc) ? hc.CustomerExcusedDegradedMinutes : 0) + downtimeGapMinutes);
+            int confirmedHealthDowntimeMinutes = suspectResults is not null && suspectResults.TryGetValue(key, out var healthClassification)
+                ? healthClassification.PlatformFaultGapMinutes + healthClassification.HealthConfirmedDegradedMinutes
+                : 0;
+
+            int unexplainedPositiveDegradedMinutes = suspectResults is not null && suspectResults.TryGetValue(key, out var unresolvedClassification)
+                ? Math.Max(0, mr.DegradedMinutes - unresolvedClassification.CustomerExcusedDegradedMinutes - unresolvedClassification.HealthConfirmedDegradedMinutes)
+                : mr.DegradedMinutes;
+
+            int unexplainedSuspectMinutes = suspectResults is not null && suspectResults.TryGetValue(key, out var unexplainedClassification)
+                ? unexplainedClassification.UnresolvedZeroDowntimeMinutes
+                    + unexplainedPositiveDegradedMinutes
+                : mr.SuspectMinutes;
+
+            elig.ConfirmedDowntimeMinutes = confirmedHealthDowntimeMinutes;
+            elig.UnexplainedSuspectMinutes = unexplainedSuspectMinutes;
 
             // For Storage Accounts, subtract zero-transaction minutes from eligibility
             int zeroTxExcludedMinutes = 0;
@@ -442,100 +460,4 @@ static int ParseIntOption(string rawValue, string optionName, int minValue)
         throw new ArgumentException($"{optionName} must be >= {minValue}.");
 
     return value;
-}
-
-static bool TryGetAzureAuthenticationMessage(Exception exception, out string message)
-{
-    foreach (var candidate in EnumerateExceptions(exception))
-    {
-        switch (candidate)
-        {
-            case CredentialUnavailableException credentialUnavailableException
-                when LooksLikeReauthenticationIssue(credentialUnavailableException.Message):
-                message = BuildAuthenticationMessage(credentialUnavailableException.Message);
-                return true;
-
-            case AuthenticationFailedException authenticationFailedException:
-                message = BuildAuthenticationMessage(authenticationFailedException.Message);
-                return true;
-
-            case Azure.RequestFailedException requestFailedException
-                when requestFailedException.Status is 401 or 403
-                     && LooksLikeReauthenticationIssue(requestFailedException.Message):
-                message = BuildAuthenticationMessage(requestFailedException.Message);
-                return true;
-        }
-    }
-
-    message = string.Empty;
-    return false;
-}
-
-static IEnumerable<Exception> EnumerateExceptions(Exception exception)
-{
-    var pending = new Stack<Exception>();
-    pending.Push(exception);
-
-    while (pending.Count > 0)
-    {
-        var current = pending.Pop();
-        yield return current;
-
-        if (current is AggregateException aggregateException)
-        {
-            foreach (var inner in aggregateException.Flatten().InnerExceptions)
-                pending.Push(inner);
-            continue;
-        }
-
-        if (current.InnerException is not null)
-            pending.Push(current.InnerException);
-    }
-}
-
-static string BuildAuthenticationMessage(string details)
-{
-    const string reauthHint = "Re-authenticate and run the command again. If you use Azure CLI credentials, run 'az login'.";
-
-    if (LooksLikeExpiredCredential(details))
-        return $"The current Azure credentials appear to be expired or no longer valid. {reauthHint}";
-
-    return $"The configured Azure credentials are not usable for this request. {reauthHint}";
-}
-
-static bool LooksLikeReauthenticationIssue(string? details)
-{
-    if (string.IsNullOrWhiteSpace(details))
-        return false;
-
-    string normalized = details.ToLowerInvariant();
-    return normalized.Contains("az login", StringComparison.Ordinal)
-        || normalized.Contains("authentication failed", StringComparison.Ordinal)
-        || normalized.Contains("interaction required", StringComparison.Ordinal)
-        || normalized.Contains("reauth", StringComparison.Ordinal)
-        || normalized.Contains("re-auth", StringComparison.Ordinal)
-        || normalized.Contains("sign in again", StringComparison.Ordinal)
-        || normalized.Contains("sign-in again", StringComparison.Ordinal)
-        || normalized.Contains("refresh token", StringComparison.Ordinal)
-        || normalized.Contains("token", StringComparison.Ordinal) && normalized.Contains("expired", StringComparison.Ordinal)
-        || normalized.Contains("invalid_grant", StringComparison.Ordinal)
-        || normalized.Contains("unauthorized", StringComparison.Ordinal)
-        || normalized.Contains("forbidden", StringComparison.Ordinal)
-        || normalized.Contains("credential is unavailable", StringComparison.Ordinal);
-}
-
-static bool LooksLikeExpiredCredential(string? details)
-{
-    if (string.IsNullOrWhiteSpace(details))
-        return false;
-
-    string normalized = details.ToLowerInvariant();
-    return normalized.Contains("expired", StringComparison.Ordinal)
-        || normalized.Contains("expiry", StringComparison.Ordinal)
-        || normalized.Contains("refresh token", StringComparison.Ordinal)
-        || normalized.Contains("invalid_grant", StringComparison.Ordinal)
-        || normalized.Contains("aadsts700082", StringComparison.Ordinal)
-        || normalized.Contains("aadsts70043", StringComparison.Ordinal)
-        || normalized.Contains("aadsts50173", StringComparison.Ordinal)
-        || normalized.Contains("az login", StringComparison.Ordinal) && normalized.Contains("again", StringComparison.Ordinal);
 }
