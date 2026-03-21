@@ -31,16 +31,16 @@
     The observation window is a UTC calendar month selected via -Month YYYYMM.
     Current month runs month-to-date; past months run full-month.
 
-.PARAMETER SubscriptionNames
+.PARAMETER Subscriptions
     One or more Azure subscription display names.
 
 .PARAMETER Month
     Observation month in UTC, format YYYYMM.
 
-.PARAMETER ResourceKinds
+.PARAMETER Kinds
     Resource kinds: vm, sql, storage (default: all).
 
-.PARAMETER ResourceName
+.PARAMETER Resource
     Optional single resource name filter.
 
 .PARAMETER Parallelism
@@ -50,26 +50,26 @@
     Post-operation grace window for Activity Log lifecycle events (default: 10).
 
 .EXAMPLE
-    ./get-availability.ps1 -SubscriptionNames 'MySubscription' -Month 202506
+    ./get-availability.ps1 -Subscriptions 'MySubscription' -Month 202506
 
 .EXAMPLE
-    ./get-availability.ps1 -SubscriptionNames 'Sub1','Sub2' -Month 202505 -ResourceKinds vm,sql
+    ./get-availability.ps1 -Subscriptions 'Sub1','Sub2' -Month 202505 -Kinds vm,sql
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string[]]$SubscriptionNames,
+    [string[]]$Subscriptions,
 
     [Parameter(Mandatory)]
     [ValidatePattern('^\d{6}$')]
     [string]$Month,
 
     [ValidateSet('vm','sql','storage')]
-    [string[]]$ResourceKinds = @('vm','sql','storage'),
+    [string[]]$Kinds = @('vm','sql','storage'),
 
-    [string]$ResourceName,
+    [string]$Resource,
 
     [ValidateRange(1, 64)]
     [int]$Parallelism = [math]::Max(4, [math]::Min(16, [Environment]::ProcessorCount)),
@@ -953,7 +953,7 @@ if ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
 # Step 2: Authenticate and resolve subscriptions
 Write-Host -NoNewline 'Authenticating... '
 $allAzSubs = @(Get-AzSubscription)
-$resolvedSubs = @(foreach ($name in $SubscriptionNames) {
+$resolvedSubs = @(foreach ($name in $Subscriptions) {
     $matches = @($allAzSubs | Where-Object Name -eq $name)
     if ($matches.Count -eq 0) { throw "Subscription '$name' not found." }
     if ($matches.Count -gt 1) { throw "Multiple subscriptions named '$name'." }
@@ -963,12 +963,12 @@ $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
 Write-Host 'OK'
 Write-Host "Processing $($resolvedSubs.Count) subscription(s): $($resolvedSubs.Name -join ', ')"
-Write-Host "Kinds: $($ResourceKinds -join ', ')"
+Write-Host "Kinds: $($Kinds -join ', ')"
 
 # Step 3: Query Resource Graph inventory
 Write-Host -NoNewline 'Querying resource inventory... '
 $resources = Get-ResourceInventory -SubscriptionIds $subIds -SubIdToName $subIdToName `
-    -Kinds $ResourceKinds -ResourceNameFilter $ResourceName
+    -Kinds $Kinds -ResourceNameFilter $Resource
 Write-Host "Found $($resources.Count) resource(s) across $($resolvedSubs.Count) subscription(s)."
 
 if ($resources.Count -eq 0) { Write-Host 'No resources found.'; return }

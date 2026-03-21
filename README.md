@@ -193,10 +193,10 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-SubscriptionNames` | *(required)* | One or more Azure subscription display names |
+| `-Subscriptions` | *(required)* | One or more Azure subscription display names |
 | `-Month` | *(required)* | Observation month in UTC using format `YYYYMM` |
-| `-ResourceKinds` | `vm,sql,storage` | Resource kinds to process |
-| `-ResourceName` | *(all)* | Filter to a single resource name |
+| `-Kinds` | `vm,sql,storage` | Resource kinds to process |
+| `-Resource` | *(all)* | Filter to a single resource name |
 | `-Parallelism` | *(auto)* | Max concurrent API calls (scales to CPU cores, 4–16) |
 | `-ActivityGraceMinutes` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
 
@@ -262,22 +262,22 @@ dotnet run -- --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --month 202603
 
 ```powershell
 # Single subscription
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
+./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
 
 # Multiple subscriptions
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO','POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
+./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-SVILUPPO','POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
 
 # Filter by resource kind
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 -ResourceKinds vm,sql
+./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 -Kinds vm,sql
 
 # Single resource
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -ResourceName spiacomdgs01
+./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -Resource spiacomdgs01
 
 # Override the Activity Log grace window
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -ResourceName spocovm01a -ActivityGraceMinutes 15
+./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -Resource spocovm01a -ActivityGraceMinutes 15
 
 # Pipe results to CSV
-./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 | Export-Csv availability.csv
+./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 | Export-Csv availability.csv
 ```
 
 ## Output
