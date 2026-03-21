@@ -241,48 +241,48 @@ cd csharp/GetAvailability
 dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/publish/
 
 # Single subscription
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --month 202603
+./GetAvailability --subscriptions Contoso-Production --month 202603
 
 # Multiple subscriptions
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO POSTE-BANCOPOSTA-PRODUZIONE --month 202603
+./GetAvailability --subscriptions Contoso-Development Contoso-Production --month 202603
 
 # Filter by resource kind
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --month 202603 --kinds vm sql
+./GetAvailability --subscriptions Contoso-Production --month 202603 --kinds vm sql
 
 # Single resource
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO --month 202603 --resource spiacomdgs01
+./GetAvailability --subscriptions Contoso-Development --month 202603 --resource myvm01
 
 # SQL database by displayed server/database name
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO --month 202603 --resource tabfpsql01azne/tabfpsqldb01azne
+./GetAvailability --subscriptions Contoso-Development --month 202603 --resource sqlserver01/sqldb01
 
 # Override the Activity Log grace window
-./GetAvailability --subscriptions POSTE-BANCOPOSTA-SVILUPPO --month 202603 --resource spocovm01a --activity-grace-minutes 15
+./GetAvailability --subscriptions Contoso-Development --month 202603 --resource myvm02 --activity-grace-minutes 15
 
 # Or run directly without publishing
 cd csharp/GetAvailability
-dotnet run -- --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --month 202603
+dotnet run -- --subscriptions Contoso-Production --month 202603
 ```
 
 ### PowerShell version
 
 ```powershell
 # Single subscription
-./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603
 
 # Multiple subscriptions
-./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-SVILUPPO','POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
+./get-availability.ps1 -Subscriptions 'Contoso-Development','Contoso-Production' -Month 202603
 
 # Filter by resource kind
-./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 -Kinds vm,sql
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -Kinds vm,sql
 
 # Single resource
-./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -Resource spiacomdgs01
+./get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm01
 
 # Override the Activity Log grace window
-./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -Resource spocovm01a -ActivityGraceMinutes 15
+./get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm02 -ActivityGraceMinutes 15
 
 # Pipe results to CSV
-./get-availability.ps1 -Subscriptions 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 | Export-Csv availability.csv
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
 ```
 
 ## Output
@@ -309,9 +309,9 @@ Table view (Kind is abbreviated: VM, SQL, Storage):
 
 | Subscription | Name | Kind | Location | Suspect | Faults | Excused | Unresolved | AvailMin | EligMin | Avail% |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| PRODUZIONE | `pabfpsql01azwe/pabfpsqldb01azwe` | SQL | westeurope | | | | | 40320 | 40320 | 100.00000 |
-| SVILUPPO | `trepomndgw01a` | VM | northeurope | 23 | | 23 | | 14369 | 14369 | 100.00000 |
-| PRODUZIONE | `pcesopcachefosa01azwe` | Storage | westeurope | 14 | | 4 | 10 | 40306 | 40316 | 99.97520 |
+| Production | `sqlserver02/sqldb02` | SQL | westeurope | | | | | 40320 | 40320 | 100.00000 |
+| Development | `devvm01a` | VM | northeurope | 23 | | 23 | | 14369 | 14369 | 100.00000 |
+| Production | `storageaccount01` | Storage | westeurope | 14 | | 4 | 10 | 40306 | 40316 | 99.97520 |
 
 Column meaning:
 
@@ -330,9 +330,9 @@ A per-subscription summary is printed grouping numerically-counted resources by 
 Console output also reports per-resource classification details:
 
 ```
-  [tabfpsql01azne/tabfpsqldb01azne] metric scan found 23 suspect min across 22 suspect gaps (null or <100% availability values)
-  [tabfpsql01azne/tabfpsqldb01azne] checked against Activity Log: 23 suspect min explained by admin lifecycle events
-  [tabfpsql01azne/tabfpsqldb01azne] eligible min = 40320 - 23 gap min excluded by Activity Log = 40297
+  [sqlserver01/sqldb01] metric scan found 23 suspect min across 22 suspect gaps (null or <100% availability values)
+  [sqlserver01/sqldb01] checked against Activity Log: 23 suspect min explained by admin lifecycle events
+  [sqlserver01/sqldb01] eligible min = 40320 - 23 gap min excluded by Activity Log = 40297
 ```
 
 ## Architecture notes
