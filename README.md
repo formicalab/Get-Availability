@@ -10,7 +10,14 @@ The observation window is selected with `--month YYYYMM` in UTC:
 
 Metrics and Activity Log can support that 90-day lookback. Health History is still only applied to the overlap with its current [retention window](https://learn.microsoft.com/en-us/azure/service-health/resource-health-overview) (about 30 days).
 
-Built with .NET 10 and published as a **Native AOT** self-contained executable (~15 MB, no runtime required).
+Two equivalent implementations are provided:
+
+| Version | Path | Runtime | Notes |
+|---|---|---|---|
+| **C#** | `csharp/GetAvailability/` | .NET 10 Native AOT (~15 MB standalone binary, no runtime required) | Fastest; recommended for production use |
+| **PowerShell** | `get-availability.ps1` | PowerShell 7+ with `Az.Accounts` and `Az.ResourceGraph` modules | No build step; convenient for ad-hoc use |
+
+Both versions share the same pipeline, classification rules, output format, and invariants.
 
 For each resource, the tool answers:
 
@@ -171,6 +178,8 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 
 ## Parameters
 
+### C# (`GetAvailability.exe`)
+
 | Option | Short | Default | Description |
 |---|---|---|---|
 | `--subscriptions` | `-s` | *(required)* | One or more Azure subscription display names |
@@ -180,9 +189,22 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 | `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
 | `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
 
-`--month` cannot point to a month whose first day is more than 90 days before the current UTC time.
+### PowerShell (`get-availability.ps1`)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-SubscriptionNames` | *(required)* | One or more Azure subscription display names |
+| `-Month` | *(required)* | Observation month in UTC using format `YYYYMM` |
+| `-ResourceKinds` | `vm,sql,storage` | Resource kinds to process |
+| `-ResourceName` | *(all)* | Filter to a single resource name |
+| `-Parallelism` | *(auto)* | Max concurrent API calls (scales to CPU cores, 4–16) |
+| `-ActivityGraceMinutes` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
+
+Both versions enforce the same constraints: `-Month` / `--month` cannot point to a month whose first day is more than 90 days before the current UTC time.
 
 ## Prerequisites
+
+### C# version
 
 | Requirement | Detail |
 |---|---|
@@ -191,9 +213,22 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 
 The published binary (`GetAvailability.exe`) requires no .NET runtime — it is a Native AOT self-contained executable.
 
-If Azure authentication fails, the tool prints the SDK exception message directly. For Azure CLI-based auth, re-run `az login` and retry if the message indicates the cached login is no longer valid.
+### PowerShell version
+
+| Requirement | Detail |
+|---|---|
+| PowerShell | 7.0 or later (`pwsh`) |
+| Az.Accounts | `Install-Module Az.Accounts` |
+| Az.ResourceGraph | `Install-Module Az.ResourceGraph` |
+| Azure auth | `Connect-AzAccount` (used by both Az modules and for ARM token acquisition) |
+
+The script outputs objects to the pipeline in addition to the formatted table, so results can be piped to `Export-Csv`, `ConvertTo-Json`, or further filtered.
+
+If Azure authentication fails, the tool prints the SDK/module exception message directly. For Azure CLI-based auth (C#), re-run `az login`; for PowerShell, re-run `Connect-AzAccount`.
 
 ## Usage
+
+### C# version
 
 ```bash
 # Build the Native AOT binary (one-time)
@@ -221,6 +256,28 @@ dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/p
 # Or run directly without publishing
 cd csharp/GetAvailability
 dotnet run -- --subscriptions POSTE-BANCOPOSTA-PRODUZIONE --month 202603
+```
+
+### PowerShell version
+
+```powershell
+# Single subscription
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
+
+# Multiple subscriptions
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO','POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603
+
+# Filter by resource kind
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 -ResourceKinds vm,sql
+
+# Single resource
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -ResourceName spiacomdgs01
+
+# Override the Activity Log grace window
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-SVILUPPO' -Month 202603 -ResourceName spocovm01a -ActivityGraceMinutes 15
+
+# Pipe results to CSV
+./get-availability.ps1 -SubscriptionNames 'POSTE-BANCOPOSTA-PRODUZIONE' -Month 202603 | Export-Csv availability.csv
 ```
 
 ## Output
@@ -287,7 +344,9 @@ Console output also reports per-resource classification details:
 - **Conservative on failure.** If a Resource Health API call fails for a period where Health History should exist, Activity Log matches still apply, but no remaining suspect minutes are excused through Health History.
 - **Transaction-aware storage.** Zero-transaction minutes are excluded from eligibility rather than counted as unavailable, giving an accurate picture of actual storage service availability.
 - **Whole-window no-signal exclusion.** If the metric API returns no usable datapoints across the full period, the resource is excluded from availability calculations and shown as `N/A`.
-- **`Parallel.ForEachAsync`** for concurrent metric and health queries with configurable parallelism.
-- **Ticks-based metric keying** (`long` instead of `DateTime`) — zero-allocation per data point.
+- **`Parallel.ForEachAsync`** (C#) / **`ForEach-Object -Parallel`** (PowerShell) for concurrent metric and health queries with configurable parallelism.
+- **Ticks-based metric keying** (`long` instead of `DateTime`) — zero-allocation per data point in both versions.
+- **`System.Text.Json`** for efficient JSON parsing in both versions — avoids large PSObject trees in PowerShell and enables AOT-safe parsing in C#.
 - **Health History retention remains independent.** The observation month can extend beyond 30 days of retained Health History; only the retained overlap is checked there.
-- **Native AOT** — ~15 MB standalone binary, no .NET runtime required.
+- **Native AOT** (C#) — ~15 MB standalone binary, no .NET runtime required.
+- **Pipeline output** (PowerShell) — the script emits result objects after the formatted table, enabling `Export-Csv`, `ConvertTo-Json`, or further pipeline filtering.
