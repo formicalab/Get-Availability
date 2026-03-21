@@ -1,0 +1,30 @@
+# .NET build output
+bin/
+obj/
+publish/
+
+# NuGet
+*.nupkg
+*.snupkg
+project.assets.json
+*.nuget.props
+*.nuget.targets
+*.nuget.g.props
+*.nuget.g.targets
+
+# User/IDE settings
+.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.sln.docstates
+launchSettings.json
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# PowerShell
+*.ps1xml
