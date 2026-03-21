@@ -285,7 +285,6 @@ function Get-AvailabilityMetrics {
                 $doc = [System.Text.Json.JsonDocument]::Parse($jsonBody)
                 $jsonBody = $null
 
-                $jNull = [System.Text.Json.JsonValueKind]::Null
                 $jNum  = [System.Text.Json.JsonValueKind]::Number
 
                 function script:GetNum([System.Text.Json.JsonElement]$dp, [string]$prop) {
@@ -954,10 +953,10 @@ if ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
 Write-Host -NoNewline 'Authenticating... '
 $allAzSubs = @(Get-AzSubscription)
 $resolvedSubs = @(foreach ($name in $Subscriptions) {
-    $matches = @($allAzSubs | Where-Object Name -eq $name)
-    if ($matches.Count -eq 0) { throw "Subscription '$name' not found." }
-    if ($matches.Count -gt 1) { throw "Multiple subscriptions named '$name'." }
-    $matches[0]
+    $found = @($allAzSubs | Where-Object Name -eq $name)
+    if ($found.Count -eq 0) { throw "Subscription '$name' not found." }
+    if ($found.Count -gt 1) { throw "Multiple subscriptions named '$name'." }
+    $found[0]
 })
 $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
