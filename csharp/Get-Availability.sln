@@ -2,9 +2,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "csharp", "csharp", "{B41BF331-FCCB-2ADF-CDB6-767964B34647}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GetAvailability", "csharp\GetAvailability\GetAvailability.csproj", "{D8E3ED6B-CACB-5DD7-2217-51DEFB71535E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GetAvailability", "GetAvailability\GetAvailability.csproj", "{D8E3ED6B-CACB-5DD7-2217-51DEFB71535E}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -19,9 +17,6 @@ Global
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
-	EndGlobalSection
-	GlobalSection(NestedProjects) = preSolution
-		{D8E3ED6B-CACB-5DD7-2217-51DEFB71535E} = {B41BF331-FCCB-2ADF-CDB6-767964B34647}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {E926E2CD-7269-4A5C-B040-BA155000B4DB}
