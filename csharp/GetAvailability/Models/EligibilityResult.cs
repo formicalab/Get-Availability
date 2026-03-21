@@ -16,8 +16,15 @@ public sealed class EligibilityResult
     // Set after metric computation in the assembly step
     public double AvailableMinutes { get; set; }
 
+    /// <summary>Total suspect minutes from the metric scan (null + 0% + positive degraded datapoints).</summary>
+    public int SuspectMinutes { get; set; }
+
     /// <summary>Suspect minutes confirmed as platform issues by Resource Health fault intervals.</summary>
     public int ConfirmedDowntimeMinutes { get; set; }
+
+    /// <summary>Suspect minutes excused from eligibility: lifecycle activity, customer-initiated,
+    /// Health Unknown explanations, and metric-issue nulls.</summary>
+    public int ExcusedMinutes { get; set; }
 
     /// <summary>Suspect minutes that remain unexplained after Activity Log, Resource Health,
     /// and fallback classification have been applied.</summary>

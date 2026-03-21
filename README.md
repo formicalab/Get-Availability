@@ -14,11 +14,15 @@ Built with .NET 10 and published as a **Native AOT** self-contained executable (
 
 For each resource, the tool answers:
 
+- How many minutes had **suspect** availability (metric below 100% or null)?
+- Of those, how many were **confirmed as platform faults** by Resource Health?
+- How many were **excused** as normal operations (lifecycle activity, customer-initiated, metric issues)?
+- How many remain **unresolved** after all classification attempts?
+- How many minutes was it **available** (confirmed by Azure Monitor)?
 - How many minutes was it **eligible** (expected to be available)?
-- How many of those minutes was it **available** (confirmed by Azure Monitor)?
 - What is the **availability percentage** (Available ÷ Eligible × 100)?
-- How many suspect minutes were **confirmed as downtime by Resource Health**?
-- How many suspect minutes remained **unexplained** after all resolution attempts?
+
+The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
 ## How it works
 
@@ -110,22 +114,23 @@ If the Resource Health API call fails for a resource while Health History should
 ### Step 4 — Assemble results
 
 ```
-EligibleMinutes  = TotalMinutes − ActivityLogExcludedGapMinutes − HealthExplainedGapMinutes − MetricIssueNullMinutes − CustomerExcusedDegradedMinutes − ZeroTxMinutes
+SuspectMinutes   = GapMinutes + DegradedMinutes  (total suspect from metric scan)
+SuspectMinutes   = GapMinutes + DegradedMinutes + ZeroTxMinutes  (total suspect from metric scan + no-signal storage minutes)
+EligibleMinutes  = TotalMinutes − ExcusedMinutes
+ExcusedMinutes   = ActivityLogExcludedGapMinutes + HealthExplainedGapMinutes + MetricIssueNullMinutes + CustomerExcusedDegradedMinutes + ZeroTxMinutes
 AvailableMinutes = Σ metric values above 0% (each 0.0–1.0) − CustomerExcusedDegradedAvailableSum
-ConfirmedDowntimeMinutes = PlatformFaultGapMinutes + HealthConfirmedDegradedMinutes
-UnexplainedMinutes = UnresolvedZeroDowntimeMinutes + RemainingPositiveDegradedMinutes
+FaultMinutes     = PlatformFaultGapMinutes + HealthConfirmedDegradedMinutes
+UnresolvedMinutes = UnresolvedZeroDowntimeMinutes + RemainingPositiveDegradedMinutes
 AvailabilityPct  = AvailableMinutes / EligibleMinutes × 100
 ```
 
-- **Activity-explained gap minutes** are removed from `EligibleMinutes`.
-- **Health-explained gap minutes** (`Unknown` or customer-initiated) are removed from `EligibleMinutes`.
-- **Metric-issue null minutes** are removed from `EligibleMinutes`.
-- **Platform-fault gap minutes** remain in `EligibleMinutes` and contribute `0` to `AvailableMinutes`.
-- **Unresolved 0% gap minutes** remain in `EligibleMinutes` and contribute `0` to `AvailableMinutes`.
+The invariant **Suspect = Faults + Excused + Unresolved** always holds.
+
+- **Excused minutes** (lifecycle activity, customer-initiated, Health Unknown, metric-issue nulls, and zero-transaction storage minutes) are removed from `EligibleMinutes`.
+- **Platform-fault minutes** remain in `EligibleMinutes` and contribute `0` to `AvailableMinutes`.
+- **Unresolved 0% minutes** remain in `EligibleMinutes` and contribute `0` to `AvailableMinutes`.
 - **Customer-excused degraded minutes** are removed from both `EligibleMinutes` and `AvailableMinutes`.
-- **Zero-transaction storage minutes** are removed from `EligibleMinutes` (no availability signal when there are no transactions).
-- **ConfirmedDowntimeMinutes** counts suspect minutes that Resource Health explicitly confirms as platform issues.
-- **UnexplainedMinutes** counts suspect minutes that still reduce confidence in the availability result after fallback classification, specifically unresolved `0%` minutes and remaining positive degraded datapoints.
+- **Zero-transaction storage minutes** count as both suspect and excused — there is no availability signal when there are no transactions, so they cannot contribute to availability calculations.
 - Resources with zero eligible minutes show `N/A`.
 - If the metric API returns no usable datapoints at all across the full period, the resource is excluded from availability calculations by setting `EligibleMinutes = 0` and `AvailableMinutes = 0`.
 
@@ -136,19 +141,23 @@ Consider a 30-day month for a VM (43,200 total minutes):
 | Category | Minutes | Effect |
 |---|---:|---|
 | Metric = 1.0 (fully available) | 40,000 | +40,000 to AvailableSum |
-| Metric = 0.7 (degraded, unexplained) | 100 | +70 to AvailableSum, +100 UnexplainedMins |
-| Metric = 0.8 during restart lifecycle event | 5 | Subtracted from eligible, remove 4 from AvailableSum |
-| Metric = null — explained by Activity Log | 40 | Subtracted from eligible |
-| Metric = null — explained by Health `Unknown` | 3,000 | Subtracted from eligible |
-| Metric = null — unresolved metric issue | 30 | Subtracted from eligible |
-| Metric = 0% — fault confirmed | 10 | +0 to available, stays in eligible, +10 ConfirmedDowntimeMins |
-| Metric = 0% — unresolved | 10 | +0 to available, stays in eligible, +10 UnexplainedMins |
+| Metric = 0.7 (degraded, unexplained) | 100 | +70 to AvailableSum, +100 Unresolved |
+| Metric = 0.8 during restart lifecycle event | 5 | +5 Excused, remove 4 from AvailableSum |
+| Metric = null — explained by Activity Log | 40 | +40 Excused |
+| Metric = null — explained by Health `Unknown` | 3,000 | +3,000 Excused |
+| Metric = null — unresolved metric issue | 30 | +30 Excused |
+| Metric = 0% — fault confirmed | 10 | +10 Faults, stays in eligible |
+| Metric = 0% — unresolved | 10 | +10 Unresolved, stays in eligible |
 
 ```
-EligibleMinutes  = 43,200 − 40 − 3,000 − 30 − 5 = 40,125
+SuspectMinutes   = (40 + 3,000 + 30 + 10 + 10) + (100 + 5) = 3,195
+FaultMinutes     = 10
+ExcusedMinutes   = 40 + 3,000 + 30 + 5 = 3,075
+UnresolvedMinutes = 100 + 10 = 110
+  check: 10 + 3,075 + 110 = 3,195 ✓
+
+EligibleMinutes  = 43,200 − 3,075 = 40,125
 AvailableMinutes = 40,000 + 70 − 4 = 40,066
-ConfirmedDowntimeMinutes = 10
-UnexplainedMinutes = 100 + 10 = 110
 AvailabilityPct  = 40,066 / 40,125 × 100 = 99.85390%
 ```
 
@@ -158,7 +167,7 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 
 - **Transactions > 0 and Availability > 0%:** the Availability value (0–100, normalised to 0.0–1.0) counts toward available minutes. Values below 100% count as degraded.
 - **Transactions > 0 and Availability null or 0%:** recorded as suspect minutes and investigated with the same Activity Log / Health History / fallback sequence.
-- **Transactions = 0 or null:** subtracted from eligible minutes (no availability signal).
+- **Transactions = 0 or null:** counted as both suspect and excused — no availability signal to measure, so they are excluded from eligibility.
 
 ## Parameters
 
@@ -234,13 +243,25 @@ If none of the observation window is covered by retained Resource Health history
 WARNING: Resource Health history does not cover this period. All suspect minutes will use Activity Log and metric fallback rules.
 ```
 
-Table view:
+Table view (Kind is abbreviated: VM, SQL, Storage):
 
-| SubscriptionName | Name | Kind | Location | Avail% | AvailMin | EligMin | ConfirmedDownMin | UnexplainedMin |
-|---|---|---|---|---:|---:|---:|---:|---:|
-| PRODUZIONE | `pabfpsql01azwe/pabfpsqldb01azwe` | AzureSqlDatabase | westeurope | 100.00000 | 40320 | 40320 | | |
-| SVILUPPO | `trepomndgw01a` | VirtualMachine | northeurope | 100.00000 | 14369 | 14369 | | |
-| PRODUZIONE | `pcesopcachefosa01azwe` | StorageAccount | westeurope | 99.97520 | 40306 | 40316 | | 10 |
+| Subscription | Name | Kind | Location | Suspect | Faults | Excused | Unresolved | AvailMin | EligMin | Avail% |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| PRODUZIONE | `pabfpsql01azwe/pabfpsqldb01azwe` | SQL | westeurope | | | | | 40320 | 40320 | 100.00000 |
+| SVILUPPO | `trepomndgw01a` | VM | northeurope | 23 | | 23 | | 14369 | 14369 | 100.00000 |
+| PRODUZIONE | `pcesopcachefosa01azwe` | Storage | westeurope | 14 | | 4 | 10 | 40306 | 40316 | 99.97520 |
+
+Column meaning:
+
+- **Suspect** — total minutes where the availability metric was below 100%, null, or had no signal (zero-transaction storage minutes).
+- **Faults** — suspect minutes confirmed as platform issues by Resource Health.
+- **Excused** — suspect minutes excused from eligibility (lifecycle activity, customer-initiated, Health Unknown, metric-issue nulls, and zero-transaction storage minutes).
+- **Unresolved** — suspect minutes that remained after all classification (unresolved 0% downtime + unexplained degraded).
+- **AvailMin** — available minutes (sum of metric values, each 0.0–1.0).
+- **EligMin** — eligible minutes (total minus excused).
+- **Avail%** — availability percentage (AvailMin ÷ EligMin × 100).
+
+The invariant **Suspect = Faults + Excused + Unresolved** holds for every row, making it easy to verify that all suspect minutes are accounted for. Columns with value 0 are shown as blank.
 
 A per-subscription summary is printed grouping numerically-counted resources by Kind + Location with resource count and aggregate availability. Resources excluded as `N/A` are not included in summary math. When multiple subscriptions are processed, a cross-subscription overall summary is printed at the end.
 

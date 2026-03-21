@@ -8,28 +8,29 @@ public static class SummaryWriter
     /// <summary>Prints a fixed-width table with one row per resource showing availability metrics.</summary>
     public static void WriteResults(EligibilityResult[] sorted)
     {
-        // Table header
-        const string fmt = "{0,-30} {1,-35} {2,-18} {3,-14} {4,12} {5,12} {6,12} {7,18} {8,18}";
+        // Table header — compact column widths to fit standard terminals
+        const string fmt = "{0,-24} {1,-30} {2,-7} {3,-12} {4,7} {5,6} {6,7} {7,10} {8,10} {9,8} {10,10}";
         Console.WriteLine();
         Console.WriteLine(string.Format(fmt,
-            "SubscriptionName", "Name", "Kind", "Location",
-            "Avail%", "AvailMin", "EligMin", "ConfirmedDownMin", "UnexplainedMin"));
-        Console.WriteLine(new string('─', 169));
+            "Subscription", "Name", "Kind", "Location",
+            "Suspect", "Faults", "Excused", "Unresolved",
+            "AvailMin", "EligMin", "Avail%"));
+        Console.WriteLine(new string('─', 141));
 
         foreach (var r in sorted)
         {
-            string confirmedDowntimeCol = r.ConfirmedDowntimeMinutes > 0 ? $"{r.ConfirmedDowntimeMinutes}" : "";
-            string unexplainedSuspectCol = r.UnexplainedSuspectMinutes > 0 ? $"{r.UnexplainedSuspectMinutes}" : "";
             Console.WriteLine(string.Format(fmt,
-                Truncate(r.SubscriptionName, 30),
-                Truncate(r.Name, 35),
-                r.Kind,
+                Truncate(r.SubscriptionName, 24),
+                Truncate(r.Name, 30),
+                ShortKind(r.Kind),
                 r.Location,
-                r.AvailabilityPct,
+                r.SuspectMinutes > 0 ? $"{r.SuspectMinutes}" : "",
+                r.ConfirmedDowntimeMinutes > 0 ? $"{r.ConfirmedDowntimeMinutes}" : "",
+                r.ExcusedMinutes > 0 ? $"{r.ExcusedMinutes}" : "",
+                r.UnexplainedSuspectMinutes > 0 ? $"{r.UnexplainedSuspectMinutes}" : "",
                 Math.Round(r.AvailableMinutes, 2),
                 r.EligibleMinutes,
-                confirmedDowntimeCol,
-                unexplainedSuspectCol));
+                r.AvailabilityPct));
         }
         Console.WriteLine();
     }
@@ -52,7 +53,7 @@ public static class SummaryWriter
                 double a = g.Sum(r => r.AvailableMinutes);
                 double e = g.Sum(r => r.EligibleMinutes);
                 double pct = e > 0 ? Math.Round(a / e * 100, 5) : 0;
-                Console.WriteLine($"  {g.Key.Kind}, {g.Key.Location} [{n} res]: {pct}% ({Math.Round(a, 2)} / {Math.Round(e, 2)} eligible min)");
+                Console.WriteLine($"  {ShortKind(g.Key.Kind)}, {g.Key.Location} [{n} res]: {pct}% ({Math.Round(a, 2)} / {Math.Round(e, 2)} eligible min)");
             }
             int tn = subGroup.Count();
             double ta = subGroup.Sum(r => r.AvailableMinutes);
@@ -75,7 +76,7 @@ public static class SummaryWriter
                 double a = g.Sum(r => r.AvailableMinutes);
                 double e = g.Sum(r => r.EligibleMinutes);
                 double pct = e > 0 ? Math.Round(a / e * 100, 5) : 0;
-                Console.WriteLine($"  {g.Key.Kind}, {g.Key.Location} [{n} res]: {pct}% ({Math.Round(a, 2)} / {Math.Round(e, 2)} eligible min)");
+                Console.WriteLine($"  {ShortKind(g.Key.Kind)}, {g.Key.Location} [{n} res]: {pct}% ({Math.Round(a, 2)} / {Math.Round(e, 2)} eligible min)");
             }
             int on = eligible.Length;
             double oa = eligible.Sum(r => r.AvailableMinutes);
@@ -89,4 +90,13 @@ public static class SummaryWriter
     /// <summary>Truncates a string to max length with "..." suffix, using Span to avoid allocation.</summary>
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : string.Concat(s.AsSpan(0, max - 3), "...");
+
+    /// <summary>Abbreviates resource kind for compact table display.</summary>
+    private static string ShortKind(string kind) => kind switch
+    {
+        "VirtualMachine" => "VM",
+        "AzureSqlDatabase" => "SQL",
+        "StorageAccount" => "Storage",
+        _ => kind
+    };
 }

@@ -139,12 +139,14 @@ static async Task RunAsync(
     }
 
     // Authenticate using DefaultAzureCredential (az login, managed identity, etc.)
+    Console.Write("Authenticating... ");
     var credential = new DefaultAzureCredential();
     var armClient = new ArmClient(credential);
     var metricsClient = new MetricsQueryClient(credential);
 
     // Step 1: Resolve subscription display names → subscription IDs
     var resolved = await SubscriptionResolver.ResolveAsync(armClient, subscriptionNames);
+    Console.WriteLine("OK");
     var subIds = resolved.Select(r => r.Id).ToArray();
     var subIdToName = resolved.ToDictionary(r => r.Id, r => r.Name);
     Console.WriteLine($"Processing {resolved.Count} subscription(s): {string.Join(", ", resolved.Select(r => r.Name))}");
@@ -218,14 +220,15 @@ static async Task RunAsync(
             {
                 elig.EligibleMinutes = 0;
                 elig.AvailableMinutes = 0;
+                elig.SuspectMinutes = 0;
                 elig.ConfirmedDowntimeMinutes = 0;
+                elig.ExcusedMinutes = 0;
                 elig.UnexplainedSuspectMinutes = 0;
                 Console.WriteLine($"  [{res.Name}] excluded from availability (no numeric availability datapoints in period)");
                 continue;
             }
 
             // Apply suspect-gap investigation results
-            int downtimeGapMinutes = 0;
             int activityLogExcludedGapMinutes = 0;
             int healthExplainedGapMinutes = 0;
             int metricIssueNullMinutes = 0;
@@ -296,7 +299,6 @@ static async Task RunAsync(
                 }
                 if (gc.PlatformFaultGapMinutes > 0)
                 {
-                    downtimeGapMinutes += gc.PlatformFaultGapMinutes;
                     Console.WriteLine($"  [{res.Name}] {gc.PlatformFaultGapMinutes} gap min confirmed as downtime (Health History platform issue)");
                 }
                 if (gc.HealthConfirmedDegradedMinutes > 0)
@@ -305,7 +307,6 @@ static async Task RunAsync(
                 }
                 if (gc.UnresolvedZeroDowntimeMinutes > 0)
                 {
-                    downtimeGapMinutes += gc.UnresolvedZeroDowntimeMinutes;
                     Console.WriteLine($"  [{res.Name}] {gc.UnresolvedZeroDowntimeMinutes} unresolved 0% suspect min trusted as downtime");
                 }
             }
@@ -323,16 +324,19 @@ static async Task RunAsync(
                     + unexplainedPositiveDegradedMinutes
                 : mr.SuspectMinutes;
 
-            elig.ConfirmedDowntimeMinutes = confirmedHealthDowntimeMinutes;
-            elig.UnexplainedSuspectMinutes = unexplainedSuspectMinutes;
-
-            // For Storage Accounts, subtract zero-transaction minutes from eligibility
+            // For Storage Accounts, zero-transaction minutes have no availability signal and are
+            // excluded from eligibility. They count as suspect (no data) and excused (nothing to measure).
             int zeroTxExcludedMinutes = 0;
             if (mr.ZeroTxMin > 0 && res.Kind == "StorageAccount")
             {
                 elig.EligibleMinutes = Math.Max(0, elig.EligibleMinutes - mr.ZeroTxMin);
                 zeroTxExcludedMinutes = mr.ZeroTxMin;
             }
+
+            elig.SuspectMinutes = mr.SuspectMinutes + zeroTxExcludedMinutes;
+            elig.ConfirmedDowntimeMinutes = confirmedHealthDowntimeMinutes;
+            elig.ExcusedMinutes = activityLogExcludedGapMinutes + healthExplainedGapMinutes + metricIssueNullMinutes + excludedDegradedMinutes + zeroTxExcludedMinutes;
+            elig.UnexplainedSuspectMinutes = unexplainedSuspectMinutes;
 
             if (activityLogExcludedGapMinutes > 0 || healthExplainedGapMinutes > 0 || metricIssueNullMinutes > 0 || excludedDegradedMinutes > 0 || zeroTxExcludedMinutes > 0)
             {
