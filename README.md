@@ -191,6 +191,7 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 | `--resource` | `-r` | *(all)* | Filter to a single resource name |
 | `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
 | `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
+| `--version` | `-v` | | Print version and exit |
 
 ### PowerShell (`get-availability.ps1`)
 
@@ -202,6 +203,7 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 | `-Resource` | *(all)* | Filter to a single resource name |
 | `-Parallelism` | *(auto)* | Max concurrent API calls (scales to CPU cores, 4–16) |
 | `-ActivityGraceMinutes` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
+| `-Version` | | Print version and exit |
 
 Both versions enforce the same constraints: `-Month` / `--month` cannot point to a month whose first day is more than 90 days before the current UTC time.
 

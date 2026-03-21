@@ -56,30 +56,44 @@
     ./get-availability.ps1 -Subscriptions 'Sub1','Sub2' -Month 202505 -Kinds vm,sql
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Run')]
 param(
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, ParameterSetName = 'Run')]
     [ValidateNotNullOrEmpty()]
     [string[]]$Subscriptions,
 
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, ParameterSetName = 'Run')]
     [ValidatePattern('^\d{6}$')]
     [string]$Month,
 
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateSet('vm','sql','storage')]
     [string[]]$Kinds = @('vm','sql','storage'),
 
+    [Parameter(ParameterSetName = 'Run')]
     [string]$Resource,
 
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(1, 64)]
     [int]$Parallelism = [math]::Max(4, [math]::Min(16, [Environment]::ProcessorCount)),
 
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(0, 120)]
-    [int]$ActivityGraceMinutes = 10
+    [int]$ActivityGraceMinutes = 10,
+
+    [Parameter(Mandatory, ParameterSetName = 'ShowVersion')]
+    [switch]$Version
 )
+
+$ScriptVersion = '0.0.0-dev'
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($Version) {
+    Write-Host "get-availability $ScriptVersion"
+    return
+}
 
 # ── Observation window ────────────────────────────────────────────────────────
 
@@ -285,7 +299,6 @@ function Get-AvailabilityMetrics {
                 $doc = [System.Text.Json.JsonDocument]::Parse($jsonBody)
                 $jsonBody = $null
 
-                $jNull = [System.Text.Json.JsonValueKind]::Null
                 $jNum  = [System.Text.Json.JsonValueKind]::Number
 
                 function script:GetNum([System.Text.Json.JsonElement]$dp, [string]$prop) {
@@ -954,10 +967,10 @@ if ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
 Write-Host -NoNewline 'Authenticating... '
 $allAzSubs = @(Get-AzSubscription)
 $resolvedSubs = @(foreach ($name in $Subscriptions) {
-    $matches = @($allAzSubs | Where-Object Name -eq $name)
-    if ($matches.Count -eq 0) { throw "Subscription '$name' not found." }
-    if ($matches.Count -gt 1) { throw "Multiple subscriptions named '$name'." }
-    $matches[0]
+    $found = @($allAzSubs | Where-Object Name -eq $name)
+    if ($found.Count -eq 0) { throw "Subscription '$name' not found." }
+    if ($found.Count -gt 1) { throw "Multiple subscriptions named '$name'." }
+    $found[0]
 })
 $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
