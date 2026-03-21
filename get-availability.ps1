@@ -56,30 +56,44 @@
     ./get-availability.ps1 -Subscriptions 'Sub1','Sub2' -Month 202505 -Kinds vm,sql
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Run')]
 param(
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, ParameterSetName = 'Run')]
     [ValidateNotNullOrEmpty()]
     [string[]]$Subscriptions,
 
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, ParameterSetName = 'Run')]
     [ValidatePattern('^\d{6}$')]
     [string]$Month,
 
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateSet('vm','sql','storage')]
     [string[]]$Kinds = @('vm','sql','storage'),
 
+    [Parameter(ParameterSetName = 'Run')]
     [string]$Resource,
 
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(1, 64)]
     [int]$Parallelism = [math]::Max(4, [math]::Min(16, [Environment]::ProcessorCount)),
 
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(0, 120)]
-    [int]$ActivityGraceMinutes = 10
+    [int]$ActivityGraceMinutes = 10,
+
+    [Parameter(Mandatory, ParameterSetName = 'ShowVersion')]
+    [switch]$Version
 )
+
+$ScriptVersion = '0.0.0-dev'
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($Version) {
+    Write-Host "get-availability $ScriptVersion"
+    return
+}
 
 # ── Observation window ────────────────────────────────────────────────────────
 

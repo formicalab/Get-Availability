@@ -18,12 +18,20 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Extract version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+
       - name: Publish AOT
-        run: dotnet publish csharp/GetAvailability/GetAvailability.csproj -c Release -r win-x64
+        run: dotnet publish csharp/GetAvailability/GetAvailability.csproj -c Release -r win-x64 -p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Prepare release assets
         shell: pwsh
         run: |
+          $version = '${{ steps.version.outputs.VERSION }}'
           $publishDir = 'csharp/GetAvailability/bin/Release/net10.0/win-x64/publish'
           $stageDir   = 'release-assets'
           New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
@@ -31,8 +39,9 @@ jobs:
           # AOT executable
           Copy-Item "$publishDir/GetAvailability.exe" "$stageDir/GetAvailability.exe"
 
-          # PowerShell script
-          Copy-Item 'get-availability.ps1' "$stageDir/get-availability.ps1"
+          # PowerShell script — stamp version
+          (Get-Content 'get-availability.ps1' -Raw) -replace "0\.0\.0-dev", $version |
+            Set-Content "$stageDir/get-availability.ps1" -NoNewline
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

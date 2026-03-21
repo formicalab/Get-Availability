@@ -66,6 +66,9 @@ for (int i = 0; i < args.Length; i++)
         case "--activity-grace-minutes" or "-g":
             activityGraceMinutes = ParseIntOption(ReadRequiredValue(args, ref i, "--activity-grace-minutes"), "--activity-grace-minutes", minValue: 0);
             break;
+        case "--version" or "-v":
+            Console.WriteLine($"GetAvailability {typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"}");
+            return 0;
         case "--help" or "-h":
             Console.WriteLine("Usage: GetAvailability --subscriptions <name1> [name2 ...] [options]");
             Console.WriteLine("  --subscriptions, -s  Required. One or more Azure subscription display names.");
@@ -74,6 +77,7 @@ for (int i = 0; i < args.Length; i++)
             Console.WriteLine("  --resource, -r       Filter to a single resource name.");
             Console.WriteLine("  --parallelism, -p    Max concurrent metric calls (default: auto).");
             Console.WriteLine("  --activity-grace-minutes, -g  Post-operation grace window for supported Activity Log lifecycle events (default: 10).");
+            Console.WriteLine("  --version, -v        Print version and exit.");
             return 0;
     }
 }
