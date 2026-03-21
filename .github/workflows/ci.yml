@@ -20,9 +20,6 @@ jobs:
       - name: Build
         run: dotnet build csharp/GetAvailability/GetAvailability.csproj -c Release
 
-      - name: Publish AOT
-        run: dotnet publish csharp/GetAvailability/GetAvailability.csproj -c Release -r win-x64
-
       - name: Verify PS1 syntax
         shell: pwsh
         run: |
