@@ -300,6 +300,7 @@ public static class ResourceHealthService
         return transitions;
     }
 
+    /// <summary>Reads a string property from a JsonElement, returning empty if absent or null.</summary>
     private static string GetPropString(System.Text.Json.JsonElement props, string name)
         => props.TryGetProperty(name, out var el) ? el.GetString() ?? "" : "";
 

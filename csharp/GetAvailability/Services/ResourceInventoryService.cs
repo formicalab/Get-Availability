@@ -9,7 +9,7 @@ namespace GetAvailability.Services;
 /// <summary>Queries Resource Graph resources table for VMs, SQL DBs, and Storage Accounts.</summary>
 public static class ResourceInventoryService
 {
-    // Maps CLI kind abbreviations to Resource Graph type filters
+    /// <summary>Maps CLI kind abbreviations to Azure Resource Graph type identifiers.</summary>
     private static readonly Dictionary<string, string> KindToType = new(StringComparer.OrdinalIgnoreCase)
     {
         ["vm"] = "microsoft.compute/virtualmachines",

@@ -49,11 +49,20 @@
 .PARAMETER ActivityGraceMinutes
     Post-operation grace window for Activity Log lifecycle events (default: 10).
 
+.PARAMETER Batch
+    Use the regional Metrics Batch API instead of per-resource metric calls.
+
+.PARAMETER BatchSize
+    Max resources per batch call (default: 10, max 50). Implies -Batch.
+
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'MySubscription' -Month 202506
 
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'Sub1','Sub2' -Month 202505 -Kinds vm,sql
+
+.EXAMPLE
+    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Batch -BatchSize 20
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Run')]
@@ -80,6 +89,13 @@ param(
     [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(0, 120)]
     [int]$ActivityGraceMinutes = 10,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [switch]$Batch,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateRange(1, 50)]
+    [int]$BatchSize = 10,
 
     [Parameter(Mandatory, ParameterSetName = 'ShowVersion')]
     [switch]$Version
@@ -201,6 +217,7 @@ ${nameFilter}| extend resourceKind = case(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+## Abbreviates a resource kind for compact table/summary display.
 function Get-ShortKind([string]$Kind) {
     switch ($Kind) {
         'VirtualMachine'   { 'VM' }
@@ -210,20 +227,449 @@ function Get-ShortKind([string]$Kind) {
     }
 }
 
+## Returns the effective start of the Resource Health 30-day retention window,
+## clamped to PeriodStart if Health History covers the full observation period.
 function Get-HealthCoverageStart([DateTimeOffset]$PeriodStart) {
     $now = [DateTimeOffset]::UtcNow
     $cm = [DateTimeOffset]::new($now.Year, $now.Month, $now.Day,
         $now.Hour, $now.Minute, 0, [TimeSpan]::Zero)
     $ret = $cm.AddDays(-30)
-    if ($ret -gt $PeriodStart) { $ret } else { $PeriodStart }
+    $ret -gt $PeriodStart ? $ret : $PeriodStart
 }
 
+## Truncates a string to max length with '...' suffix.
 function Get-TruncatedString([string]$s, [int]$max) {
-    if ($s.Length -le $max) { $s } else { $s.Substring(0, $max - 3) + '...' }
+    $s.Length -le $max ? $s : ($s.Substring(0, $max - 3) + '...')
 }
 
-# ── Metrics (parallel) ───────────────────────────────────────────────────────
+# ── Batch API configuration ──────────────────────────────────────────────────
+# Maps resource kind → metric namespace, metric names, and aggregation for the
+# regional Metrics Batch API (https://{region}.metrics.monitor.azure.com).
 
+$KindConfig = @{
+    'VirtualMachine' = @{
+        Namespace   = 'Microsoft.Compute/virtualMachines'
+        MetricNames = 'VmAvailabilityMetric'
+        Aggregation = 'Minimum'
+    }
+    'AzureSqlDatabase' = @{
+        Namespace   = 'Microsoft.Sql/servers/databases'
+        MetricNames = 'Availability'
+        Aggregation = 'Minimum'
+    }
+    'StorageAccount' = @{
+        Namespace   = 'Microsoft.Storage/storageAccounts'
+        MetricNames = 'Availability,Transactions'
+        Aggregation = 'Minimum,Total'
+    }
+}
+
+# ── Batch endpoint validation ─────────────────────────────────────────────────
+
+## Probes each regional batch endpoint with an empty payload to verify reachability.
+## 400/401/403 are expected for the dummy subscription and treated as OK.
+function Test-BatchEndpoints {
+    param(
+        [string]$MetricsToken,
+        [string[]]$Regions
+    )
+
+    Write-Host "Validating batch endpoint availability for $($Regions.Count) region(s)..."
+    $allOk = $true
+    foreach ($region in $Regions) {
+        $endpoint = "https://$region.metrics.monitor.azure.com"
+        $testUri = "$endpoint/subscriptions/00000000-0000-0000-0000-000000000000/metrics:getBatch?api-version=2023-10-01&metricnamespace=Microsoft.Compute/virtualMachines&metricnames=Percentage%20CPU"
+        $body = '{"resourceids":[]}'
+
+        try {
+            $oldPref = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+            try {
+                Invoke-WebRequest -Uri $testUri -Method POST -Body $body -ContentType 'application/json' `
+                    -Headers @{ Authorization = "Bearer $MetricsToken" } -UseBasicParsing -ErrorAction Stop | Out-Null
+            }
+            finally { $ProgressPreference = $oldPref }
+            Write-Host "  $region`: OK"
+        }
+        catch {
+            $statusCode = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+            if ($statusCode -in @(400, 401, 403)) {
+                Write-Host "  $region`: OK (got expected $statusCode for probe)"
+            }
+            else {
+                Write-Host "  $region`: FAILED (status=$statusCode) - $_" -ForegroundColor Red
+                $allOk = $false
+            }
+        }
+    }
+    if (-not $allOk) {
+        throw 'One or more batch endpoints are unreachable. Aborting.'
+    }
+    Write-Host 'All batch endpoints validated successfully.'
+    Write-Host ''
+}
+
+# ── Batch metric processing ───────────────────────────────────────────────────
+
+## Fetches Azure Monitor metrics using the regional Batch API instead of per-resource
+## ARM calls. Resources are grouped by (subscription, region, kind), chunked by
+## BatchSize, and processed in parallel waves with GC between waves to bound memory.
+## Uses HttpClient with ResponseHeadersRead for streaming JSON parsing.
+function Get-BatchAvailabilityMetrics {
+    param(
+        [object[]]$Resources,
+        [DateTimeOffset]$StartDate,
+        [DateTimeOffset]$EndDate,
+        [int]$ThrottleLimit,
+        [int]$BatchSize,
+        [string]$MetricsToken
+    )
+
+    $startIso = $StartDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $endIso   = $EndDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+
+    # Group resources by (subscriptionId, location, kind)
+    $groups = @{}
+    foreach ($res in $Resources) {
+        $groupKey = "$($res.SubscriptionId)|$($res.Location.ToLowerInvariant())|$($res.Kind)"
+        if (-not $groups.ContainsKey($groupKey)) {
+            $groups[$groupKey] = [System.Collections.Generic.List[object]]::new()
+        }
+        $groups[$groupKey].Add($res)
+    }
+
+    # Build batch work items: split each group into chunks of BatchSize
+    $batchWorkItems = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in $groups.GetEnumerator()) {
+        $parts = $entry.Key -split '\|'
+        $subId    = $parts[0]
+        $location = $parts[1]
+        $kind     = $parts[2]
+
+        $config = $KindConfig[$kind]
+        if (-not $config) {
+            Write-Warning "No batch config for kind '$kind', skipping."
+            continue
+        }
+
+        $chunk = [System.Collections.Generic.List[object]]::new()
+        foreach ($res in $entry.Value) {
+            $chunk.Add($res)
+            if ($chunk.Count -ge $BatchSize) {
+                $batchWorkItems.Add([PSCustomObject]@{
+                    SubscriptionId = $subId
+                    Location       = $location
+                    Kind           = $kind
+                    Config         = $config
+                    Resources      = @($chunk)
+                })
+                $chunk = [System.Collections.Generic.List[object]]::new()
+            }
+        }
+        if ($chunk.Count -gt 0) {
+            $batchWorkItems.Add([PSCustomObject]@{
+                SubscriptionId = $subId
+                Location       = $location
+                Kind           = $kind
+                Config         = $config
+                Resources      = @($chunk)
+            })
+        }
+    }
+
+    $totalResources = $Resources.Count
+    $totalBatches   = $batchWorkItems.Count
+    $uniqueRegions  = @($groups.Keys | ForEach-Object { ($_ -split '\|')[1] } | Select-Object -Unique | Sort-Object)
+    Write-Host "Grouped $totalResources resource(s) into $totalBatches batch(es) across $($uniqueRegions.Count) region(s) (max $BatchSize per batch)."
+    $sortedEntries = @($groups.GetEnumerator() | Sort-Object { ($_.Key -split '\|')[1] }, { ($_.Key -split '\|')[2] }, { ($_.Key -split '\|')[0] })
+    foreach ($entry in $sortedEntries) {
+        $parts = $entry.Key -split '\|'
+        $subName  = $entry.Value[0].SubscriptionName
+        $kind     = Get-ShortKind $parts[2]
+        $location = $parts[1]
+        $count    = $entry.Value.Count
+        $chunks   = [math]::Ceiling($count / $BatchSize)
+        Write-Host "  $location / $kind / $(Get-TruncatedString $subName 30) : $count resource(s) -> $chunks batch(es)"
+    }
+    Write-Host ''
+
+    $resultByRes = @{}
+    $batchesDone = 0
+
+    $batchHttpClient = [System.Net.Http.HttpClient]::new()
+    $batchHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $MetricsToken")
+    $batchHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
+
+    $waveSize = $ThrottleLimit
+    for ($waveStart = 0; $waveStart -lt $batchWorkItems.Count; $waveStart += $waveSize) {
+        $waveEnd   = [math]::Min($waveStart + $waveSize, $batchWorkItems.Count)
+        $waveItems = @($batchWorkItems[$waveStart..($waveEnd - 1)])
+        $waveNum   = [math]::Floor($waveStart / $waveSize) + 1
+        $totalWaves = [math]::Ceiling($batchWorkItems.Count / $waveSize)
+
+        $waveProgress = [hashtable]::Synchronized(@{ Done = 0; Total = $waveItems.Count; Base = $batchesDone; Grand = $totalBatches; Waves = $totalWaves; Wave = $waveNum })
+        [Console]::Write("`r  Fetching batch metrics: wave $waveNum/$totalWaves, batch $batchesDone/$totalBatches done")
+
+        $waveResults = @($waveItems | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        $workItem     = $_
+        $client       = $using:batchHttpClient
+        $startIso     = $using:startIso
+        $endIso       = $using:endIso
+        $wp           = $using:waveProgress
+
+        $subId    = $workItem.SubscriptionId
+        $location = $workItem.Location
+        $kind     = $workItem.Kind
+        $config   = $workItem.Config
+        $resources = $workItem.Resources
+
+        $isVm      = $kind -eq 'VirtualMachine'
+        $isStorage = $kind -eq 'StorageAccount'
+
+        $resourceIds = @($resources | ForEach-Object { $_.ResourceId })
+
+        $endpoint = "https://$location.metrics.monitor.azure.com"
+
+        $uri = "$endpoint/subscriptions/$subId/metrics:getBatch" +
+               "?starttime=$([uri]::EscapeDataString($startIso))" +
+               "&endtime=$([uri]::EscapeDataString($endIso))" +
+               "&interval=PT1M" +
+               "&metricnamespace=$([uri]::EscapeDataString($config.Namespace))" +
+               "&metricnames=$([uri]::EscapeDataString($config.MetricNames))" +
+               "&aggregation=$([uri]::EscapeDataString($config.Aggregation))" +
+               "&api-version=2023-10-01"
+
+        $bodyObj = @{ resourceids = $resourceIds }
+        $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 3
+
+        $doc = $null
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            $httpReq = [System.Net.Http.HttpRequestMessage]::new(
+                [System.Net.Http.HttpMethod]::Post, $uri)
+            $httpReq.Content = [System.Net.Http.StringContent]::new(
+                $bodyJson, [System.Text.Encoding]::UTF8, 'application/json')
+            try {
+                $httpResp = $client.SendAsync($httpReq,
+                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                ).GetAwaiter().GetResult()
+                $sc = [int]$httpResp.StatusCode
+                if ($sc -ge 200 -and $sc -lt 300) {
+                    $respStream = $httpResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                    try { $doc = [System.Text.Json.JsonDocument]::ParseAsync($respStream).GetAwaiter().GetResult() }
+                    finally { $respStream.Dispose() }
+                    $httpResp.Dispose(); $httpReq.Dispose()
+                    break
+                }
+                $httpResp.Dispose(); $httpReq.Dispose()
+                if (($sc -in @(401, 429) -or $sc -ge 500) -and $attempt -lt 5) {
+                    Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
+                    continue
+                }
+                $names = ($resources | ForEach-Object { $_.Name }) -join ', '
+                Write-Warning "Batch metric query failed for [$names]: HTTP $sc"
+                break
+            }
+            catch {
+                try { $httpReq.Dispose() } catch {}
+                $retryable = $_.ToString() -match 'transport|connection.*closed|reset by peer|timed?\s*out'
+                if ($retryable -and $attempt -lt 5) {
+                    Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
+                    continue
+                }
+                $names = ($resources | ForEach-Object { $_.Name }) -join ', '
+                Write-Warning "Batch metric query failed for [$names]: $_"
+                break
+            }
+        }
+        $bodyJson = $null
+
+        if (-not $doc) {
+            foreach ($resource in $resources) {
+                [PSCustomObject]@{
+                    ResourceId              = $resource.ResourceId
+                    ResourceIdLower         = $resource.ResourceId.ToLowerInvariant()
+                    Name                    = $resource.Name
+                    AvailableSum            = 0.0
+                    GapMinutes              = 0
+                    ZeroTxMin               = 0
+                    ExcludeFromAvailability = $true
+                    GapTicks                = @()
+                    ZeroAvailTicks          = @()
+                    DegradedMinutes         = 0
+                    DegradedTicks           = @()
+                    DegradedValues          = @()
+                    SuspectMinutes          = 0
+                }
+            }
+        $wp.Done++
+        [Console]::Write("`r  Fetching batch metrics: wave $($wp.Wave)/$($wp.Waves), batch $($wp.Base + $wp.Done)/$($wp.Grand) done")
+            return
+        }
+
+        $jNum = [System.Text.Json.JsonValueKind]::Number
+
+        function script:GetNum([System.Text.Json.JsonElement]$dp, [string]$prop) {
+            foreach ($p in $dp.EnumerateObject()) {
+                if ($p.Name -eq $prop -and $p.Value.ValueKind -eq $jNum) { return $p.Value.GetDouble() }
+            }
+            return $null
+        }
+
+        $resById = @{}
+        foreach ($r in $resources) { $resById[$r.ResourceId.ToLowerInvariant()] = $r }
+
+        try {
+            $valuesArr = $doc.RootElement.GetProperty('values')
+            foreach ($resourceEntry in $valuesArr.EnumerateArray()) {
+                $resId = $resourceEntry.GetProperty('resourceid').GetString()
+                $resIdLower = $resId.ToLowerInvariant()
+                $resObj = if ($resById.ContainsKey($resIdLower)) { $resById[$resIdLower] } else { $null }
+                $resName = if ($resObj) { $resObj.Name } else { $resId }
+
+                $metricValueArr = $resourceEntry.GetProperty('value')
+
+                [double]$availSum = 0.0
+                [int]$zeroTxMin = 0
+                [int]$numericPoints = 0
+                $nullTicks     = [System.Collections.Generic.List[long]]::new()
+                $zeroTicks     = [System.Collections.Generic.List[long]]::new()
+                $degradedTicks = [System.Collections.Generic.List[long]]::new()
+                $degradedValues = [System.Collections.Generic.List[double]]::new()
+
+                if ($isStorage) {
+                    $txByTicks = [System.Collections.Generic.Dictionary[long,double]]::new()
+                    foreach ($metricEl in $metricValueArr.EnumerateArray()) {
+                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
+                        if ($mName -ne 'Transactions') { continue }
+                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
+                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
+                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
+                                $tot = GetNum $dp 'total'
+                                if ($null -ne $tot) { $txByTicks[$time.Ticks] = $tot }
+                            }
+                        }
+                    }
+                    foreach ($metricEl in $metricValueArr.EnumerateArray()) {
+                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
+                        if ($mName -ne 'Availability') { continue }
+                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
+                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
+                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
+                                $ticks = $time.Ticks
+                                $txVal = [double]0
+                                $hasTx = $txByTicks.TryGetValue($ticks, [ref]$txVal) -and $txVal -gt 0
+                                $minVal = GetNum $dp 'minimum'
+
+                                if ($hasTx -and $null -ne $minVal) {
+                                    $norm = $minVal / 100.0
+                                    $numericPoints++
+                                    if ($norm -eq 0.0) {
+                                        $zeroTicks.Add($ticks)
+                                    } else {
+                                        $availSum += $norm
+                                        if ($norm -lt 1.0) {
+                                            $degradedTicks.Add($ticks)
+                                            $degradedValues.Add($norm)
+                                        }
+                                    }
+                                } elseif ($hasTx -and $null -eq $minVal) {
+                                    $nullTicks.Add($ticks)
+                                } elseif (-not $hasTx) {
+                                    $zeroTxMin++
+                                }
+                            }
+                        }
+                    }
+                    $txByTicks = $null
+                } else {
+                    foreach ($metricEl in $metricValueArr.EnumerateArray()) {
+                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
+                        $isPrimary = $mName -eq 'VmAvailabilityMetric' -or $mName -eq 'Availability'
+                        if (-not $isPrimary) { continue }
+
+                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
+                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
+                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
+                                $ticks = $time.Ticks
+                                $minVal = GetNum $dp 'minimum'
+
+                                if ($null -ne $minVal) {
+                                    $numericPoints++
+                                    $v = if ($isVm) { $minVal } else { $minVal / 100.0 }
+                                    if ($v -eq 0.0) {
+                                        $zeroTicks.Add($ticks)
+                                    } else {
+                                        $availSum += $v
+                                        if ($v -lt 1.0) {
+                                            $degradedTicks.Add($ticks)
+                                            $degradedValues.Add($v)
+                                        }
+                                    }
+                                } else {
+                                    $nullTicks.Add($ticks)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                $gapMinutes = $nullTicks.Count + $zeroTicks.Count
+                $degradedMinutes = $degradedTicks.Count
+                $excludeFromAvailability = $numericPoints -eq 0 -and $nullTicks.Count -eq 0 -and
+                    $zeroTicks.Count -eq 0 -and $degradedMinutes -eq 0
+
+                [PSCustomObject]@{
+                    ResourceId              = $resId
+                    ResourceIdLower         = $resIdLower
+                    Name                    = $resName
+                    AvailableSum            = $availSum
+                    GapMinutes              = $gapMinutes
+                    ZeroTxMin               = $zeroTxMin
+                    ExcludeFromAvailability = $excludeFromAvailability
+                    GapTicks                = @($nullTicks)
+                    ZeroAvailTicks          = @($zeroTicks)
+                    DegradedMinutes         = $degradedMinutes
+                    DegradedTicks           = @($degradedTicks)
+                    DegradedValues          = @($degradedValues)
+                    SuspectMinutes          = $gapMinutes + $degradedMinutes
+                }
+            }
+        }
+        finally {
+            if ($doc) { $doc.Dispose() }
+        }
+
+        $wp.Done++
+        [Console]::Write("`r  Fetching batch metrics: wave $($wp.Wave)/$($wp.Waves), batch $($wp.Base + $wp.Done)/$($wp.Grand) done")
+    })
+
+        # Collect this wave's results into the main hashtable
+        [Console]::Write("`r" + (' ' * 60) + "`r")
+        foreach ($item in $waveResults) {
+            $key = if ($item.ResourceIdLower) { $item.ResourceIdLower } else { $item.ResourceId.ToLowerInvariant() }
+            $resultByRes[$key] = $item
+        }
+        $batchesDone += $waveItems.Count
+        $waveResults = $null
+
+        if ($waveStart + $waveSize -lt $batchWorkItems.Count) {
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+        }
+    }
+
+    $batchHttpClient.Dispose()
+
+    [Console]::Write("`r" + (' ' * 80) + "`r")
+    Write-Host "Batch queries completed. Received results for $($resultByRes.Count) / $totalResources resource(s)."
+
+    $resultByRes
+}
+
+# ── Per-resource metrics (parallel) ───────────────────────────────────────────
+
+## Fetches Azure Monitor metrics one resource at a time via the ARM Metrics API.
+## Uses ForEach-Object -Parallel for concurrent calls with System.Text.Json for
+## low-allocation parsing. Each resource gets its own HTTP call with retry on 429/5xx.
 function Get-AvailabilityMetrics {
     param(
         [object[]]$Resources,
@@ -430,6 +876,16 @@ function Get-AvailabilityMetrics {
 
 # ── Suspect gap investigation (parallel) ──────────────────────────────────────
 
+## For each resource with suspect minutes, queries Activity Log (for supported
+## lifecycle operations) and Resource Health (for the overlap with the 30-day
+## retention window) to classify every suspect minute.
+## Classification precedence:
+##   1. Platform fault (Resource Health)       → stays eligible, counts as downtime
+##   2. Lifecycle activity (Activity Log)       → excluded from eligibility
+##   3. Unknown / customer-initiated (Health)  → excluded from eligibility
+##   4. Remaining null                          → metric issue, excluded
+##   5. Remaining 0%                            → trusted as downtime
+##   6. Remaining degraded (0% < v < 100%)     → trusted as degraded availability
 function Invoke-SuspectGapInvestigation {
     param(
         [object[]]$Candidates,
@@ -455,6 +911,7 @@ function Invoke-SuspectGapInvestigation {
         $hcStart   = $using:HealthCoverageStart
 
         # ── Local helpers ─────────────────────────────────────────────
+        ## ARM GET with retry on 429/5xx and exponential backoff.
         function script:ArmGet([string]$uri) {
             for ($a = 0; $a -lt 6; $a++) {
                 try {
@@ -473,10 +930,12 @@ function Invoke-SuspectGapInvestigation {
             }
         }
 
+        ## Truncates a DateTimeOffset to the minute boundary (seconds = 0).
         function script:TruncMin([DateTimeOffset]$v) {
             [DateTimeOffset]::new($v.Year, $v.Month, $v.Day, $v.Hour, $v.Minute, 0, [TimeSpan]::Zero)
         }
 
+        ## Returns $true if a tick value falls inside any of the given intervals.
         function script:InInterval([long]$tick, [object[]]$intervals) {
             foreach ($iv in $intervals) {
                 if ($tick -ge $iv.FromTicks -and $tick -lt $iv.ToTicks) { return $true }
@@ -484,6 +943,7 @@ function Invoke-SuspectGapInvestigation {
             $false
         }
 
+        ## Safely reads a string property from a JsonElement, returning '' if absent.
         function script:GetJsonStr([System.Text.Json.JsonElement]$el, [string]$name) {
             $v = [System.Text.Json.JsonElement]::new()
             if ($el.TryGetProperty($name, [ref]$v) -and
@@ -493,6 +953,7 @@ function Invoke-SuspectGapInvestigation {
             ''
         }
 
+        ## Parses a timestamp string from Azure APIs (multiple formats) into a UTC DateTime.
         function script:ParseTimestamp([string]$s) {
             if ([string]::IsNullOrWhiteSpace($s)) { return $null }
             $dto = [DateTimeOffset]::MinValue
@@ -506,6 +967,8 @@ function Invoke-SuspectGapInvestigation {
         }
 
         # ── Activity Log ──────────────────────────────────────────────
+        # Query Activity Log for supported lifecycle operations (VM: start/deallocate/
+        # powerOff/restart; SQL: pause/resume) and build intervals that explain metric gaps.
         $activityIntervals = @()
         $supportsActivity = $c.Kind -eq 'VirtualMachine' -or $c.Kind -eq 'AzureSqlDatabase'
 
@@ -645,6 +1108,8 @@ function Invoke-SuspectGapInvestigation {
         }
 
         # ── Resource Health ───────────────────────────────────────────
+        # Query the Resource Health REST API for the portion of the window
+        # covered by the current 30-day retention window.
         $healthHistoryApplied = [DateTimeOffset]$hcStart -lt [DateTimeOffset]$pEnd
         $faultIntervals    = @()
         $unknownIntervals  = @()
@@ -786,6 +1251,7 @@ function Invoke-SuspectGapInvestigation {
         }
 
         # ── Classify each suspect tick ────────────────────────────────
+        # Precedence: platform fault > activity log > health unknown/customer > 0% downtime > metric issue
         $zeroSet = [System.Collections.Generic.HashSet[long]]::new()
         foreach ($zt in @($c.ZeroTicksArray)) { [void]$zeroSet.Add([long]$zt) }
 
@@ -866,6 +1332,7 @@ function Invoke-SuspectGapInvestigation {
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
+## Prints a fixed-width table with one row per resource showing availability metrics.
 function Write-ResultsTable([object[]]$Sorted) {
     $fmt = '{0,-24} {1,-30} {2,-7} {3,-12} {4,7} {5,6} {6,7} {7,10} {8,10} {9,8} {10,10}'
     Write-Host ''
@@ -890,6 +1357,8 @@ function Write-ResultsTable([object[]]$Sorted) {
     Write-Host ''
 }
 
+## Prints per-subscription summaries grouped by Kind + Location, plus a cross-
+## subscription overall summary when multiple subscriptions are present.
 function Write-SubscriptionSummaries([object[]]$Sorted) {
     $eligible = @($Sorted | Where-Object { $_.AvailabilityPct -ne 'N/A' })
 
@@ -916,9 +1385,9 @@ function Write-SubscriptionSummaries([object[]]$Sorted) {
     # Cross-subscription summary
     $subs = @($eligible | ForEach-Object { $_.SubscriptionName } | Select-Object -Unique)
     if ($subs.Count -gt 1 -and $eligible.Count -gt 0) {
-        Write-Host ([char]0x2550 * 62)
+        Write-Host ([string]::new([char]0x2550, 62))
         Write-Host '               OVERALL (all subscriptions)'
-        Write-Host ([char]0x2550 * 62)
+        Write-Host ([string]::new([char]0x2550, 62))
         foreach ($g in ($eligible | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
             $items = @($g.Group)
             $n = $items.Count
@@ -949,12 +1418,9 @@ $utcEnd       = $window.End
 $totalMinutes = $window.TotalMinutes
 
 $healthCoverageStart = Get-HealthCoverageStart $utcStart
-$healthCoveredMinutes = if ($healthCoverageStart -lt $utcEnd) {
-    [int]($utcEnd - $healthCoverageStart).TotalMinutes
-} else { 0 }
+$healthCoveredMinutes = $healthCoverageStart -lt $utcEnd ? [int]($utcEnd - $healthCoverageStart).TotalMinutes : 0
 
-$periodLabel = if ($window.IsMonthToDate) { "month $($window.NormalizedMonth) (month-to-date)" }
-               else { "month $($window.NormalizedMonth)" }
+$periodLabel = $window.IsMonthToDate ? "month $($window.NormalizedMonth) (month-to-date)" : "month $($window.NormalizedMonth)"
 Write-Host "Period: $periodLabel ($($utcStart.ToString('u')) -> $($utcEnd.ToString('u')), $totalMinutes min)"
 
 if ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
@@ -964,6 +1430,9 @@ if ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
 }
 
 # Step 2: Authenticate and resolve subscriptions
+# -BatchSize explicitly set implies -Batch
+if ($PSBoundParameters.ContainsKey('BatchSize') -and -not $Batch) { $Batch = [switch]::new($true) }
+
 Write-Host -NoNewline 'Authenticating... '
 $allAzSubs = @(Get-AzSubscription)
 $resolvedSubs = @(foreach ($name in $Subscriptions) {
@@ -974,19 +1443,33 @@ $resolvedSubs = @(foreach ($name in $Subscriptions) {
 })
 $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
+
+$rawToken = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com').Token
+$armToken = ($rawToken -is [securestring]) ? ($rawToken | ConvertFrom-SecureString -AsPlainText) : [string]$rawToken
+$rawToken = $null
+
+if ($Batch) {
+    $rawMetrics = (Get-AzAccessToken -ResourceUrl 'https://metrics.monitor.azure.com').Token
+    $metricsToken = ($rawMetrics -is [securestring]) ? ($rawMetrics | ConvertFrom-SecureString -AsPlainText) : [string]$rawMetrics
+    $rawMetrics = $null
+}
+
 Write-Host 'OK'
 Write-Host "Processing $($resolvedSubs.Count) subscription(s): $($resolvedSubs.Name -join ', ')"
 Write-Host "Kinds: $($Kinds -join ', ')"
+if ($Batch) { Write-Host "Mode: Batch (batch-size=$BatchSize)" }
 
 # Step 3: Query Resource Graph inventory
 Write-Host -NoNewline 'Querying resource inventory... '
 $resources = Get-ResourceInventory -SubscriptionIds $subIds -SubIdToName $subIdToName `
     -Kinds $Kinds -ResourceNameFilter $Resource
-Write-Host "Found $($resources.Count) resource(s) across $($resolvedSubs.Count) subscription(s)."
+
+$regionCount = @($resources | ForEach-Object { $_.Location } | Select-Object -Unique).Count
+Write-Host "Found $($resources.Count) resource(s) across $($resolvedSubs.Count) subscription(s), $regionCount region(s)."
 
 if ($resources.Count -eq 0) { Write-Host 'No resources found.'; return }
 
-# Step 4: Build initial eligibility (all minutes eligible)
+# Step 4: Build initial eligibility records (all minutes start as eligible)
 $eligByRes = @{}
 foreach ($res in $resources) {
     $eligByRes[$res.ResourceId.ToLowerInvariant()] = [PSCustomObject]@{
@@ -1006,15 +1489,19 @@ foreach ($res in $resources) {
     }
 }
 
-# Step 5: Fetch Azure Monitor metrics per resource in parallel
-$rawToken = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com').Token
-$armToken = ($rawToken -is [securestring]) ? ($rawToken | ConvertFrom-SecureString -AsPlainText) : [string]$rawToken
-$rawToken = $null
+# Step 5: Fetch Azure Monitor metrics
+if ($Batch) {
+    $uniqueRegions = @($resources | ForEach-Object { $_.Location.ToLowerInvariant() } | Select-Object -Unique | Sort-Object)
+    Test-BatchEndpoints -MetricsToken $metricsToken -Regions $uniqueRegions
+    $metricResults = Get-BatchAvailabilityMetrics -Resources $resources -StartDate $utcStart `
+        -EndDate $utcEnd -ThrottleLimit $Parallelism -BatchSize $BatchSize -MetricsToken $metricsToken
+    $metricsToken = $null
+} else {
+    $metricResults = Get-AvailabilityMetrics -Resources $resources -StartDate $utcStart `
+        -EndDate $utcEnd -ThrottleLimit $Parallelism -ArmToken $armToken
+}
 
-$metricResults = Get-AvailabilityMetrics -Resources $resources -StartDate $utcStart `
-    -EndDate $utcEnd -ThrottleLimit $Parallelism -ArmToken $armToken
-
-# Step 6: Build suspect candidates and investigate
+# Step 6: Build suspect candidates and investigate via Activity Log + Resource Health
 $suspectCandidates = [System.Collections.Generic.List[object]]::new()
 foreach ($res in $resources) {
     $key = $res.ResourceId.ToLowerInvariant()
@@ -1046,7 +1533,7 @@ if ($suspectCandidates.Count -gt 0) {
         -HealthCoverageStart $healthCoverageStart
 }
 
-# Step 7: Assemble final results
+# Step 7: Assemble final results — apply investigation outcomes and zero-tx exclusions
 foreach ($res in $resources) {
     $key  = $res.ResourceId.ToLowerInvariant()
     $elig = $eligByRes[$key]
@@ -1199,6 +1686,3 @@ Write-SubscriptionSummaries $sorted
 
 $sw.Stop()
 Write-Host "Completed in $($sw.Elapsed.ToString('hh\:mm\:ss\.ff'))"
-
-# Output objects for pipeline use
-$sorted
