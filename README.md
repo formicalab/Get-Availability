@@ -42,7 +42,9 @@ A single KQL query against the Resource Graph `resources` table returns all VMs,
 
 ### Step 2 — Fetch availability metrics
 
-Azure Monitor is queried per-resource in parallel (configurable via `--parallelism`, default auto-scales to CPU cores) with retry on 429/5xx errors. Granularity is PT1M (one data point per minute).
+By default, Azure Monitor is queried per-resource in parallel (configurable via `--parallelism`, default auto-scales to CPU cores) with retry on 429/5xx errors. Granularity is PT1M (one data point per minute).
+
+With `--batch` / `-Batch`, the tool uses the regional [Azure Monitor Metrics Batch API](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/migrate-to-batch-api) instead of individual per-resource calls. Resources are grouped by (subscription, region, kind) and sent in configurable chunks (`--batch-size` / `-BatchSize`, default 10, max 50). This reduces the total number of API calls and can significantly improve throughput for large inventories. The batch endpoint requires a separate token (`https://metrics.monitor.azure.com`) and the tool validates each regional endpoint before fetching. Wave-based processing with garbage collection between waves keeps memory usage bounded.
 
 | Resource type | Metrics requested | Native scale | Aggregation |
 |---|---|---|---|
@@ -191,6 +193,8 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 | `--resource` | `-r` | *(all)* | Filter to a single resource name |
 | `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
 | `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
+| `--batch` | `-b` | off | Use the regional Metrics Batch API instead of per-resource calls |
+| `--batch-size` | | `10` | Max resources per batch call (1–50); implies `--batch` |
 | `--version` | `-v` | | Print version and exit |
 
 ### PowerShell (`get-availability.ps1`)
@@ -203,6 +207,8 @@ Storage Account `Availability` is a transaction-success-rate metric — it is on
 | `-Resource` | *(all)* | Filter to a single resource name |
 | `-Parallelism` | *(auto)* | Max concurrent API calls (scales to CPU cores, 4–16) |
 | `-ActivityGraceMinutes` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
+| `-Batch` | off | Use the regional Metrics Batch API instead of per-resource calls |
+| `-BatchSize` | `10` | Max resources per batch call (1–50); implies `-Batch` |
 | `-Version` | | Print version and exit |
 
 Both versions enforce the same constraints: `-Month` / `--month` cannot point to a month whose first day is more than 90 days before the current UTC time.
@@ -258,6 +264,12 @@ dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/p
 # Override the Activity Log grace window
 ./GetAvailability --subscriptions Contoso-Development --month 202603 --resource myvm02 --activity-grace-minutes 15
 
+# Use batch API mode
+./GetAvailability --subscriptions Contoso-Production --month 202603 --batch
+
+# Use batch API with custom batch size
+./GetAvailability --subscriptions Contoso-Production Contoso-Development --month 202603 --batch-size 20
+
 # Or run directly without publishing
 cd csharp/GetAvailability
 dotnet run -- --subscriptions Contoso-Production --month 202603
@@ -280,6 +292,12 @@ dotnet run -- --subscriptions Contoso-Production --month 202603
 
 # Override the Activity Log grace window
 ./get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm02 -ActivityGraceMinutes 15
+
+# Use batch API mode
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -Batch
+
+# Use batch API with custom batch size
+./get-availability.ps1 -Subscriptions 'Contoso-Production','Contoso-Development' -Month 202603 -Batch -BatchSize 20
 
 # Pipe results to CSV
 ./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
@@ -349,6 +367,7 @@ Console output also reports per-resource classification details:
 - **Conservative on failure.** If a Resource Health API call fails for a period where Health History should exist, Activity Log matches still apply, but no remaining suspect minutes are excused through Health History.
 - **Transaction-aware storage.** Zero-transaction minutes are excluded from eligibility rather than counted as unavailable, giving an accurate picture of actual storage service availability.
 - **Whole-window no-signal exclusion.** If the metric API returns no usable datapoints across the full period, the resource is excluded from availability calculations and shown as `N/A`.
+- **Batch API mode.** `--batch` / `-Batch` uses the regional Azure Monitor Metrics Batch API, grouping resources by (subscription, region, kind) and sending them in configurable chunks. This reduces API call count and improves throughput for large inventories. Regional endpoints are validated before fetching. Wave-based processing with GC between waves bounds memory usage.
 - **`Parallel.ForEachAsync`** (C#) / **`ForEach-Object -Parallel`** (PowerShell) for concurrent metric and health queries with configurable parallelism.
 - **Ticks-based metric keying** (`long` instead of `DateTime`) — zero-allocation per data point in both versions.
 - **`System.Text.Json`** for efficient JSON parsing in both versions — avoids large PSObject trees in PowerShell and enables AOT-safe parsing in C#.

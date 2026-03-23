@@ -259,12 +259,17 @@ public static class ActivityLogService
     private static DateTimeOffset ExtendActivityInterval(int graceMinutes, DateTimeOffset currentEnd)
         => graceMinutes > 0 ? currentEnd.AddMinutes(graceMinutes) : currentEnd;
 
+    /// <summary>
+    /// Parses Azure timestamp strings which may use several formats depending on
+    /// region and API version. Falls back to DateTimeOffset.TryParse for formats
+    /// not in the explicit list.
+    /// </summary>
     private static DateTimeOffset? ParseAzureTimestamp(string? timestamp)
     {
         if (string.IsNullOrWhiteSpace(timestamp))
             return null;
 
-        string[] formats =
+        ReadOnlySpan<string> formats =
         [
             "MM/dd/yyyy HH:mm:ss",
             "M/d/yyyy H:mm:ss",
@@ -274,7 +279,7 @@ public static class ActivityLogService
             "yyyy-MM-ddTHH:mm:ss.fffffffZ",
         ];
 
-        foreach (string format in formats)
+        foreach (var format in formats)
         {
             if (DateTimeOffset.TryParseExact(
                 timestamp,
@@ -296,9 +301,11 @@ public static class ActivityLogService
             : null;
     }
 
+    /// <summary>Truncates to minute boundary for interval grouping.</summary>
     private static DateTimeOffset TruncateToMinute(DateTimeOffset value)
         => new(value.Year, value.Month, value.Day, value.Hour, value.Minute, 0, TimeSpan.Zero);
 
+    /// <summary>Reads a nested string property (e.g. operationName.value) from a JsonElement.</summary>
     private static string GetNestedPropString(JsonElement parent, string propertyName, string nestedName)
     {
         if (!parent.TryGetProperty(propertyName, out var obj) || obj.ValueKind != JsonValueKind.Object)
@@ -306,6 +313,7 @@ public static class ActivityLogService
         return GetPropString(obj, nestedName);
     }
 
+    /// <summary>Reads a string property from a JsonElement, returning empty if absent or null.</summary>
     private static string GetPropString(JsonElement props, string name)
         => props.TryGetProperty(name, out var el) ? el.GetString() ?? "" : "";
 }

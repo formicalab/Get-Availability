@@ -41,8 +41,10 @@ string[] subscriptionNames = [];
 string[] kinds = ["vm", "sql", "storage"];
 string? resourceName = null;
 string? monthParameter = null;
-int parallelism = Math.Max(4, Math.Min(16, Environment.ProcessorCount)); // auto-scale to CPU cores
+int parallelism = Math.Clamp(Environment.ProcessorCount, 4, 16);
 int activityGraceMinutes = 10;
+bool useBatch = false;
+int batchSize = 10;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -66,6 +68,14 @@ for (int i = 0; i < args.Length; i++)
         case "--activity-grace-minutes" or "-g":
             activityGraceMinutes = ParseIntOption(ReadRequiredValue(args, ref i, "--activity-grace-minutes"), "--activity-grace-minutes", minValue: 0);
             break;
+        case "--batch" or "-b":
+            useBatch = true;
+            break;
+        case "--batch-size":
+            batchSize = ParseIntOption(ReadRequiredValue(args, ref i, "--batch-size"), "--batch-size", minValue: 1);
+            if (batchSize > 50) throw new ArgumentException("--batch-size must be <= 50.");
+            useBatch = true;
+            break;
         case "--version" or "-v":
             Console.WriteLine($"GetAvailability {typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"}");
             return 0;
@@ -77,6 +87,8 @@ for (int i = 0; i < args.Length; i++)
             Console.WriteLine("  --resource, -r       Filter to a single resource name.");
             Console.WriteLine("  --parallelism, -p    Max concurrent metric calls (default: auto).");
             Console.WriteLine("  --activity-grace-minutes, -g  Post-operation grace window for supported Activity Log lifecycle events (default: 10).");
+            Console.WriteLine("  --batch, -b          Use the regional Metrics Batch API instead of per-resource calls.");
+            Console.WriteLine("  --batch-size         Max resources per batch call (default: 10, max: 50). Implies --batch.");
             Console.WriteLine("  --version, -v        Print version and exit.");
             return 0;
     }
@@ -96,7 +108,7 @@ if (string.IsNullOrWhiteSpace(monthParameter))
 
 try
 {
-    await RunAsync(subscriptionNames, kinds, resourceName, monthParameter, parallelism, activityGraceMinutes);
+    await RunAsync(subscriptionNames, kinds, resourceName, monthParameter, parallelism, activityGraceMinutes, useBatch, batchSize);
     return 0;
 }
 catch (Exception ex) when (ex is AuthenticationFailedException or CredentialUnavailableException)
@@ -118,7 +130,9 @@ static async Task RunAsync(
     string? resourceName,
     string monthParameter,
     int parallelism,
-    int activityGraceMinutes)
+    int activityGraceMinutes,
+    bool useBatch,
+    int batchSize)
 {
     var sw = Stopwatch.StartNew();
 
@@ -179,8 +193,17 @@ static async Task RunAsync(
         };
     }
 
-    // Step 4: Fetch Azure Monitor metrics per resource in parallel
-    var metricResults = await MetricsService.QueryAsync(metricsClient, resources, utcStart, utcEnd, parallelism);
+    // Step 4: Fetch Azure Monitor metrics (batch or per-resource)
+    ConcurrentDictionary<string, MetricScalars> metricResults;
+    if (useBatch)
+    {
+        Console.WriteLine($"Using Batch API (batch size: {batchSize}).");
+        metricResults = await BatchMetricsService.QueryAsync(credential, resources, utcStart, utcEnd, parallelism, batchSize);
+    }
+    else
+    {
+        metricResults = await MetricsService.QueryAsync(metricsClient, resources, utcStart, utcEnd, parallelism);
+    }
 
     // Step 5: For resources with suspect metric minutes, investigate null/0% suspect minutes and
     // positive degraded datapoints. Activity Log is checked first for supported lifecycle actions,
@@ -315,18 +338,16 @@ static async Task RunAsync(
                 }
             }
 
-            int confirmedHealthDowntimeMinutes = suspectResults is not null && suspectResults.TryGetValue(key, out var healthClassification)
-                ? healthClassification.PlatformFaultGapMinutes + healthClassification.HealthConfirmedDegradedMinutes
-                : 0;
+            int confirmedHealthDowntimeMinutes = 0;
+            int unexplainedPositiveDegradedMinutes = mr.DegradedMinutes;
+            int unexplainedSuspectMinutes = mr.SuspectMinutes;
 
-            int unexplainedPositiveDegradedMinutes = suspectResults is not null && suspectResults.TryGetValue(key, out var unresolvedClassification)
-                ? Math.Max(0, mr.DegradedMinutes - unresolvedClassification.CustomerExcusedDegradedMinutes - unresolvedClassification.HealthConfirmedDegradedMinutes)
-                : mr.DegradedMinutes;
-
-            int unexplainedSuspectMinutes = suspectResults is not null && suspectResults.TryGetValue(key, out var unexplainedClassification)
-                ? unexplainedClassification.UnresolvedZeroDowntimeMinutes
-                    + unexplainedPositiveDegradedMinutes
-                : mr.SuspectMinutes;
+            if (suspectResults is not null && suspectResults.TryGetValue(key, out var cls))
+            {
+                confirmedHealthDowntimeMinutes = cls.PlatformFaultGapMinutes + cls.HealthConfirmedDegradedMinutes;
+                unexplainedPositiveDegradedMinutes = Math.Max(0, mr.DegradedMinutes - cls.CustomerExcusedDegradedMinutes - cls.HealthConfirmedDegradedMinutes);
+                unexplainedSuspectMinutes = cls.UnresolvedZeroDowntimeMinutes + unexplainedPositiveDegradedMinutes;
+            }
 
             // For Storage Accounts, zero-transaction minutes have no availability signal and are
             // excluded from eligibility. They count as suspect (no data) and excused (nothing to measure).
@@ -360,8 +381,8 @@ static async Task RunAsync(
                     $"  [{res.Name}] eligible min = {totalMinutes} - {string.Join(" - ", eligibilityAdjustments)} = {elig.EligibleMinutes}");
             }
 
-            double customerExcusedAvail = suspectResults is not null && suspectResults.TryGetValue(key, out var availClass)
-                ? availClass.CustomerExcusedDegradedAvailableSum
+            double customerExcusedAvail = suspectResults is not null && suspectResults.TryGetValue(key, out var ac)
+                ? ac.CustomerExcusedDegradedAvailableSum
                 : 0;
             elig.AvailableMinutes = Math.Round(Math.Max(0, mr.AvailableSum - customerExcusedAvail), 2);
         }
@@ -452,7 +473,16 @@ static string[] ReadRequiredValues(string[] args, ref int index, string optionNa
 {
     var values = new List<string>();
     while (index + 1 < args.Length && !args[index + 1].StartsWith("-", StringComparison.Ordinal))
-        values.Add(args[++index]);
+    {
+        // Support comma-separated values: "A, B, C" or "A,B,C" or mixed
+        var raw = args[++index];
+        foreach (var part in raw.Split(','))
+        {
+            var trimmed = part.Trim();
+            if (trimmed.Length > 0)
+                values.Add(trimmed);
+        }
+    }
 
     return values.Count > 0
         ? values.ToArray()
