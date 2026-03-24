@@ -5,14 +5,6 @@
 
 Reports month-scoped availability for Azure Virtual Machines, Azure SQL Databases, and Azure Storage Accounts across one or more Azure subscriptions.
 
-The observation window is selected with `--month YYYYMM` in UTC:
-
-- past months use the full calendar month
-- the current month is reported month-to-date
-- the requested month cannot start more than 90 days before now
-
-Metrics and Activity Log can support that 90-day lookback. Health History is still only applied to the overlap with its current [retention window](https://learn.microsoft.com/en-us/azure/service-health/resource-health-overview) (about 30 days).
-
 Two equivalent implementations are provided:
 
 | Version | Path | Runtime | Notes |
@@ -28,138 +20,233 @@ For each resource, the tool answers:
 - Of those, how many were **confirmed as platform faults** by Resource Health?
 - How many were **excused** as normal operations (lifecycle activity, customer-initiated, metric issues)?
 - How many remain **unresolved** after all classification attempts?
-- How many minutes was it **available** (confirmed by Azure Monitor)?
-- How many minutes was it **eligible** (expected to be available)?
 - What is the **availability percentage** (Available ÷ Eligible × 100)?
 
 The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
+## Usage
+
+### Prerequisites
+
+**C# version:**
+
+| Requirement | Detail |
+|---|---|
+| .NET SDK | 10.0 or later (build from source only) |
+| Azure auth | `az login` or any method supported by `DefaultAzureCredential` |
+
+The published binary (`GetAvailability.exe`) requires no .NET runtime — it is a Native AOT self-contained executable.
+
+**PowerShell version:**
+
+| Requirement | Detail |
+|---|---|
+| PowerShell | 7.0 or later (`pwsh`) |
+| Az.Accounts | `Install-Module Az.Accounts` |
+| Az.ResourceGraph | `Install-Module Az.ResourceGraph` |
+| Azure auth | `Connect-AzAccount` (used by both Az modules and for ARM token acquisition) |
+
+If Azure authentication fails, the tool prints the SDK/module exception message directly. For Azure CLI-based auth (C#), re-run `az login`; for PowerShell, re-run `Connect-AzAccount`.
+
+### Parameters
+
+**C# (`GetAvailability.exe`):**
+
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--subscriptions` | `-s` | *(required)* | One or more Azure subscription display names |
+| `--month` | `-m` | *(required)* | Observation month in UTC, format `YYYYMM` |
+| `--kinds` | `-k` | `vm sql storage` | Resource kinds to process |
+| `--resource` | `-r` | *(all)* | Filter to a single resource name |
+| `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
+| `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for Activity Log lifecycle events |
+| `--batch` | `-b` | off | Use the regional Metrics Batch API instead of per-resource calls |
+| `--batch-size` | | `10` | Max resources per batch call (1–50); implies `--batch` |
+| `--version` | `-v` | | Print version and exit |
+
+**PowerShell (`get-availability.ps1`):**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-Subscriptions` | *(required)* | One or more Azure subscription display names |
+| `-Month` | *(required)* | Observation month in UTC, format `YYYYMM` |
+| `-Kinds` | `vm,sql,storage` | Resource kinds to process |
+| `-Resource` | *(all)* | Filter to a single resource name |
+| `-Parallelism` | *(auto)* | Max concurrent API calls (scales to CPU cores, 4–16) |
+| `-ActivityGraceMinutes` | `10` | Post-operation grace window for Activity Log lifecycle events |
+| `-Batch` | off | Use the regional Metrics Batch API instead of per-resource calls |
+| `-BatchSize` | `10` | Max resources per batch call (1–50); implies `-Batch` |
+| `-Version` | | Print version and exit |
+
+The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the current ~30-day retention window.
+
+### Examples
+
+**C#:**
+
+```bash
+# Build the Native AOT binary (one-time)
+cd csharp/GetAvailability
+dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/publish/
+
+# Single subscription
+./GetAvailability --subscriptions Contoso-Production --month 202603
+
+# Multiple subscriptions, filtered by kind
+./GetAvailability --subscriptions Contoso-Development Contoso-Production --month 202603 --kinds vm sql
+
+# Single resource (SQL database by server/database name)
+./GetAvailability --subscriptions Contoso-Development --month 202603 --resource sqlserver01/sqldb01
+
+# Batch API with custom batch size
+./GetAvailability --subscriptions Contoso-Production Contoso-Development --month 202603 --batch-size 20
+
+# Run directly without publishing
+cd csharp/GetAvailability
+dotnet run -- --subscriptions Contoso-Production --month 202603
+```
+
+**PowerShell:**
+
+```powershell
+# Single subscription
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603
+
+# Multiple subscriptions, filtered by kind
+./get-availability.ps1 -Subscriptions 'Contoso-Development','Contoso-Production' -Month 202603 -Kinds vm,sql
+
+# Single resource with custom grace window
+./get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm02 -ActivityGraceMinutes 15
+
+# Batch API with custom batch size
+./get-availability.ps1 -Subscriptions 'Contoso-Production','Contoso-Development' -Month 202603 -BatchSize 20
+
+# Pipe results to CSV
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
+```
+
+### Output
+
+The header line shows the observation window and total minutes:
+
+```
+Period: month 202602 (2026-02-01 00:00:00Z -> 2026-03-01 00:00:00Z, 40320 min)
+```
+
+If the observation window extends beyond the Resource Health retention window, an explicit warning is printed:
+
+```
+WARNING: Resource Health history covers only part of this period (2026-02-16 18:54:00Z -> 2026-03-01 00:00:00Z, 17586 of 40320 min). Earlier minutes will use Activity Log and metric fallback rules.
+```
+
+Table view (Kind is abbreviated: VM, SQL, Storage):
+
+| Subscription | Name | Kind | Location | Suspect | Faults | Excused | Unresolved | AvailMin | EligMin | Avail% |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Production | `sqlserver02/sqldb02` | SQL | westeurope | | | | | 40320 | 40320 | 100.00000 |
+| Development | `devvm01a` | VM | northeurope | 23 | | 23 | | 14369 | 14369 | 100.00000 |
+| Production | `storageaccount01` | Storage | westeurope | 14 | | 4 | 10 | 40306 | 40316 | 99.97520 |
+
+Columns with value 0 are shown as blank. Resources with zero eligible minutes show `N/A`. A per-subscription summary is printed at the end, grouping resources by Kind + Location with aggregate availability. When multiple subscriptions are processed, a cross-subscription overall summary follows.
+
+Per-resource classification narration is also printed on the console:
+
+```
+  [sqlserver01/sqldb01] metric scan found 23 suspect min across 22 suspect gaps (null or <100% availability values)
+  [sqlserver01/sqldb01] checked against Activity Log: 23 suspect min explained by admin lifecycle events
+  [sqlserver01/sqldb01] eligible min = 40320 - 23 gap min excluded by Activity Log = 40297
+```
+
+The PowerShell version also emits result objects to the pipeline, so output can be piped to `Export-Csv`, `ConvertTo-Json`, or further filtered.
+
 ## How it works
 
-### Step 1 — Resource inventory
+### Resource inventory
 
-A single KQL query against the Resource Graph `resources` table returns all VMs, SQL databases (excluding system `master` DBs), and Storage Accounts. Server-side KQL filters are applied when `--kinds` or `--resource` are provided, minimising data transfer.
+A KQL query against the Resource Graph `resources` table returns all matching VMs, SQL databases (excluding system `master` DBs), and Storage Accounts. Server-side filters are applied when `--kinds` or `--resource` are provided.
 
-### Step 2 — Fetch availability metrics
+### Metric collection
 
-By default, Azure Monitor is queried per-resource in parallel (configurable via `--parallelism`, default auto-scales to CPU cores) with retry on 429/5xx errors. Granularity is PT1M (one data point per minute).
+Azure Monitor is queried at PT1M granularity (one data point per minute) with retry on 429/5xx errors. Two modes are available:
 
-With `--batch` / `-Batch`, the tool uses the regional [Azure Monitor Metrics Batch API](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/migrate-to-batch-api) instead of individual per-resource calls. Resources are grouped by (subscription, region, kind) and sent in configurable chunks (`--batch-size` / `-BatchSize`, default 10, max 50). This reduces the total number of API calls and can significantly improve throughput for large inventories. The batch endpoint requires a separate token (`https://metrics.monitor.azure.com`) and the tool validates each regional endpoint before fetching. Wave-based processing with garbage collection between waves keeps memory usage bounded.
+- **Per-resource** (default): parallel ARM Metrics API calls, one per resource, with configurable parallelism.
+- **Batch** (`--batch`): the regional [Azure Monitor Metrics Batch API](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/migrate-to-batch-api). Resources are grouped by (subscription, region, kind) and sent in configurable chunks (`--batch-size`, default 10, max 50). The batch endpoint uses a separate token scope (`https://metrics.monitor.azure.com`) and each regional endpoint is validated before fetching. Wave-based processing with GC between waves bounds memory usage.
 
-| Resource type | Metrics requested | Native scale | Aggregation |
+| Resource type | Metrics | Native scale | Aggregation |
 |---|---|---|---|
 | Virtual Machine | `VmAvailabilityMetric` | 0.0–1.0 | Minimum |
 | Azure SQL Database | `Availability` | 0–100 → normalised to 0.0–1.0 | Minimum |
 | Storage Account | `Availability`, `Transactions` | 0–100 → normalised to 0.0–1.0 | Minimum, Total |
 
-For each data point in the response:
+Each data point is classified as follows:
 
-- **Value = 100%** → adds `1.0` to `AvailableSum` (fully available).
-- **Value > 0 and < 100%** → added to `AvailableSum` as a fractional contribution (for example `99.5% → 0.995`) and recorded as a **positive degraded suspect minute**.
-- **Value = 0%** → recorded as a **0%-valued suspect minute**.
-- **Value = null (missing)** → recorded as a **null suspect minute**.
-- **Storage only: Transactions = 0** → counted as `ZeroTxMin` (no availability signal to measure).
-
-Any minute with `null` or a value below `100%` is a **suspect minute**. Contiguous suspect minutes form a **suspect gap**.
-
-### Step 3 — Investigate suspect gaps via Activity Log, then Health History when available
-
-For every resource that has suspect minutes (`null`, `0%`, or a positive value below `100%`), the tool builds suspect gaps and investigates each suspect minute with the following precedence:
-
-1. **Activity Log first** for supported lifecycle operations.
-2. **Health History second** for the overlap with the current [Resource Health retention window](https://learn.microsoft.com/en-us/azure/service-health/resource-health-overview) (about 30 days).
-3. **Fallback rules** for any suspect minute that still remains unresolved.
-
-For supported resource kinds, the tool first queries the [Activity Log REST API](https://learn.microsoft.com/azure/azure-monitor/platform/rest-activity-log#retrieve-activity-log-data) for the same observation window and the exact resource ID. It only looks for lifecycle operations that represent deliberate administrative action:
-
-- **Virtual Machines**
-  - `Microsoft.Compute/virtualMachines/start/action`
-  - `Microsoft.Compute/virtualMachines/deallocate/action`
-  - `Microsoft.Compute/virtualMachines/powerOff/action`
-  - `Microsoft.Compute/virtualMachines/restart/action`
-- **Azure SQL Databases**
-  - `Microsoft.Sql/servers/databases/pause`
-  - `Microsoft.Sql/servers/databases/resume`
-
-If one of those operations overlaps the affected minute, that minute is treated as **customer/admin lifecycle activity** and is removed from eligibility unless Health History later confirms that the same minute was actually a platform fault. A short post-operation grace window is also applied to lifecycle operations that commonly leave trailing transition datapoints after the control-plane event finishes. The grace window is configurable through `--activity-grace-minutes` and defaults to `10` minutes.
-
-For the part of the observation window still covered by Resource Health retention, the tool then queries the [Resource Health REST API](https://learn.microsoft.com/en-us/rest/api/resourcehealth/availability-statuses/list?view=rest-resourcehealth-2025-05-01) (`availabilityStatuses`, API version `2025-05-01`) and converts the result into:
-
-- **fault intervals** (`Unavailable` / `Degraded`)
-- **Unknown intervals** (Azure cannot determine health, typically monitoring issues)
-- **customer-initiated intervals**
-
-Classification rules are then applied minute-by-minute inside each suspect gap:
-
-- **Platform fault wins.** If Health History says the minute is in a fault interval, it stays eligible and counts against availability even if Activity Log also shows a lifecycle event.
-- **Activity Log lifecycle match** → excluded from eligibility.
-- **Health History `Unknown` or customer-initiated**:
-  - valid explanation for `null` and `0%` suspect minutes, so they are excluded from eligibility
-  - valid explanation for positive degraded datapoints only when Health History says customer-initiated
-- **Remaining `null` suspect minute** → treated as a metric issue and excluded from eligibility.
-- **Remaining `0%` suspect minute** → treated as downtime and kept in eligibility.
-- **Remaining `0% < value < 100%` suspect minute** → trusted as degraded availability and kept in eligibility.
-
-This distinction is deliberate:
-
-- unresolved `null` usually means missing telemetry, so it does not count as downtime
-- unresolved `0%` is still an explicit metric value, so it is treated as downtime
-
-If the requested month extends beyond the current Health History retention, only the retained overlap uses Health History. Older suspect minutes fall back directly to Activity Log and the metric-based rules above.
-
-
-States that are **not** considered platform faults (close any open fault interval):
-
-| Health state | Rationale |
+| Data point | Treatment |
 |---|---|
-| `Available` | Resource confirmed healthy |
-| `Unknown` | Azure cannot determine health — typically says *"unable to determine health due to Azure Monitor issue"*. A monitoring gap, not a confirmed outage. |
-| Customer-initiated | Deliberate stop/deallocate/restart — detected via `reasonType`, `context`, or `healthEventCause` fields |
+| Value = 100% | Adds `1.0` to `AvailableSum` (fully available) |
+| 0% < value < 100% | Fractional contribution to `AvailableSum`; recorded as a **degraded suspect minute** |
+| Value = 0% | Recorded as a **0%-valued suspect minute** |
+| Value = null | Recorded as a **null suspect minute** |
+| Storage: Transactions = 0 | No availability signal — counted as both suspect and excused, excluded from eligibility |
 
-Customer-initiated Resource Health events are detected via multiple API fields for robustness:
-- `reasonType`: `"Customer Initiated"` or `"User Initiated"`
-- `context`: `"Customer Initiated"`
-- `healthEventCause`: `"UserInitiated"`
+Any minute with `null` or a value below `100%` is a **suspect minute**. Contiguous suspect minutes form a **suspect gap** (used for narration only — investigation is always minute-by-minute).
 
-If the Resource Health API call fails for a resource while Health History should have been available, the tool is conservative and does **not** excuse suspect gap minutes through Health History. Activity Log matches still apply, and all remaining minutes fall back directly to the metric-based rules above. If the Activity Log call fails, the tool continues with Health History plus the fallback rules.
+### Suspect gap investigation
 
-### Step 4 — Assemble results
+For every resource with suspect minutes, the tool investigates each minute with the following precedence:
+
+**1. Activity Log** — For supported resource kinds, the [Activity Log REST API](https://learn.microsoft.com/azure/azure-monitor/platform/rest-activity-log#retrieve-activity-log-data) is queried for lifecycle operations that represent deliberate administrative action:
+
+- **VMs**: `start/action`, `deallocate/action`, `powerOff/action`, `restart/action`
+- **SQL DBs**: `pause`, `resume`
+
+Matching minutes are treated as customer/admin lifecycle activity and removed from eligibility. A configurable grace window (`--activity-grace-minutes`, default 10) extends these intervals to cover trailing transition datapoints.
+
+**2. Health History** — For the portion of the window covered by the ~30-day [Resource Health retention](https://learn.microsoft.com/en-us/azure/service-health/resource-health-overview), the [Resource Health REST API](https://learn.microsoft.com/en-us/rest/api/resourcehealth/availability-statuses/list?view=rest-resourcehealth-2025-05-01) (`availabilityStatuses`, API version `2025-05-01`) is queried. Transitions are converted into three interval types:
+
+- **Fault** (`Unavailable` / `Degraded`) — confirmed platform issues
+- **Unknown** — Azure cannot determine health (typically a monitoring gap, not an outage)
+- **Customer-initiated** — detected via `reasonType` (`"Customer Initiated"` / `"User Initiated"`), `context` (`"Customer Initiated"`), or `healthEventCause` (`"UserInitiated"`)
+
+**3. Minute-by-minute classification** — Each suspect minute is classified with strict precedence:
+
+| Condition | Effect |
+|---|---|
+| Health History: fault interval | Stays eligible, counts as downtime (platform fault wins even if Activity Log also matches) |
+| Activity Log: lifecycle match | Excluded from eligibility |
+| Health History: Unknown or customer-initiated | Excluded from eligibility (for degraded minutes, only customer-initiated excuses) |
+| Remaining null | Metric issue — excluded from eligibility (missing telemetry ≠ downtime) |
+| Remaining 0% | Trusted as downtime — stays eligible (explicit metric value) |
+| Remaining degraded (0% < v < 100%) | Trusted as degraded availability — stays eligible |
+
+**Conservative on failure:** if a Resource Health API call fails, Activity Log matches still apply but no remaining minutes are excused through Health History. If the Activity Log call fails, Health History plus fallback rules still apply.
+
+### Result assembly
 
 ```
-SuspectMinutes   = GapMinutes + DegradedMinutes  (total suspect from metric scan)
-SuspectMinutes   = GapMinutes + DegradedMinutes + ZeroTxMinutes  (total suspect from metric scan + no-signal storage minutes)
 EligibleMinutes  = TotalMinutes − ExcusedMinutes
-ExcusedMinutes   = ActivityLogExcludedGapMinutes + HealthExplainedGapMinutes + MetricIssueNullMinutes + CustomerExcusedDegradedMinutes + ZeroTxMinutes
+ExcusedMinutes   = ActivityLogExcluded + HealthExplained + MetricIssueNulls + CustomerExcusedDegraded + ZeroTxMinutes
 AvailableMinutes = Σ metric values above 0% (each 0.0–1.0) − CustomerExcusedDegradedAvailableSum
-FaultMinutes     = PlatformFaultGapMinutes + HealthConfirmedDegradedMinutes
-UnresolvedMinutes = UnresolvedZeroDowntimeMinutes + RemainingPositiveDegradedMinutes
+FaultMinutes     = PlatformFaultGap + HealthConfirmedDegraded
+UnresolvedMinutes = UnresolvedZeroDowntime + RemainingPositiveDegraded
 AvailabilityPct  = AvailableMinutes / EligibleMinutes × 100
 ```
 
-The invariant **Suspect = Faults + Excused + Unresolved** always holds.
-
-- **Excused minutes** (lifecycle activity, customer-initiated, Health Unknown, metric-issue nulls, and zero-transaction storage minutes) are removed from `EligibleMinutes`.
-- **Platform-fault minutes** remain in `EligibleMinutes` and contribute `0` to `AvailableMinutes`.
-- **Unresolved 0% minutes** remain in `EligibleMinutes` and contribute `0` to `AvailableMinutes`.
-- **Customer-excused degraded minutes** are removed from both `EligibleMinutes` and `AvailableMinutes`.
-- **Zero-transaction storage minutes** count as both suspect and excused — there is no availability signal when there are no transactions, so they cannot contribute to availability calculations.
-- Resources with zero eligible minutes show `N/A`.
-- If the metric API returns no usable datapoints at all across the full period, the resource is excluded from availability calculations by setting `EligibleMinutes = 0` and `AvailableMinutes = 0`.
+If the metric API returns no usable datapoints across the full period, the resource is excluded from availability calculations and shown as `N/A`.
 
 ### Worked example
 
-Consider a 30-day month for a VM (43,200 total minutes):
+A 30-day month for a VM (43,200 total minutes):
 
 | Category | Minutes | Effect |
 |---|---:|---|
 | Metric = 1.0 (fully available) | 40,000 | +40,000 to AvailableSum |
 | Metric = 0.7 (degraded, unexplained) | 100 | +70 to AvailableSum, +100 Unresolved |
-| Metric = 0.8 during restart lifecycle event | 5 | +5 Excused, remove 4 from AvailableSum |
-| Metric = null — explained by Activity Log | 40 | +40 Excused |
-| Metric = null — explained by Health `Unknown` | 3,000 | +3,000 Excused |
-| Metric = null — unresolved metric issue | 30 | +30 Excused |
-| Metric = 0% — fault confirmed | 10 | +10 Faults, stays in eligible |
-| Metric = 0% — unresolved | 10 | +10 Unresolved, stays in eligible |
+| Metric = 0.8 during restart lifecycle | 5 | +5 Excused, remove 4 from AvailableSum |
+| Metric = null — Activity Log match | 40 | +40 Excused |
+| Metric = null — Health `Unknown` | 3,000 | +3,000 Excused |
+| Metric = null — unresolved | 30 | +30 Excused (metric issue) |
+| Metric = 0% — fault confirmed | 10 | +10 Faults, stays eligible |
+| Metric = 0% — unresolved | 10 | +10 Unresolved, stays eligible |
 
 ```
 SuspectMinutes   = (40 + 3,000 + 30 + 10 + 10) + (100 + 5) = 3,195
@@ -173,210 +260,17 @@ AvailableMinutes = 40,000 + 70 − 4 = 40,066
 AvailabilityPct  = 40,066 / 40,125 × 100 = 99.85390%
 ```
 
-### Storage Account — transaction-based eligibility
+## Implementation notes
 
-Storage Account `Availability` is a transaction-success-rate metric — it is only meaningful when there are actual transactions. The tool fetches both `Availability` and `Transactions` in a single API call. For each minute:
+These notes cover performance and implementation details specific to each version.
 
-- **Transactions > 0 and Availability > 0%:** the Availability value (0–100, normalised to 0.0–1.0) counts toward available minutes. Values below 100% count as degraded.
-- **Transactions > 0 and Availability null or 0%:** recorded as suspect minutes and investigated with the same Activity Log / Health History / fallback sequence.
-- **Transactions = 0 or null:** counted as both suspect and excused — no availability signal to measure, so they are excluded from eligibility.
-
-## Parameters
-
-### C# (`GetAvailability.exe`)
-
-| Option | Short | Default | Description |
-|---|---|---|---|
-| `--subscriptions` | `-s` | *(required)* | One or more Azure subscription display names |
-| `--month` | `-m` | *(required)* | Observation month in UTC using format `YYYYMM` |
-| `--kinds` | `-k` | `vm sql storage` | Resource kinds to process |
-| `--resource` | `-r` | *(all)* | Filter to a single resource name |
-| `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
-| `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
-| `--batch` | `-b` | off | Use the regional Metrics Batch API instead of per-resource calls |
-| `--batch-size` | | `10` | Max resources per batch call (1–50); implies `--batch` |
-| `--version` | `-v` | | Print version and exit |
-
-### PowerShell (`get-availability.ps1`)
-
-| Parameter | Default | Description |
-|---|---|---|
-| `-Subscriptions` | *(required)* | One or more Azure subscription display names |
-| `-Month` | *(required)* | Observation month in UTC using format `YYYYMM` |
-| `-Kinds` | `vm,sql,storage` | Resource kinds to process |
-| `-Resource` | *(all)* | Filter to a single resource name |
-| `-Parallelism` | *(auto)* | Max concurrent API calls (scales to CPU cores, 4–16) |
-| `-ActivityGraceMinutes` | `10` | Post-operation grace window for supported Activity Log lifecycle events |
-| `-Batch` | off | Use the regional Metrics Batch API instead of per-resource calls |
-| `-BatchSize` | `10` | Max resources per batch call (1–50); implies `-Batch` |
-| `-Version` | | Print version and exit |
-
-Both versions enforce the same constraints: `-Month` / `--month` cannot point to a month whose first day is more than 90 days before the current UTC time.
-
-## Prerequisites
-
-### C# version
-
-| Requirement | Detail |
-|---|---|
-| .NET SDK | 10.0 or later (build from source only) |
-| Azure auth | `az login` or any method supported by `DefaultAzureCredential` |
-
-The published binary (`GetAvailability.exe`) requires no .NET runtime — it is a Native AOT self-contained executable.
-
-### PowerShell version
-
-| Requirement | Detail |
-|---|---|
-| PowerShell | 7.0 or later (`pwsh`) |
-| Az.Accounts | `Install-Module Az.Accounts` |
-| Az.ResourceGraph | `Install-Module Az.ResourceGraph` |
-| Azure auth | `Connect-AzAccount` (used by both Az modules and for ARM token acquisition) |
-
-The script outputs objects to the pipeline in addition to the formatted table, so results can be piped to `Export-Csv`, `ConvertTo-Json`, or further filtered.
-
-If Azure authentication fails, the tool prints the SDK/module exception message directly. For Azure CLI-based auth (C#), re-run `az login`; for PowerShell, re-run `Connect-AzAccount`.
-
-## Usage
-
-### C# version
-
-```bash
-# Build the Native AOT binary (one-time)
-cd csharp/GetAvailability
-dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/publish/
-
-# Single subscription
-./GetAvailability --subscriptions Contoso-Production --month 202603
-
-# Multiple subscriptions
-./GetAvailability --subscriptions Contoso-Development Contoso-Production --month 202603
-
-# Filter by resource kind
-./GetAvailability --subscriptions Contoso-Production --month 202603 --kinds vm sql
-
-# Single resource
-./GetAvailability --subscriptions Contoso-Development --month 202603 --resource myvm01
-
-# SQL database by displayed server/database name
-./GetAvailability --subscriptions Contoso-Development --month 202603 --resource sqlserver01/sqldb01
-
-# Override the Activity Log grace window
-./GetAvailability --subscriptions Contoso-Development --month 202603 --resource myvm02 --activity-grace-minutes 15
-
-# Use batch API mode
-./GetAvailability --subscriptions Contoso-Production --month 202603 --batch
-
-# Use batch API with custom batch size
-./GetAvailability --subscriptions Contoso-Production Contoso-Development --month 202603 --batch-size 20
-
-# Or run directly without publishing
-cd csharp/GetAvailability
-dotnet run -- --subscriptions Contoso-Production --month 202603
-```
-
-### PowerShell version
-
-```powershell
-# Single subscription
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603
-
-# Multiple subscriptions
-./get-availability.ps1 -Subscriptions 'Contoso-Development','Contoso-Production' -Month 202603
-
-# Filter by resource kind
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -Kinds vm,sql
-
-# Single resource
-./get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm01
-
-# Override the Activity Log grace window
-./get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm02 -ActivityGraceMinutes 15
-
-# Use batch API mode
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -Batch
-
-# Use batch API with custom batch size
-./get-availability.ps1 -Subscriptions 'Contoso-Production','Contoso-Development' -Month 202603 -Batch -BatchSize 20
-
-# Pipe results to CSV
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
-```
-
-## Output
-
-The header line shows the observation window and total minutes:
-
-```
-Period: month 202602 (2026-02-01 00:00:00Z -> 2026-03-01 00:00:00Z, 40320 min)
-```
-
-If the requested month is only partially covered by the current Resource Health retention window, the tool prints an explicit warning immediately after the period line:
-
-```
-WARNING: Resource Health history covers only part of this period (2026-02-16 18:54:00Z -> 2026-03-01 00:00:00Z, 17586 of 40320 min). Earlier minutes will use Activity Log and metric fallback rules.
-```
-
-If none of the observation window is covered by retained Resource Health history, the tool instead prints:
-
-```
-WARNING: Resource Health history does not cover this period. All suspect minutes will use Activity Log and metric fallback rules.
-```
-
-Table view (Kind is abbreviated: VM, SQL, Storage):
-
-| Subscription | Name | Kind | Location | Suspect | Faults | Excused | Unresolved | AvailMin | EligMin | Avail% |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Production | `sqlserver02/sqldb02` | SQL | westeurope | | | | | 40320 | 40320 | 100.00000 |
-| Development | `devvm01a` | VM | northeurope | 23 | | 23 | | 14369 | 14369 | 100.00000 |
-| Production | `storageaccount01` | Storage | westeurope | 14 | | 4 | 10 | 40306 | 40316 | 99.97520 |
-
-Column meaning:
-
-- **Suspect** — total minutes where the availability metric was below 100%, null, or had no signal (zero-transaction storage minutes).
-- **Faults** — suspect minutes confirmed as platform issues by Resource Health.
-- **Excused** — suspect minutes excused from eligibility (lifecycle activity, customer-initiated, Health Unknown, metric-issue nulls, and zero-transaction storage minutes).
-- **Unresolved** — suspect minutes that remained after all classification (unresolved 0% downtime + unexplained degraded).
-- **AvailMin** — available minutes (sum of metric values, each 0.0–1.0).
-- **EligMin** — eligible minutes (total minus excused).
-- **Avail%** — availability percentage (AvailMin ÷ EligMin × 100).
-
-The invariant **Suspect = Faults + Excused + Unresolved** holds for every row, making it easy to verify that all suspect minutes are accounted for. Columns with value 0 are shown as blank.
-
-A per-subscription summary is printed grouping numerically-counted resources by Kind + Location with resource count and aggregate availability. Resources excluded as `N/A` are not included in summary math. When multiple subscriptions are processed, a cross-subscription overall summary is printed at the end.
-
-Console output also reports per-resource classification details:
-
-```
-  [sqlserver01/sqldb01] metric scan found 23 suspect min across 22 suspect gaps (null or <100% availability values)
-  [sqlserver01/sqldb01] checked against Activity Log: 23 suspect min explained by admin lifecycle events
-  [sqlserver01/sqldb01] eligible min = 40320 - 23 gap min excluded by Activity Log = 40297
-```
-
-## Architecture notes
-
-- **Single metric API call per resource.** Storage Accounts fetch 2 metrics (availability + transactions) in one call. VMs and SQL DBs fetch 1 metric each.
-- **Activity Log first, Health History second.** Supported lifecycle operations are checked first, but Health History platform faults still win if both overlap the same suspect minute.
-- **Suspect gaps are only a narration layer.** Investigation still happens minute-by-minute inside each suspect gap, so mixed-cause gaps are handled correctly.
-- **Unresolved `null` and unresolved `0%` are not treated the same.** Remaining `null` minutes are metric issues and excluded from eligibility; remaining `0%` minutes are trusted as downtime.
-- **Unknown ≠ fault.** Resource Health `Unknown` state (typically *"unable to determine health due to Azure Monitor issue"*) does not open a fault interval. It only excuses `null` and `0%` suspect minutes.
-- **Customer/admin-initiated awareness.** Resource Health events with `context: "Customer Initiated"`, `reasonType: "Customer Initiated"` / `"User Initiated"`, or `healthEventCause: "UserInitiated"` create customer intervals. For supported kinds, Activity Log lifecycle operations create the same effect. Positive degraded datapoints inside those windows are excluded from availability math.
-- **Configurable grace for transition tails.** `--activity-grace-minutes` defaults to `10` and extends lifecycle-operation intervals that are known to leave trailing anomalous datapoints after the control-plane operation finishes.
-- **Month-based observation period.** The tool now accepts `--month YYYYMM` and can inspect months whose first day is within the last 90 days.
-- **Explicit Health History coverage warnings.** When the requested month is only partially or not at all covered by retained Resource Health history, the report header says so and clarifies that older suspect minutes fall back to Activity Log plus metric-based rules.
-- **Conservative on failure.** If a Resource Health API call fails for a period where Health History should exist, Activity Log matches still apply, but no remaining suspect minutes are excused through Health History.
-- **Transaction-aware storage.** Zero-transaction minutes are excluded from eligibility rather than counted as unavailable, giving an accurate picture of actual storage service availability.
-- **Whole-window no-signal exclusion.** If the metric API returns no usable datapoints across the full period, the resource is excluded from availability calculations and shown as `N/A`.
-- **Batch API mode.** `--batch` / `-Batch` uses the regional Azure Monitor Metrics Batch API, grouping resources by (subscription, region, kind) and sending them in configurable chunks. This reduces API call count and improves throughput for large inventories. Regional endpoints are validated before fetching. Wave-based processing with GC between waves bounds memory usage.
-- **`Parallel.ForEachAsync`** (C#) / **`ForEach-Object -Parallel`** (PowerShell) for concurrent metric and health queries with configurable parallelism.
-- **Shared `HttpClient`** with connection pooling (PowerShell per-resource metrics and gap investigation paths) — avoids per-request TCP/TLS overhead that `Invoke-WebRequest` incurs; streams JSON responses directly into `System.Text.Json` without intermediate string allocation.
-- **HashSet-based interval containment** (PowerShell) — suspect-minute classification pre-expands Activity Log and Health History intervals into `HashSet<long>` tick sets for O(1) lookups instead of linear interval scans.
-- **O(1) JSON property access** — `TryGetProperty` hash lookup instead of `EnumerateObject` linear scan when reading metric datapoints (~44k calls per resource per month).
-- **Compiled metric processor** (PowerShell) — the ~44k-datapoint-per-resource JSON processing loop is compiled as C# via `Add-Type` and runs at native .NET speed, eliminating the interpreted-loop bottleneck that dominates wall-clock time for large inventories.
-- **Compiled gap processor** (PowerShell) — `ExpandToTickSet` (interval → `HashSet<long>`) and `ClassifyGaps` (minute-by-minute classification) are also compiled via `Add-Type`, replacing interpreted loops that iterate over potentially tens of thousands of ticks per resource.
-- **Idempotent `Add-Type` guards** (PowerShell) — each compiled C# block (`MetricProcessor`, `GapProcessor`) is independently guarded by a `PSTypeName` check so the script can be re-run within the same PowerShell session without "type already exists" errors.
-- **Ticks-based metric keying** (`long` instead of `DateTime`) — zero-allocation per data point in both versions.
-- **`System.Text.Json`** for efficient JSON parsing in both versions — avoids large PSObject trees in PowerShell and enables AOT-safe parsing in C#.
-- **Health History retention remains independent.** The observation month can extend beyond 30 days of retained Health History; only the retained overlap is checked there.
+- **`Parallel.ForEachAsync`** (C#) / **`ForEach-Object -Parallel`** (PowerShell) for concurrent metric, Activity Log, and Resource Health queries with configurable parallelism.
+- **Shared `HttpClient`** with connection pooling (PowerShell) — avoids per-request TCP/TLS overhead; streams JSON responses directly into `System.Text.Json` without intermediate string allocation. Used for both per-resource metrics and gap investigation paths.
+- **Compiled metric processor** (PowerShell) — the ~44k-datapoint-per-resource JSON processing loop is compiled as C# via `Add-Type` and runs at native .NET speed.
+- **Compiled gap processor** (PowerShell) — `ExpandToTickSet` (interval → `HashSet<long>`) and `ClassifyGaps` (minute-by-minute classification) are also compiled via `Add-Type`.
+- **Idempotent `Add-Type` guards** (PowerShell) — each compiled C# block (`MetricProcessor`, `GapProcessor`) is independently guarded by a `PSTypeName` check so the script can be re-run within the same session.
+- **HashSet-based interval containment** — suspect-minute classification pre-expands intervals into `HashSet<long>` tick sets for O(1) lookups instead of linear scans.
+- **O(1) JSON property access** — `TryGetProperty` hash lookup instead of `EnumerateObject` linear scan (~44k calls per resource per month).
+- **Ticks-based metric keying** — `long` instead of `DateTime` for zero-allocation per data point.
+- **`System.Text.Json`** for efficient JSON parsing — avoids large PSObject trees in PowerShell and enables AOT-safe parsing in C#.
 - **Native AOT** (C#) — ~15 MB standalone binary, no .NET runtime required.
-- **Pipeline output** (PowerShell) — the script emits result objects after the formatted table, enabling `Export-Csv`, `ConvertTo-Json`, or further pipeline filtering.
