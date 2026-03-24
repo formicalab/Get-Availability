@@ -242,9 +242,264 @@ function Get-TruncatedString([string]$s, [int]$max) {
     $s.Length -le $max ? $s : ($s.Substring(0, $max - 3) + '...')
 }
 
-# ── Batch API configuration ──────────────────────────────────────────────────
-# Maps resource kind → metric namespace, metric names, and aggregation for the
-# regional Metrics Batch API (https://{region}.metrics.monitor.azure.com).
+# ── Compiled metric processor ─────────────────────────────────────────────────
+# The JSON processing loop iterates ~44 K data-points per resource (PT1M × 1
+# month).  In interpreted PowerShell that is the dominant bottleneck; compiling
+# the identical logic as C# via Add-Type makes it run at native .NET speed.
+
+if (-not ([System.Management.Automation.PSTypeName]'MetricProcessor').Type) {
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+
+public sealed class MetricProcessorResult
+{
+    public double AvailableSum;
+    public int    NumericPoints;
+    public int    ZeroTxMin;
+    public long[]   NullTicks     = Array.Empty<long>();
+    public long[]   ZeroTicks     = Array.Empty<long>();
+    public long[]   DegradedTicks = Array.Empty<long>();
+    public double[] DegradedValues = Array.Empty<double>();
+
+    public int  GapMinutes              => NullTicks.Length + ZeroTicks.Length;
+    public int  DegradedMinutes         => DegradedTicks.Length;
+    public bool ExcludeFromAvailability => NumericPoints == 0 && NullTicks.Length == 0
+                                           && ZeroTicks.Length == 0 && DegradedTicks.Length == 0;
+    public int  SuspectMinutes          => GapMinutes + DegradedMinutes;
+}
+
+public sealed class BatchResourceResult
+{
+    public string ResourceId      = "";
+    public string ResourceIdLower = "";
+    public MetricProcessorResult Metrics = new();
+}
+
+public static class MetricProcessor
+{
+    /// <summary>Per-resource response: root has "value" array.</summary>
+    public static MetricProcessorResult ProcessSingle(JsonDocument doc, bool isVm, bool isStorage)
+        => ProcessMetricArray(doc.RootElement.GetProperty("value"), isVm, isStorage);
+
+    /// <summary>Batch response: root has "values" array, each with "resourceid" + "value".</summary>
+    public static BatchResourceResult[] ProcessBatch(JsonDocument doc, bool isVm, bool isStorage)
+    {
+        var results = new List<BatchResourceResult>();
+        foreach (var entry in doc.RootElement.GetProperty("values").EnumerateArray())
+        {
+            string resId = entry.GetProperty("resourceid").GetString() ?? "";
+            results.Add(new BatchResourceResult
+            {
+                ResourceId      = resId,
+                ResourceIdLower = resId.ToLowerInvariant(),
+                Metrics         = ProcessMetricArray(entry.GetProperty("value"), isVm, isStorage)
+            });
+        }
+        return results.ToArray();
+    }
+
+    // ── shared inner loop ────────────────────────────────────────────────────
+    private static MetricProcessorResult ProcessMetricArray(
+        JsonElement valueArr, bool isVm, bool isStorage)
+    {
+        var r = new MetricProcessorResult();
+        var nullTicks      = new List<long>();
+        var zeroTicks      = new List<long>();
+        var degradedTicks  = new List<long>();
+        var degradedValues = new List<double>();
+
+        if (isStorage)
+        {
+            var txByTicks = new Dictionary<long, double>();
+            foreach (var metricEl in valueArr.EnumerateArray())
+            {
+                if (!string.Equals(metricEl.GetProperty("name").GetProperty("value").GetString(), "Transactions", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
+                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
+                {
+                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
+                                         .ToUniversalTime().Ticks;
+                    if (dp.TryGetProperty("total", out var tot) && tot.ValueKind == JsonValueKind.Number)
+                        txByTicks[ticks] = tot.GetDouble();
+                }
+            }
+            foreach (var metricEl in valueArr.EnumerateArray())
+            {
+                if (!string.Equals(metricEl.GetProperty("name").GetProperty("value").GetString(), "Availability", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
+                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
+                {
+                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
+                                         .ToUniversalTime().Ticks;
+                    bool hasTx = txByTicks.TryGetValue(ticks, out double txVal) && txVal > 0;
+                    double? minVal = null;
+                    if (dp.TryGetProperty("minimum", out var minEl) && minEl.ValueKind == JsonValueKind.Number)
+                        minVal = minEl.GetDouble();
+
+                    if (hasTx && minVal.HasValue)
+                    {
+                        double norm = minVal.Value / 100.0;
+                        r.NumericPoints++;
+                        if (norm == 0.0)      zeroTicks.Add(ticks);
+                        else { r.AvailableSum += norm;
+                               if (norm < 1.0) { degradedTicks.Add(ticks); degradedValues.Add(norm); } }
+                    }
+                    else if (hasTx)  nullTicks.Add(ticks);
+                    else             r.ZeroTxMin++;
+                }
+            }
+        }
+        else
+        {
+            foreach (var metricEl in valueArr.EnumerateArray())
+            {
+                string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
+                if (!string.Equals(mName, "VmAvailabilityMetric", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(mName, "Availability", StringComparison.OrdinalIgnoreCase)) continue;
+
+                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
+                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
+                {
+                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
+                                         .ToUniversalTime().Ticks;
+                    double? minVal = null;
+                    if (dp.TryGetProperty("minimum", out var minEl) && minEl.ValueKind == JsonValueKind.Number)
+                        minVal = minEl.GetDouble();
+
+                    if (minVal.HasValue)
+                    {
+                        r.NumericPoints++;
+                        double v = isVm ? minVal.Value : minVal.Value / 100.0;
+                        if (v == 0.0)      zeroTicks.Add(ticks);
+                        else { r.AvailableSum += v;
+                               if (v < 1.0) { degradedTicks.Add(ticks); degradedValues.Add(v); } }
+                    }
+                    else nullTicks.Add(ticks);
+                }
+            }
+        }
+
+        r.NullTicks      = nullTicks.ToArray();
+        r.ZeroTicks      = zeroTicks.ToArray();
+        r.DegradedTicks  = degradedTicks.ToArray();
+        r.DegradedValues = degradedValues.ToArray();
+        return r;
+    }
+}
+'@
+}
+
+# ── Compiled gap investigation helpers ────────────────────────────────────────
+# ExpandToTickSet and ClassifyGaps run at native .NET speed, replacing interpreted
+# PowerShell loops that iterate over potentially tens of thousands of ticks.
+
+if (-not ([System.Management.Automation.PSTypeName]'GapProcessor').Type) {
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+
+// ── Gap investigation helpers ───────────────────────────────────────────────
+
+public sealed class GapClassificationResult
+{
+    public int    PlatformFaultGapMin;
+    public int    UnresolvedZeroDowntimeMin;
+    public int    HealthExplainedGapMin;
+    public int    MetricIssueNullMin;
+    public int    ActivityLogExcludedGapMin;
+    public int    CustomerExcusedDegradedMin;
+    public double CustomerExcusedDegradedAvail;
+    public int    ActivityLogDegradedMin;
+    public int    HealthConfirmedDegradedMin;
+}
+
+public static class GapProcessor
+{
+    private const long OneMinTicks = 600_000_000L;
+
+    /// <summary>Expands interval pairs (fromTicks[i]..toTicks[i]) into a HashSet of minute-aligned ticks.</summary>
+    public static HashSet<long> ExpandToTickSet(long[] fromTicks, long[] toTicks)
+    {
+        var set = new HashSet<long>();
+        if (fromTicks == null || fromTicks.Length == 0) return set;
+        for (int i = 0; i < fromTicks.Length; i++)
+        {
+            long t = fromTicks[i] - (fromTicks[i] % OneMinTicks);
+            if (t < fromTicks[i]) t += OneMinTicks;
+            while (t < toTicks[i])
+            {
+                set.Add(t);
+                t += OneMinTicks;
+            }
+        }
+        return set;
+    }
+
+    /// <summary>Classifies each suspect tick into gap/degraded categories using precomputed HashSets.</summary>
+    public static GapClassificationResult ClassifyGaps(
+        long[] allGapTicks, long[] zeroTicks,
+        long[] degradedTicks, double[] degradedValues,
+        HashSet<long> activitySet, HashSet<long> faultSet,
+        HashSet<long> unknownSet, HashSet<long> customerSet,
+        bool healthHistoryApplied, long hcStartTicks)
+    {
+        var r = new GapClassificationResult();
+        var zeroSet = new HashSet<long>(zeroTicks ?? Array.Empty<long>());
+
+        if (allGapTicks != null)
+        {
+            foreach (long tk in allGapTicks)
+            {
+                bool isZero     = zeroSet.Contains(tk);
+                bool inActivity = activitySet.Contains(tk);
+                bool inHCov     = healthHistoryApplied && tk >= hcStartTicks;
+                bool inFault    = inHCov && faultSet.Contains(tk);
+                bool inUnknown  = inHCov && unknownSet.Contains(tk);
+                bool inCustomer = inHCov && customerSet.Contains(tk);
+
+                if      (inFault)                   r.PlatformFaultGapMin++;
+                else if (inActivity)                r.ActivityLogExcludedGapMin++;
+                else if (inCustomer || inUnknown)   r.HealthExplainedGapMin++;
+                else if (isZero)                    r.UnresolvedZeroDowntimeMin++;
+                else                                r.MetricIssueNullMin++;
+            }
+        }
+
+        if (degradedTicks != null)
+        {
+            for (int i = 0; i < degradedTicks.Length; i++)
+            {
+                long   tk = degradedTicks[i];
+                double dv = degradedValues[i];
+                bool inActivity = activitySet.Contains(tk);
+                bool inHCov     = healthHistoryApplied && tk >= hcStartTicks;
+                bool inFault    = inHCov && faultSet.Contains(tk);
+                bool inCustomer = inHCov && customerSet.Contains(tk);
+
+                if (inFault)
+                    r.HealthConfirmedDegradedMin++;
+                else if (inActivity || inCustomer)
+                {
+                    r.CustomerExcusedDegradedMin++;
+                    r.CustomerExcusedDegradedAvail += dv;
+                    if (inActivity) r.ActivityLogDegradedMin++;
+                }
+            }
+        }
+
+        return r;
+    }
+}
+'@
+}
+
+# ── Kind configuration ────────────────────────────────────────────────────────
+# Maps resource kind → metric namespace, metric names, and aggregation.
+# Used by both the per-resource ARM Metrics API and the regional Batch API.
 
 $KindConfig = @{
     'VirtualMachine' = @{
@@ -337,7 +592,7 @@ function Get-BatchAvailabilityMetrics {
         $groups[$groupKey].Add($res)
     }
 
-    # Build batch work items: split each group into chunks of BatchSize
+    # Split each group into chunks of BatchSize to form individual batch API calls
     $batchWorkItems = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in $groups.GetEnumerator()) {
         $parts = $entry.Key -split '\|'
@@ -505,132 +760,30 @@ function Get-BatchAvailabilityMetrics {
             return
         }
 
-        $jNum = [System.Text.Json.JsonValueKind]::Number
-
-        function script:GetNum([System.Text.Json.JsonElement]$dp, [string]$prop) {
-            foreach ($p in $dp.EnumerateObject()) {
-                if ($p.Name -eq $prop -and $p.Value.ValueKind -eq $jNum) { return $p.Value.GetDouble() }
-            }
-            return $null
-        }
-
         $resById = @{}
         foreach ($r in $resources) { $resById[$r.ResourceId.ToLowerInvariant()] = $r }
 
         try {
-            $valuesArr = $doc.RootElement.GetProperty('values')
-            foreach ($resourceEntry in $valuesArr.EnumerateArray()) {
-                $resId = $resourceEntry.GetProperty('resourceid').GetString()
-                $resIdLower = $resId.ToLowerInvariant()
-                $resObj = if ($resById.ContainsKey($resIdLower)) { $resById[$resIdLower] } else { $null }
-                $resName = if ($resObj) { $resObj.Name } else { $resId }
-
-                $metricValueArr = $resourceEntry.GetProperty('value')
-
-                [double]$availSum = 0.0
-                [int]$zeroTxMin = 0
-                [int]$numericPoints = 0
-                $nullTicks     = [System.Collections.Generic.List[long]]::new()
-                $zeroTicks     = [System.Collections.Generic.List[long]]::new()
-                $degradedTicks = [System.Collections.Generic.List[long]]::new()
-                $degradedValues = [System.Collections.Generic.List[double]]::new()
-
-                if ($isStorage) {
-                    $txByTicks = [System.Collections.Generic.Dictionary[long,double]]::new()
-                    foreach ($metricEl in $metricValueArr.EnumerateArray()) {
-                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
-                        if ($mName -ne 'Transactions') { continue }
-                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
-                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
-                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
-                                $tot = GetNum $dp 'total'
-                                if ($null -ne $tot) { $txByTicks[$time.Ticks] = $tot }
-                            }
-                        }
-                    }
-                    foreach ($metricEl in $metricValueArr.EnumerateArray()) {
-                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
-                        if ($mName -ne 'Availability') { continue }
-                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
-                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
-                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
-                                $ticks = $time.Ticks
-                                $txVal = [double]0
-                                $hasTx = $txByTicks.TryGetValue($ticks, [ref]$txVal) -and $txVal -gt 0
-                                $minVal = GetNum $dp 'minimum'
-
-                                if ($hasTx -and $null -ne $minVal) {
-                                    $norm = $minVal / 100.0
-                                    $numericPoints++
-                                    if ($norm -eq 0.0) {
-                                        $zeroTicks.Add($ticks)
-                                    } else {
-                                        $availSum += $norm
-                                        if ($norm -lt 1.0) {
-                                            $degradedTicks.Add($ticks)
-                                            $degradedValues.Add($norm)
-                                        }
-                                    }
-                                } elseif ($hasTx -and $null -eq $minVal) {
-                                    $nullTicks.Add($ticks)
-                                } elseif (-not $hasTx) {
-                                    $zeroTxMin++
-                                }
-                            }
-                        }
-                    }
-                    $txByTicks = $null
-                } else {
-                    foreach ($metricEl in $metricValueArr.EnumerateArray()) {
-                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
-                        $isPrimary = $mName -eq 'VmAvailabilityMetric' -or $mName -eq 'Availability'
-                        if (-not $isPrimary) { continue }
-
-                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
-                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
-                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
-                                $ticks = $time.Ticks
-                                $minVal = GetNum $dp 'minimum'
-
-                                if ($null -ne $minVal) {
-                                    $numericPoints++
-                                    $v = if ($isVm) { $minVal } else { $minVal / 100.0 }
-                                    if ($v -eq 0.0) {
-                                        $zeroTicks.Add($ticks)
-                                    } else {
-                                        $availSum += $v
-                                        if ($v -lt 1.0) {
-                                            $degradedTicks.Add($ticks)
-                                            $degradedValues.Add($v)
-                                        }
-                                    }
-                                } else {
-                                    $nullTicks.Add($ticks)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                $gapMinutes = $nullTicks.Count + $zeroTicks.Count
-                $degradedMinutes = $degradedTicks.Count
-                $excludeFromAvailability = $numericPoints -eq 0 -and $nullTicks.Count -eq 0 -and
-                    $zeroTicks.Count -eq 0 -and $degradedMinutes -eq 0
+            $batchResults = [MetricProcessor]::ProcessBatch($doc, $isVm, $isStorage)
+            foreach ($br in $batchResults) {
+                $resObj  = if ($resById.ContainsKey($br.ResourceIdLower)) { $resById[$br.ResourceIdLower] } else { $null }
+                $resName = if ($resObj) { $resObj.Name } else { $br.ResourceId }
+                $m = $br.Metrics
 
                 [PSCustomObject]@{
-                    ResourceId              = $resId
-                    ResourceIdLower         = $resIdLower
+                    ResourceId              = $br.ResourceId
+                    ResourceIdLower         = $br.ResourceIdLower
                     Name                    = $resName
-                    AvailableSum            = $availSum
-                    GapMinutes              = $gapMinutes
-                    ZeroTxMin               = $zeroTxMin
-                    ExcludeFromAvailability = $excludeFromAvailability
-                    GapTicks                = @($nullTicks)
-                    ZeroAvailTicks          = @($zeroTicks)
-                    DegradedMinutes         = $degradedMinutes
-                    DegradedTicks           = @($degradedTicks)
-                    DegradedValues          = @($degradedValues)
-                    SuspectMinutes          = $gapMinutes + $degradedMinutes
+                    AvailableSum            = $m.AvailableSum
+                    GapMinutes              = $m.GapMinutes
+                    ZeroTxMin               = $m.ZeroTxMin
+                    ExcludeFromAvailability = $m.ExcludeFromAvailability
+                    GapTicks                = $m.NullTicks
+                    ZeroAvailTicks          = $m.ZeroTicks
+                    DegradedMinutes         = $m.DegradedMinutes
+                    DegradedTicks           = $m.DegradedTicks
+                    DegradedValues          = $m.DegradedValues
+                    SuspectMinutes          = $m.SuspectMinutes
                 }
             }
         }
@@ -668,8 +821,8 @@ function Get-BatchAvailabilityMetrics {
 # ── Per-resource metrics (parallel) ───────────────────────────────────────────
 
 ## Fetches Azure Monitor metrics one resource at a time via the ARM Metrics API.
-## Uses ForEach-Object -Parallel for concurrent calls with System.Text.Json for
-## low-allocation parsing. Each resource gets its own HTTP call with retry on 429/5xx.
+## Uses ForEach-Object -Parallel with a shared HttpClient for connection pooling
+## and System.Text.Json for streaming JSON parsing. Retries on 429/5xx.
 function Get-AvailabilityMetrics {
     param(
         [object[]]$Resources,
@@ -681,47 +834,59 @@ function Get-AvailabilityMetrics {
     $total = $Resources.Count
     Write-Host "Querying metrics for $total resource(s) with parallelism $ThrottleLimit..."
 
+    $armHttpClient = [System.Net.Http.HttpClient]::new()
+    $armHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $armHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
+
     $done = 0
     $resultByRes = @{}
 
     $Resources | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         $resource = $_
-        $token    = $using:ArmToken
+        $client   = $using:armHttpClient
         $startIso = ($using:StartDate).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         $endIso   = ($using:EndDate).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
         $isVm      = $resource.Kind -eq 'VirtualMachine'
         $isStorage  = $resource.Kind -eq 'StorageAccount'
 
-        if ($isVm) {
-            $metricNames = 'VmAvailabilityMetric'
-            $agg = 'Minimum'
-        } elseif ($isStorage) {
-            $metricNames = 'Availability,Transactions'
-            $agg = 'Minimum,Total'
-        } else {
-            $metricNames = 'Availability'
-            $agg = 'Minimum'
-        }
+        $kindCfg = ($using:KindConfig)[$resource.Kind]
+        $metricNames = $kindCfg.MetricNames
+        $agg         = $kindCfg.Aggregation
+        $ns          = $kindCfg.Namespace
 
         $uri = "https://management.azure.com$($resource.ResourceId)/providers/Microsoft.Insights/metrics?" +
-               "api-version=2024-02-01&metricnames=$([uri]::EscapeDataString($metricNames))" +
+               "api-version=2024-02-01&metricnamespace=$([uri]::EscapeDataString($ns))" +
+               "&metricnames=$([uri]::EscapeDataString($metricNames))" +
                "&timespan=$startIso/$endIso&interval=PT1M&aggregation=$agg"
 
-        $jsonBody = $null
+        $doc = $null
         for ($attempt = 1; $attempt -le 5; $attempt++) {
+            $httpReq = [System.Net.Http.HttpRequestMessage]::new(
+                [System.Net.Http.HttpMethod]::Get, $uri)
             try {
-                $oldPref = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-                try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ Authorization = "Bearer $token" } -Method GET -UseBasicParsing }
-                finally { $ProgressPreference = $oldPref }
-                $jsonBody = $resp.Content
-                $resp = $null
+                $httpResp = $client.SendAsync($httpReq,
+                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                ).GetAwaiter().GetResult()
+                $sc = [int]$httpResp.StatusCode
+                if ($sc -ge 200 -and $sc -lt 300) {
+                    $respStream = $httpResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                    try { $doc = [System.Text.Json.JsonDocument]::ParseAsync($respStream).GetAwaiter().GetResult() }
+                    finally { $respStream.Dispose() }
+                    $httpResp.Dispose(); $httpReq.Dispose()
+                    break
+                }
+                $httpResp.Dispose(); $httpReq.Dispose()
+                if (($sc -eq 429 -or $sc -ge 500) -and $attempt -lt 5) {
+                    Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
+                    continue
+                }
+                Write-Warning "Metric query failed for '$($resource.Name)': HTTP $sc"
                 break
             }
             catch {
-                $statusCode = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
-                $retryable = $statusCode -eq 429 -or $statusCode -ge 500 -or
-                    $_.ToString() -match 'transport|connection.*closed|reset by peer|timed?\s*out'
+                try { $httpReq.Dispose() } catch {}
+                $retryable = $_.ToString() -match 'transport|connection.*closed|reset by peer|timed?\s*out'
                 if ($retryable -and $attempt -lt 5) {
                     Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
                     continue
@@ -731,134 +896,43 @@ function Get-AvailabilityMetrics {
             }
         }
 
-        [double]$availSum = 0.0
-        [int]$zeroTxMin = 0
-        [int]$numericPoints = 0
-        $nullTicks    = [System.Collections.Generic.List[long]]::new()
-        $zeroTicks    = [System.Collections.Generic.List[long]]::new()
-        $degradedTicks  = [System.Collections.Generic.List[long]]::new()
-        $degradedValues = [System.Collections.Generic.List[double]]::new()
-
-        if ($jsonBody) {
-            $doc = $null
-            try {
-                $doc = [System.Text.Json.JsonDocument]::Parse($jsonBody)
-                $jsonBody = $null
-
-                $jNum  = [System.Text.Json.JsonValueKind]::Number
-
-                function script:GetNum([System.Text.Json.JsonElement]$dp, [string]$prop) {
-                    foreach ($p in $dp.EnumerateObject()) {
-                        if ($p.Name -eq $prop -and $p.Value.ValueKind -eq $jNum) { return $p.Value.GetDouble() }
-                    }
-                    return $null
-                }
-
-                $valueArr = $doc.RootElement.GetProperty('value')
-
-                if ($isStorage) {
-                    # Build Transactions lookup
-                    $txByTicks = [System.Collections.Generic.Dictionary[long,double]]::new()
-                    foreach ($metricEl in $valueArr.EnumerateArray()) {
-                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
-                        if ($mName -ne 'Transactions') { continue }
-                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
-                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
-                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
-                                $tot = GetNum $dp 'total'
-                                if ($null -ne $tot) { $txByTicks[$time.Ticks] = $tot }
-                            }
-                        }
-                    }
-                    # Process Availability
-                    foreach ($metricEl in $valueArr.EnumerateArray()) {
-                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
-                        if ($mName -ne 'Availability') { continue }
-                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
-                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
-                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
-                                $ticks = $time.Ticks
-                                $txVal = [double]0
-                                $hasTx = $txByTicks.TryGetValue($ticks, [ref]$txVal) -and $txVal -gt 0
-                                $minVal = GetNum $dp 'minimum'
-
-                                if ($hasTx -and $null -ne $minVal) {
-                                    $norm = $minVal / 100.0
-                                    $numericPoints++
-                                    if ($norm -eq 0.0) {
-                                        $zeroTicks.Add($ticks)
-                                    } else {
-                                        $availSum += $norm
-                                        if ($norm -lt 1.0) {
-                                            $degradedTicks.Add($ticks)
-                                            $degradedValues.Add($norm)
-                                        }
-                                    }
-                                } elseif ($hasTx -and $null -eq $minVal) {
-                                    $nullTicks.Add($ticks)
-                                } elseif (-not $hasTx) {
-                                    $zeroTxMin++
-                                }
-                            }
-                        }
-                    }
-                    $txByTicks = $null
-                } else {
-                    # VM or SQL DB
-                    foreach ($metricEl in $valueArr.EnumerateArray()) {
-                        $mName = $metricEl.GetProperty('name').GetProperty('value').GetString()
-                        $isPrimary = $mName -eq 'VmAvailabilityMetric' -or $mName -eq 'Availability'
-                        if (-not $isPrimary) { continue }
-
-                        foreach ($tsEl in $metricEl.GetProperty('timeseries').EnumerateArray()) {
-                            foreach ($dp in $tsEl.GetProperty('data').EnumerateArray()) {
-                                $time = [datetime]::Parse($dp.GetProperty('timeStamp').GetString()).ToUniversalTime()
-                                $ticks = $time.Ticks
-                                $minVal = GetNum $dp 'minimum'
-
-                                if ($null -ne $minVal) {
-                                    $numericPoints++
-                                    $v = if ($isVm) { $minVal } else { $minVal / 100.0 }
-                                    if ($v -eq 0.0) {
-                                        $zeroTicks.Add($ticks)
-                                    } else {
-                                        $availSum += $v
-                                        if ($v -lt 1.0) {
-                                            $degradedTicks.Add($ticks)
-                                            $degradedValues.Add($v)
-                                        }
-                                    }
-                                } else {
-                                    $nullTicks.Add($ticks)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            finally {
-                if ($doc) { $doc.Dispose() }
-            }
+        $m = $null
+        if ($doc) {
+            try   { $m = [MetricProcessor]::ProcessSingle($doc, $isVm, $isStorage) }
+            catch { Write-Warning "Metric processing failed for '$($resource.Name)': $_" }
+            finally { $doc.Dispose() }
         }
 
-        $gapMinutes = $nullTicks.Count + $zeroTicks.Count
-        $degradedMinutes = $degradedTicks.Count
-        $excludeFromAvailability = $numericPoints -eq 0 -and $nullTicks.Count -eq 0 -and
-            $zeroTicks.Count -eq 0 -and $degradedTicks.Count -eq 0
-
-        [PSCustomObject]@{
-            ResourceId              = $resource.ResourceId
-            Name                    = $resource.Name
-            AvailableSum            = $availSum
-            GapMinutes              = $gapMinutes
-            ZeroTxMin               = $zeroTxMin
-            ExcludeFromAvailability = $excludeFromAvailability
-            GapTicks                = @($nullTicks)
-            ZeroAvailTicks          = @($zeroTicks)
-            DegradedMinutes         = $degradedMinutes
-            DegradedTicks           = @($degradedTicks)
-            DegradedValues          = @($degradedValues)
-            SuspectMinutes          = $gapMinutes + $degradedMinutes
+        if ($m) {
+            [PSCustomObject]@{
+                ResourceId              = $resource.ResourceId
+                Name                    = $resource.Name
+                AvailableSum            = $m.AvailableSum
+                GapMinutes              = $m.GapMinutes
+                ZeroTxMin               = $m.ZeroTxMin
+                ExcludeFromAvailability = $m.ExcludeFromAvailability
+                GapTicks                = $m.NullTicks
+                ZeroAvailTicks          = $m.ZeroTicks
+                DegradedMinutes         = $m.DegradedMinutes
+                DegradedTicks           = $m.DegradedTicks
+                DegradedValues          = $m.DegradedValues
+                SuspectMinutes          = $m.SuspectMinutes
+            }
+        } else {
+            [PSCustomObject]@{
+                ResourceId              = $resource.ResourceId
+                Name                    = $resource.Name
+                AvailableSum            = 0.0
+                GapMinutes              = 0
+                ZeroTxMin               = 0
+                ExcludeFromAvailability = $true
+                GapTicks                = @()
+                ZeroAvailTicks          = @()
+                DegradedMinutes         = 0
+                DegradedTicks           = @()
+                DegradedValues          = @()
+                SuspectMinutes          = 0
+            }
         }
     } | ForEach-Object {
         $done++
@@ -871,6 +945,7 @@ function Get-AvailabilityMetrics {
         }
     }
     Write-Progress -Activity 'Querying metrics' -Completed
+    $armHttpClient.Dispose()
     $resultByRes
 }
 
@@ -902,30 +977,51 @@ function Invoke-SuspectGapInvestigation {
     $total = $Candidates.Count
     $resultByRes = @{}
 
+    # Shared HttpClient for all Activity Log and Resource Health API calls within
+    # the parallel block — avoids per-request TCP/TLS overhead.
+    $gapHttpClient = [System.Net.Http.HttpClient]::new()
+    $gapHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $gapHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
+
     $Candidates | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         $c         = $_
-        $token     = $using:ArmToken
+        $client    = $using:gapHttpClient
         $pStart    = $using:PeriodStart
         $pEnd      = $using:PeriodEnd
         $graceMin  = $using:GraceMinutes
         $hcStart   = $using:HealthCoverageStart
 
         # ── Local helpers ─────────────────────────────────────────────
-        ## ARM GET with retry on 429/5xx and exponential backoff.
-        function script:ArmGet([string]$uri) {
+        ## ARM GET with retry on 429/5xx and exponential backoff (shared HttpClient).
+        function script:ArmGet([string]$uri, [System.Net.Http.HttpClient]$httpClient) {
             for ($a = 0; $a -lt 6; $a++) {
+                $httpReq = [System.Net.Http.HttpRequestMessage]::new(
+                    [System.Net.Http.HttpMethod]::Get, $uri)
                 try {
-                    $old = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-                    try { $r = Invoke-WebRequest -Uri $uri -Headers @{ Authorization = "Bearer $token" } -UseBasicParsing }
-                    finally { $ProgressPreference = $old }
-                    return $r.Content
-                } catch {
-                    $code = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
-                    if (($code -eq 429 -or $code -ge 500) -and $a -lt 5) {
+                    $httpResp = $httpClient.SendAsync($httpReq,
+                        [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                    ).GetAwaiter().GetResult()
+                    $sc = [int]$httpResp.StatusCode
+                    if ($sc -ge 200 -and $sc -lt 300) {
+                        return $httpResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    }
+                    if (($sc -eq 429 -or $sc -ge 500) -and $a -lt 5) {
+                        $httpResp.Dispose()
                         Start-Sleep -Seconds ([math]::Min(30, [math]::Pow(2, $a)))
                         continue
                     }
+                    $httpResp.EnsureSuccessStatusCode() | Out-Null
+                } catch {
+                    if ($a -lt 5) {
+                        $code = try { [int]$_.Exception.InnerException.StatusCode } catch { 0 }
+                        if ($code -eq 429 -or $code -ge 500) {
+                            Start-Sleep -Seconds ([math]::Min(30, [math]::Pow(2, $a)))
+                            continue
+                        }
+                    }
                     throw
+                } finally {
+                    $httpReq.Dispose()
                 }
             }
         }
@@ -933,14 +1029,6 @@ function Invoke-SuspectGapInvestigation {
         ## Truncates a DateTimeOffset to the minute boundary (seconds = 0).
         function script:TruncMin([DateTimeOffset]$v) {
             [DateTimeOffset]::new($v.Year, $v.Month, $v.Day, $v.Hour, $v.Minute, 0, [TimeSpan]::Zero)
-        }
-
-        ## Returns $true if a tick value falls inside any of the given intervals.
-        function script:InInterval([long]$tick, [object[]]$intervals) {
-            foreach ($iv in $intervals) {
-                if ($tick -ge $iv.FromTicks -and $tick -lt $iv.ToTicks) { return $true }
-            }
-            $false
         }
 
         ## Safely reads a string property from a JsonElement, returning '' if absent.
@@ -995,7 +1083,7 @@ function Invoke-SuspectGapInvestigation {
 
                 $events = [System.Collections.Generic.List[object]]::new()
                 while ($url) {
-                    $json = ArmGet $url
+                    $json = ArmGet $url $client
                     $doc = [System.Text.Json.JsonDocument]::Parse($json)
                     try {
                         $valEl = [System.Text.Json.JsonElement]::new()
@@ -1051,7 +1139,8 @@ function Invoke-SuspectGapInvestigation {
                     finally { $doc.Dispose() }
                 }
 
-                # Build intervals from events
+                # Build intervals from events: group by operation+correlationId,
+                # compute from/to per group, apply grace window, then merge overlaps.
                 if ($events.Count -gt 0) {
                     $groups = @{}
                     foreach ($evt in $events) {
@@ -1082,7 +1171,7 @@ function Invoke-SuspectGapInvestigation {
                         }
                     }
 
-                    # Merge intervals
+                    # Merge overlapping intervals into a minimal set
                     if ($rawIntervals.Count -gt 1) {
                         $sorted = @($rawIntervals | Sort-Object FromTicks)
                         $merged = [System.Collections.Generic.List[object]]::new()
@@ -1123,7 +1212,7 @@ function Invoke-SuspectGapInvestigation {
                        "?api-version=2025-05-01"
 
                 while ($url) {
-                    $json = ArmGet $url
+                    $json = ArmGet $url $client
                     $doc = [System.Text.Json.JsonDocument]::Parse($json)
                     try {
                         $valEl = [System.Text.Json.JsonElement]::new()
@@ -1251,71 +1340,50 @@ function Invoke-SuspectGapInvestigation {
         }
 
         # ── Classify each suspect tick ────────────────────────────────
-        # Precedence: platform fault > activity log > health unknown/customer > 0% downtime > metric issue
-        $zeroSet = [System.Collections.Generic.HashSet[long]]::new()
-        foreach ($zt in @($c.ZeroTicksArray)) { [void]$zeroSet.Add([long]$zt) }
+        # Expands intervals into HashSets of minute-aligned ticks and classifies
+        # every suspect minute via compiled C# (GapProcessor). Precedence:
+        #   1. Platform fault (Resource Health)       → stays eligible, 0 available
+        #   2. Lifecycle activity (Activity Log)       → excluded from eligibility
+        #   3. Unknown / customer-initiated (Health)  → excluded from eligibility
+        #   4. Remaining null                          → metric issue, excluded
+        #   5. Remaining 0%                            → downtime, stays eligible
+        #   6. Remaining degraded (0% < v < 100%)     → trusted, stays eligible
+        $aFrom = [long[]]@($activityIntervals | ForEach-Object { $_.FromTicks })
+        $aTo   = [long[]]@($activityIntervals | ForEach-Object { $_.ToTicks })
+        $fFrom = [long[]]@($faultIntervals    | ForEach-Object { $_.FromTicks })
+        $fTo   = [long[]]@($faultIntervals    | ForEach-Object { $_.ToTicks })
+        $uFrom = [long[]]@($unknownIntervals  | ForEach-Object { $_.FromTicks })
+        $uTo   = [long[]]@($unknownIntervals  | ForEach-Object { $_.ToTicks })
+        $cFrom = [long[]]@($customerIntervals | ForEach-Object { $_.FromTicks })
+        $cTo   = [long[]]@($customerIntervals | ForEach-Object { $_.ToTicks })
+
+        $activityTickSet = [GapProcessor]::ExpandToTickSet($aFrom, $aTo)
+        $faultTickSet    = [GapProcessor]::ExpandToTickSet($fFrom, $fTo)
+        $unknownTickSet  = [GapProcessor]::ExpandToTickSet($uFrom, $uTo)
+        $customerTickSet = [GapProcessor]::ExpandToTickSet($cFrom, $cTo)
 
         $hcStartTicks = ([DateTimeOffset]$hcStart).UtcTicks
 
-        [int]$platformFaultGapMin = 0
-        [int]$unresolvedZeroDowntimeMin = 0
-        [int]$healthExplainedGapMin = 0
-        [int]$metricIssueNullMin = 0
-        [int]$activityLogExcludedGapMin = 0
-        [int]$customerExcusedDegradedMin = 0
-        [double]$customerExcusedDegradedAvail = 0.0
-        [int]$activityLogDegradedMin = 0
-        [int]$healthConfirmedDegradedMin = 0
-
-        foreach ($tick in @($c.AllGapTicks)) {
-            $tk = [long]$tick
-            $isZero      = $zeroSet.Contains($tk)
-            $inActivity  = InInterval $tk $activityIntervals
-            $inHCoverage = $healthHistoryApplied -and $tk -ge $hcStartTicks
-            $inFault     = $inHCoverage -and (InInterval $tk $faultIntervals)
-            $inUnknown   = $inHCoverage -and (InInterval $tk $unknownIntervals)
-            $inCustomer  = $inHCoverage -and (InInterval $tk $customerIntervals)
-
-            if     ($inFault)                    { $platformFaultGapMin++ }
-            elseif ($inActivity)                 { $activityLogExcludedGapMin++ }
-            elseif ($inCustomer -or $inUnknown)  { $healthExplainedGapMin++ }
-            elseif ($isZero)                     { $unresolvedZeroDowntimeMin++ }
-            else                                 { $metricIssueNullMin++ }
-        }
-
-        # Classify degraded samples
-        $dgTicks  = @($c.DegradedTicks)
-        $dgValues = @($c.DegradedValues)
-        for ($i = 0; $i -lt $dgTicks.Count; $i++) {
-            $tk = [long]$dgTicks[$i]
-            $dv = [double]$dgValues[$i]
-
-            $inActivity  = InInterval $tk $activityIntervals
-            $inHCoverage = $healthHistoryApplied -and $tk -ge $hcStartTicks
-            $inFault     = $inHCoverage -and (InInterval $tk $faultIntervals)
-            $inCustomer  = $inHCoverage -and (InInterval $tk $customerIntervals)
-
-            if ($inFault) {
-                $healthConfirmedDegradedMin++
-            } elseif ($inActivity -or $inCustomer) {
-                $customerExcusedDegradedMin++
-                $customerExcusedDegradedAvail += $dv
-                if ($inActivity) { $activityLogDegradedMin++ }
-            }
-        }
+        $cr = [GapProcessor]::ClassifyGaps(
+            [long[]]@($c.AllGapTicks),
+            [long[]]@($c.ZeroTicksArray),
+            [long[]]@($c.DegradedTicks),
+            [double[]]@($c.DegradedValues),
+            $activityTickSet, $faultTickSet, $unknownTickSet, $customerTickSet,
+            $healthHistoryApplied, $hcStartTicks)
 
         [PSCustomObject]@{
             ResourceId                        = $c.ResourceId
             HealthHistoryApplied              = $healthHistoryApplied
-            ActivityLogExcludedGapMinutes     = $activityLogExcludedGapMin
-            HealthExplainedGapMinutes         = $healthExplainedGapMin
-            MetricIssueNullMinutes            = $metricIssueNullMin
-            PlatformFaultGapMinutes           = $platformFaultGapMin
-            UnresolvedZeroDowntimeMinutes     = $unresolvedZeroDowntimeMin
-            CustomerExcusedDegradedMinutes    = $customerExcusedDegradedMin
-            CustomerExcusedDegradedAvailableSum = $customerExcusedDegradedAvail
-            ActivityLogDegradedMinutes        = $activityLogDegradedMin
-            HealthConfirmedDegradedMinutes    = $healthConfirmedDegradedMin
+            ActivityLogExcludedGapMinutes     = $cr.ActivityLogExcludedGapMin
+            HealthExplainedGapMinutes         = $cr.HealthExplainedGapMin
+            MetricIssueNullMinutes            = $cr.MetricIssueNullMin
+            PlatformFaultGapMinutes           = $cr.PlatformFaultGapMin
+            UnresolvedZeroDowntimeMinutes     = $cr.UnresolvedZeroDowntimeMin
+            CustomerExcusedDegradedMinutes    = $cr.CustomerExcusedDegradedMin
+            CustomerExcusedDegradedAvailableSum = $cr.CustomerExcusedDegradedAvail
+            ActivityLogDegradedMinutes        = $cr.ActivityLogDegradedMin
+            HealthConfirmedDegradedMinutes    = $cr.HealthConfirmedDegradedMin
         }
     } | ForEach-Object {
         $done++
@@ -1327,6 +1395,7 @@ function Invoke-SuspectGapInvestigation {
         }
     }
     Write-Progress -Activity 'Investigating suspect gaps' -Completed
+    $gapHttpClient.Dispose()
     $resultByRes
 }
 
@@ -1448,16 +1517,9 @@ $rawToken = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com').Toke
 $armToken = ($rawToken -is [securestring]) ? ($rawToken | ConvertFrom-SecureString -AsPlainText) : [string]$rawToken
 $rawToken = $null
 
-if ($Batch) {
-    $rawMetrics = (Get-AzAccessToken -ResourceUrl 'https://metrics.monitor.azure.com').Token
-    $metricsToken = ($rawMetrics -is [securestring]) ? ($rawMetrics | ConvertFrom-SecureString -AsPlainText) : [string]$rawMetrics
-    $rawMetrics = $null
-}
-
 Write-Host 'OK'
 Write-Host "Processing $($resolvedSubs.Count) subscription(s): $($resolvedSubs.Name -join ', ')"
 Write-Host "Kinds: $($Kinds -join ', ')"
-if ($Batch) { Write-Host "Mode: Batch (batch-size=$BatchSize)" }
 
 # Step 3: Query Resource Graph inventory
 Write-Host -NoNewline 'Querying resource inventory... '
@@ -1468,6 +1530,13 @@ $regionCount = @($resources | ForEach-Object { $_.Location } | Select-Object -Un
 Write-Host "Found $($resources.Count) resource(s) across $($resolvedSubs.Count) subscription(s), $regionCount region(s)."
 
 if ($resources.Count -eq 0) { Write-Host 'No resources found.'; return }
+
+if ($Batch) {
+    $rawMetrics = (Get-AzAccessToken -ResourceUrl 'https://metrics.monitor.azure.com').Token
+    $metricsToken = ($rawMetrics -is [securestring]) ? ($rawMetrics | ConvertFrom-SecureString -AsPlainText) : [string]$rawMetrics
+    $rawMetrics = $null
+    Write-Host "Mode: Batch (batch-size=$BatchSize)"
+}
 
 # Step 4: Build initial eligibility records (all minutes start as eligible)
 $eligByRes = @{}
@@ -1533,7 +1602,12 @@ if ($suspectCandidates.Count -gt 0) {
         -HealthCoverageStart $healthCoverageStart
 }
 
-# Step 7: Assemble final results — apply investigation outcomes and zero-tx exclusions
+# Step 7: Assemble final results
+# Wires investigation outcomes into each resource's eligibility record:
+#   - Subtracts excused minutes from EligibleMinutes
+#   - Computes AvailableMinutes, ConfirmedDowntimeMinutes, UnexplainedSuspectMinutes
+#   - Excludes zero-transaction storage minutes from eligibility
+#   - Prints per-resource classification narration
 foreach ($res in $resources) {
     $key  = $res.ResourceId.ToLowerInvariant()
     $elig = $eligByRes[$key]
@@ -1562,7 +1636,8 @@ foreach ($res in $resources) {
     if ($gc) {
         $totalSuspectMinutes = $mr.SuspectMinutes
 
-        # Count suspect gaps for narration
+        # Count contiguous suspect gaps for narration by sorting all suspect
+        # ticks and counting boundaries where consecutive ticks are >1 min apart.
         $allSuspectTicks = [System.Collections.Generic.List[long]]::new()
         foreach ($t in @($mr.GapTicks))       { $allSuspectTicks.Add([long]$t) }
         foreach ($t in @($mr.ZeroAvailTicks))  { $allSuspectTicks.Add([long]$t) }
