@@ -18,10 +18,15 @@
 // remaining 0% minutes are trusted as downtime. Remaining positive degraded datapoints
 // stay as degraded availability.
 //
+// When --workspace is specified, Activity Log lifecycle events are fetched from a
+// Log Analytics workspace via a single bulk KQL query instead of per-resource REST
+// API calls. Resource Health uses a hybrid approach: Log Analytics transitions cover
+// the period beyond the REST API's ~30-day retention, while REST API transitions
+// (curated, with retroactively corrected causes) are authoritative for the last
+// ~30 days. The two sources are merged to produce complete coverage.
+//
 // The observation window is a UTC calendar month selected via --month YYYYMM.
-// Current month runs month-to-date; past months run full-month. Metrics and
-// Activity Log can later support periods beyond 30 days, while Resource Health
-// is still applied only for the overlap with its retained history.
+// Current month runs month-to-date; past months run full-month.
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -35,7 +40,8 @@ using GetAvailability.Services;
 
 // ── CLI argument parsing ─────────────────────────────────────────────────────
 // Supports: --subscriptions (required), --month (required), --kinds,
-//           --resource, --parallelism, --activity-grace-minutes, --help
+//           --resource, --parallelism, --activity-grace-minutes,
+//           --batch, --batch-size, --workspace, --help
 
 string[] subscriptionNames = [];
 string[] kinds = ["vm", "sql", "storage"];
@@ -45,6 +51,7 @@ int parallelism = Math.Clamp(Environment.ProcessorCount, 4, 16);
 int activityGraceMinutes = 10;
 bool useBatch = false;
 int batchSize = 10;
+string? workspace = null;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -76,6 +83,11 @@ for (int i = 0; i < args.Length; i++)
             if (batchSize > 50) throw new ArgumentException("--batch-size must be <= 50.");
             useBatch = true;
             break;
+        case "--workspace" or "-w":
+            workspace = ReadRequiredValue(args, ref i, "--workspace");
+            if (!Guid.TryParse(workspace, out _))
+                throw new ArgumentException("--workspace must be a valid GUID.");
+            break;
         case "--version" or "-v":
             Console.WriteLine($"GetAvailability {typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"}");
             return 0;
@@ -89,6 +101,8 @@ for (int i = 0; i < args.Length; i++)
             Console.WriteLine("  --activity-grace-minutes, -g  Post-operation grace window for supported Activity Log lifecycle events (default: 10).");
             Console.WriteLine("  --batch, -b          Use the regional Metrics Batch API instead of per-resource calls.");
             Console.WriteLine("  --batch-size         Max resources per batch call (default: 10, max: 50). Implies --batch.");
+            Console.WriteLine("  --workspace, -w      Log Analytics workspace ID (GUID). Fetches Activity Log via bulk KQL;");
+            Console.WriteLine("                       Resource Health uses hybrid approach (KQL for older + REST for last ~30 days).");
             Console.WriteLine("  --version, -v        Print version and exit.");
             return 0;
     }
@@ -108,7 +122,7 @@ if (string.IsNullOrWhiteSpace(monthParameter))
 
 try
 {
-    await RunAsync(subscriptionNames, kinds, resourceName, monthParameter, parallelism, activityGraceMinutes, useBatch, batchSize);
+    await RunAsync(subscriptionNames, kinds, resourceName, monthParameter, parallelism, activityGraceMinutes, useBatch, batchSize, workspace);
     return 0;
 }
 catch (Exception ex) when (ex is AuthenticationFailedException or CredentialUnavailableException)
@@ -132,20 +146,27 @@ static async Task RunAsync(
     int parallelism,
     int activityGraceMinutes,
     bool useBatch,
-    int batchSize)
+    int batchSize,
+    string? workspace)
 {
     var sw = Stopwatch.StartNew();
 
     var (utcStart, utcEnd, normalizedMonth, isMonthToDate) = ResolveObservationWindow(monthParameter);
     int totalMinutes = (int)(utcEnd - utcStart).TotalMinutes;
-    var healthCoverageStart = ResourceHealthService.GetHealthCoverageStart(utcStart);
+    bool useLogAnalytics = workspace is not null;
+    var healthCoverageStart = ResourceHealthService.GetHealthCoverageStart(utcStart, useLogAnalytics);
     int healthCoveredMinutes = healthCoverageStart < utcEnd
         ? (int)(utcEnd - healthCoverageStart).TotalMinutes
         : 0;
 
     string periodLabel = isMonthToDate ? $"month {normalizedMonth} (month-to-date)" : $"month {normalizedMonth}";
     Console.WriteLine($"Period: {periodLabel} ({utcStart:u} -> {utcEnd:u}, {totalMinutes} min)");
-    if (healthCoverageStart > utcStart && healthCoveredMinutes > 0)
+
+    if (useLogAnalytics)
+    {
+        Console.WriteLine($"Log Analytics workspace: {workspace} (Activity Log via KQL, Resource Health via KQL + REST API hybrid)");
+    }
+    else if (healthCoverageStart > utcStart && healthCoveredMinutes > 0)
     {
         Console.WriteLine(
             $"WARNING: Resource Health history covers only part of this period ({healthCoverageStart:u} -> {utcEnd:u}, {healthCoveredMinutes} of {totalMinutes} min). Earlier minutes will use Activity Log and metric fallback rules.");
@@ -208,6 +229,9 @@ static async Task RunAsync(
     // Step 5: For resources with suspect metric minutes, investigate null/0% suspect minutes and
     // positive degraded datapoints. Activity Log is checked first for supported lifecycle actions,
     // then Resource Health is applied where still retained.
+    // Build the candidate list: each entry carries the resource, its combined null+zero tick array,
+    // a HashSet of zero-valued ticks (for O(1) null-vs-zero discrimination during classification),
+    // and any degraded samples (0% < value < 100%).
     var suspectCandidates = new List<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks, MetricValueSample[]? DegradedSamples)>();
     foreach (var res in resources)
     {
@@ -227,15 +251,32 @@ static async Task RunAsync(
 
     ConcurrentDictionary<string, SuspectGapClassification>? suspectResults = null;
     if (suspectCandidates.Count > 0)
+    {
+        // When -Workspace is specified, bulk-fetch Activity Log + Resource Health data
+        // from Log Analytics before starting per-resource investigation.
+        Dictionary<string, LogAnalyticsResourceData>? laData = null;
+        if (workspace is not null)
+        {
+            Console.Write("Fetching Activity Log + Resource Health history from Log Analytics... ");
+            laData = await LogAnalyticsService.FetchAsync(
+                credential, workspace, subIds, utcStart, utcEnd);
+        }
+
         suspectResults = await ResourceHealthService.InvestigateSuspectGapsAsync(
             credential,
             suspectCandidates,
             utcStart,
             utcEnd,
             parallelism,
-            activityGraceMinutes);
+            activityGraceMinutes,
+            laData);
+    }
 
-    // Step 6: Assemble final results — apply suspect-gap investigation outcomes and zero-tx storage exclusions
+    // Step 6: Assemble final results — apply suspect-gap investigation outcomes and zero-tx storage exclusions.
+    // For each resource, print per-resource classification narration (suspect count, Activity Log matches,
+    // Health History outcomes, eligibility adjustments) and compute the final availability figures:
+    //   SuspectMinutes, ConfirmedDowntimeMinutes, ExcusedMinutes, UnexplainedSuspectMinutes,
+    //   AvailableMinutes, EligibleMinutes, AvailabilityPct.
     foreach (var res in resources)
     {
         var key = res.ResourceId.ToLowerInvariant();
@@ -255,7 +296,8 @@ static async Task RunAsync(
                 continue;
             }
 
-            // Apply suspect-gap investigation results
+            // Apply suspect-gap investigation results: walk through each classification bucket
+            // and subtract excused/explained minutes from eligibility, accumulate counters.
             int activityLogExcludedGapMinutes = 0;
             int healthExplainedGapMinutes = 0;
             int metricIssueNullMinutes = 0;
@@ -338,6 +380,8 @@ static async Task RunAsync(
                 }
             }
 
+            // Compute downtime and unresolved counters from investigation results.
+            // ConfirmedDowntime = platform faults (gap + degraded); Unresolved = zero-downtime + remaining degraded.
             int confirmedHealthDowntimeMinutes = 0;
             int unexplainedPositiveDegradedMinutes = mr.DegradedMinutes;
             int unexplainedSuspectMinutes = mr.SuspectMinutes;

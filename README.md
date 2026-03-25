@@ -62,6 +62,7 @@ If Azure authentication fails, the tool prints the SDK/module exception message 
 | `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for Activity Log lifecycle events |
 | `--batch` | `-b` | off | Use the regional Metrics Batch API instead of per-resource calls |
 | `--batch-size` | | `10` | Max resources per batch call (1–50); implies `--batch` |
+| `--workspace` | `-w` | *(none)* | Log Analytics workspace ID (GUID). Fetches Activity Log via bulk KQL; Resource Health uses hybrid approach (KQL for older + REST for last ~30 days) |
 | `--version` | `-v` | | Print version and exit |
 
 **PowerShell (`get-availability.ps1`):**
@@ -76,9 +77,10 @@ If Azure authentication fails, the tool prints the SDK/module exception message 
 | `-ActivityGraceMinutes` | `10` | Post-operation grace window for Activity Log lifecycle events |
 | `-Batch` | off | Use the regional Metrics Batch API instead of per-resource calls |
 | `-BatchSize` | `10` | Max resources per batch call (1–50); implies `-Batch` |
+| `-Workspace` | *(none)* | Log Analytics workspace ID (GUID). Fetches Activity Log lifecycle events from the workspace via a single bulk KQL query (faster for large estates). Resource Health uses a hybrid approach: KQL transitions cover the period beyond the REST API's ~30-day retention, while REST API transitions (curated, with corrected causes) are authoritative for the last ~30 days. Provides complete Resource Health coverage across the full observation window. |
 | `-Version` | | Print version and exit |
 
-The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the current ~30-day retention window.
+The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the ~30-day REST API retention window. When `-Workspace` / `--workspace` is used, Health History coverage extends to the full observation period via a hybrid approach (Log Analytics for older transitions + REST API for the last ~30 days).
 
 ### Examples
 
@@ -101,6 +103,9 @@ dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/p
 # Batch API with custom batch size
 ./GetAvailability --subscriptions Contoso-Production Contoso-Development --month 202603 --batch-size 20
 
+# Use Log Analytics for Activity Log + Resource Health (faster, extended retention)
+./GetAvailability --subscriptions Contoso-Production --month 202603 --workspace b233a4b7-3c43-433c-ac60-1f6ff217ddd4
+
 # Run directly without publishing
 cd csharp/GetAvailability
 dotnet run -- --subscriptions Contoso-Production --month 202603
@@ -121,6 +126,9 @@ dotnet run -- --subscriptions Contoso-Production --month 202603
 # Batch API with custom batch size
 ./get-availability.ps1 -Subscriptions 'Contoso-Production','Contoso-Development' -Month 202603 -BatchSize 20
 
+# Use Log Analytics for Activity Log + Resource Health (faster, extended retention)
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -Workspace 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
+
 # Pipe results to CSV
 ./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
 ```
@@ -137,6 +145,12 @@ If the observation window extends beyond the Resource Health retention window, a
 
 ```
 WARNING: Resource Health history covers only part of this period (2026-02-16 18:54:00Z -> 2026-03-01 00:00:00Z, 17586 of 40320 min). Earlier minutes will use Activity Log and metric fallback rules.
+```
+
+When `-Workspace` is used, the 30-day warning is suppressed (hybrid coverage applies) and an informational line is printed:
+
+```
+Log Analytics workspace: b233a4b7-…-1f6ff217ddd4 (Activity Log via KQL, Resource Health via KQL + REST API hybrid)
 ```
 
 Table view (Kind is abbreviated: VM, SQL, Storage):
@@ -194,14 +208,19 @@ Any minute with `null` or a value below `100%` is a **suspect minute**. Contiguo
 
 For every resource with suspect minutes, the tool investigates each minute with the following precedence:
 
-**1. Activity Log** — For supported resource kinds, the [Activity Log REST API](https://learn.microsoft.com/azure/azure-monitor/platform/rest-activity-log#retrieve-activity-log-data) is queried for lifecycle operations that represent deliberate administrative action:
+**1. Activity Log** — For supported resource kinds, lifecycle operations representing deliberate administrative action are checked:
 
 - **VMs**: `start/action`, `deallocate/action`, `powerOff/action`, `restart/action`
 - **SQL DBs**: `pause`, `resume`
 
 Matching minutes are treated as customer/admin lifecycle activity and removed from eligibility. A configurable grace window (`--activity-grace-minutes`, default 10) extends these intervals to cover trailing transition datapoints.
 
-**2. Health History** — For the portion of the window covered by the ~30-day [Resource Health retention](https://learn.microsoft.com/en-us/azure/service-health/resource-health-overview), the [Resource Health REST API](https://learn.microsoft.com/en-us/rest/api/resourcehealth/availability-statuses/list?view=rest-resourcehealth-2025-05-01) (`availabilityStatuses`, API version `2025-05-01`) is queried. Transitions are converted into three interval types:
+**2. Health History** — Resource Health transitions are converted into three interval types (below). Two data source modes are supported:
+
+- **REST API only** (default, no `-Workspace`): The [Activity Log REST API](https://learn.microsoft.com/azure/azure-monitor/platform/rest-activity-log#retrieve-activity-log-data) and the [Resource Health REST API](https://learn.microsoft.com/en-us/rest/api/resourcehealth/availability-statuses/list?view=rest-resourcehealth-2025-05-01) (`availabilityStatuses`, API version `2025-05-01`) are queried per-resource. Resource Health API has a ~30-day retention limit.
+- **Hybrid: Log Analytics + REST API** (`-Workspace` / `--workspace`): A single bulk KQL query against the `AzureActivity` table fetches Activity Log lifecycle events and Resource Health transitions for all resources at once (faster for large estates: 1 query vs. thousands of REST calls). Resource Health transitions older than the REST API's ~30-day retention cutoff come from Log Analytics (workspace retention, typically 365 days). For the last ~30 days, the REST API is always queried and its transitions take precedence — REST data is authoritative because it provides curated synthetic entries that fill coverage gaps between health incidents and retroactively corrects cause classification. The two sources are merged chronologically to form a complete health timeline. Requires the target subscriptions to have diagnostic settings sending Activity Log data to the specified workspace.
+
+Health transition interval types:
 
 - **Fault** (`Unavailable` / `Degraded`) — confirmed platform issues
 - **Unknown** — Azure cannot determine health (typically a monitoring gap, not an outage)

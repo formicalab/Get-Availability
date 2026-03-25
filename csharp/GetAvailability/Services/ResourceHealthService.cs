@@ -19,9 +19,11 @@ namespace GetAvailability.Services;
 ///   5. Remaining 0% minutes are treated as downtime.
 ///   6. Remaining positive degraded datapoints stay as degraded availability.
 ///
-/// Resource Health is only available for the overlap with the current 30-day retention
-/// window. This service is structured so older observation periods can later skip the
-/// health-history step while still using Activity Log and metric-based fallbacks.
+/// When Log Analytics data is provided (hybrid mode), Activity Log events come from the
+/// pre-fetched LA data and Resource Health uses a hybrid merge: LA transitions older than
+/// the REST API's ~30-day retention cutoff are combined with REST API transitions (which
+/// are authoritative for the last ~30 days due to curated synthetic entries and retroactive
+/// cause correction). Without LA data, both sources use REST APIs directly.
 /// </summary>
 public static class ResourceHealthService
 {
@@ -29,7 +31,7 @@ public static class ResourceHealthService
     /// For resources with suspect metric minutes, investigates null/0% suspect minutes plus
     /// positive degraded datapoints. Activity Log is gathered first for supported kinds, then
     /// Resource Health is consulted for the portion of the observation window still within the
-    /// current 30-day retention window.
+    /// current retention window (full period when using Log Analytics hybrid mode, ~30 days otherwise).
     /// Returns a dictionary keyed by lowercase resource ID.
     /// </summary>
     public static async Task<ConcurrentDictionary<string, SuspectGapClassification>> InvestigateSuspectGapsAsync(
@@ -38,7 +40,8 @@ public static class ResourceHealthService
         DateTimeOffset periodStart,
         DateTimeOffset periodEnd,
         int parallelism,
-        int activityGraceMinutes)
+        int activityGraceMinutes,
+        Dictionary<string, LogAnalyticsResourceData>? laData = null)
     {
         Console.WriteLine($"Investigating suspect gaps for {candidates.Count} resource(s)...");
 
@@ -47,6 +50,9 @@ public static class ResourceHealthService
 
         using var http = new HttpClient();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+
+        bool useLogAnalytics = laData is not null;
+        var restCutoff = GetRestHealthCutoff();
 
         var results = new ConcurrentDictionary<string, SuspectGapClassification>(StringComparer.OrdinalIgnoreCase);
         int done = 0;
@@ -57,6 +63,10 @@ public static class ResourceHealthService
             async (candidate, ct) =>
             {
                 var (res, allGapTicks, zeroTicks, degradedSamples) = candidate;
+                var resKey = res.ResourceId.ToLowerInvariant();
+                LogAnalyticsResourceData? resLaData = null;
+                laData?.TryGetValue(resKey, out resLaData);
+
                 var classification = await ClassifySuspectGapsAsync(
                     http,
                     res,
@@ -66,8 +76,11 @@ public static class ResourceHealthService
                     periodStart,
                     periodEnd,
                     activityGraceMinutes,
+                    useLogAnalytics,
+                    resLaData,
+                    restCutoff,
                     ct);
-                results[res.ResourceId.ToLowerInvariant()] = classification;
+                results[resKey] = classification;
 
                 int current = Interlocked.Increment(ref done);
                 if (current % 10 == 0 || current == total)
@@ -81,6 +94,8 @@ public static class ResourceHealthService
     /// <summary>
     /// Fetches lifecycle activity and health history for a single resource, then classifies
     /// each suspect minute using the precedence documented on the class.
+    /// When Log Analytics data is available, uses pre-fetched activity events and merges
+    /// LA health transitions (pre-cutoff) with REST API transitions (post-cutoff).
     /// </summary>
     private static async Task<SuspectGapClassification> ClassifySuspectGapsAsync(
         HttpClient http,
@@ -91,6 +106,9 @@ public static class ResourceHealthService
         DateTimeOffset periodStart,
         DateTimeOffset periodEnd,
         int activityGraceMinutes,
+        bool useLogAnalytics,
+        LogAnalyticsResourceData? resLaData,
+        DateTimeOffset restCutoff,
         CancellationToken ct)
     {
         var activityIntervals = new List<(DateTimeOffset From, DateTimeOffset To)>();
@@ -99,13 +117,27 @@ public static class ResourceHealthService
         {
             try
             {
-                activityIntervals = await ActivityLogService.BuildLifecycleIntervalsAsync(
-                    http,
-                    resource,
-                    periodStart,
-                    periodEnd,
-                    activityGraceMinutes,
-                    ct);
+                if (resLaData is not null && resLaData.ActivityEvents.Count > 0)
+                {
+                    // Log Analytics path: use pre-fetched events
+                    activityIntervals = ActivityLogService.BuildLifecycleIntervalsFromEvents(
+                        resLaData.ActivityEvents,
+                        resource.Kind,
+                        periodStart,
+                        periodEnd,
+                        activityGraceMinutes);
+                }
+                else if (!useLogAnalytics)
+                {
+                    // REST API path (no -Workspace)
+                    activityIntervals = await ActivityLogService.BuildLifecycleIntervalsAsync(
+                        http,
+                        resource,
+                        periodStart,
+                        periodEnd,
+                        activityGraceMinutes,
+                        ct);
+                }
             }
             catch (Exception ex)
             {
@@ -113,7 +145,7 @@ public static class ResourceHealthService
             }
         }
 
-        var healthCoverageStart = GetHealthCoverageStart(periodStart);
+        var healthCoverageStart = GetHealthCoverageStart(periodStart, useLogAnalytics);
         bool healthHistoryApplied = healthCoverageStart < periodEnd;
 
         List<HealthTransition> transitions = [];
@@ -121,7 +153,24 @@ public static class ResourceHealthService
         {
             try
             {
-                transitions = await FetchHealthHistoryAsync(http, resource.ResourceId, ct);
+                // In hybrid mode, add LA health transitions older than the REST cutoff
+                if (resLaData is not null && resLaData.HealthTransitions.Count > 0)
+                {
+                    foreach (var ht in resLaData.HealthTransitions)
+                    {
+                        if (ht.OccurredOn < restCutoff)
+                            transitions.Add(ht);
+                    }
+                }
+
+                // REST API health transitions: sole source without -Workspace;
+                // covers last ~30 days with curated authoritative data in hybrid mode.
+                var restTransitions = await FetchHealthHistoryAsync(http, resource.ResourceId, ct);
+                transitions.AddRange(restTransitions);
+
+                // Sort chronologically (REST returns newest-first → already reversed,
+                // but merge with LA data requires re-sorting)
+                transitions.Sort((a, b) => a.OccurredOn.CompareTo(b.OccurredOn));
             }
             catch (Exception ex)
             {
@@ -221,12 +270,30 @@ public static class ResourceHealthService
             healthConfirmedDegradedMin);
     }
 
-    public static DateTimeOffset GetHealthCoverageStart(DateTimeOffset periodStart)
+    /// <summary>
+    /// Returns the effective start of the Resource Health coverage window.
+    /// When using Log Analytics (hybrid mode), coverage extends to periodStart.
+    /// Without Log Analytics, coverage is limited to ~30 days.
+    /// </summary>
+    public static DateTimeOffset GetHealthCoverageStart(DateTimeOffset periodStart, bool useLogAnalytics = false)
     {
+        if (useLogAnalytics) return periodStart;
         var now = DateTimeOffset.UtcNow;
         var currentMinute = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, TimeSpan.Zero);
         var retentionStart = currentMinute.AddDays(-30);
         return retentionStart > periodStart ? retentionStart : periodStart;
+    }
+
+    /// <summary>
+    /// Returns the REST API Resource Health retention cutoff (~30 days from now).
+    /// In hybrid mode, LA transitions older than this cutoff are kept and REST
+    /// transitions supplement the last ~30 days with authoritative curated data.
+    /// </summary>
+    public static DateTimeOffset GetRestHealthCutoff()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var currentMinute = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, TimeSpan.Zero);
+        return currentMinute.AddDays(-30);
     }
 
     private static bool IsInInterval(long tick, List<(DateTimeOffset From, DateTimeOffset To)> intervals)
@@ -460,8 +527,8 @@ public static class ResourceHealthService
         || t.HealthEventCause.Equals("UserInitiated", StringComparison.OrdinalIgnoreCase);
 }
 
-/// <summary>Parsed health status transition from the Resource Health API.</summary>
-internal readonly record struct HealthTransition(
+/// <summary>Parsed health status transition from the Resource Health API or Log Analytics.</summary>
+public readonly record struct HealthTransition(
     DateTimeOffset OccurredOn,
     string State,
     string ReasonType,

@@ -53,7 +53,41 @@ public static class ActivityLogService
         => TryGetActivityLogRules(resourceKind, out _);
 
     /// <summary>
-    /// Builds merged lifecycle intervals for a supported resource kind from Activity Log events.
+    /// Builds merged lifecycle intervals from pre-fetched Log Analytics activity events.
+    /// Used when -Workspace is specified, replacing REST API calls with bulk KQL data.
+    /// </summary>
+    public static List<(DateTimeOffset From, DateTimeOffset To)> BuildLifecycleIntervalsFromEvents(
+        IReadOnlyList<LogAnalyticsActivityEvent> laEvents,
+        string resourceKind,
+        DateTimeOffset periodStart,
+        DateTimeOffset periodEnd,
+        int activityGraceMinutes)
+    {
+        if (!TryGetActivityLogRules(resourceKind, out var activityRules))
+            return [];
+
+        var events = new List<ActivityLogEvent>();
+        foreach (var laEvt in laEvents)
+        {
+            if (!TryMatchActivityOperation(laEvt.OperationName, activityRules, activityGraceMinutes, out int graceMinutes))
+                continue;
+
+            events.Add(new ActivityLogEvent(
+                laEvt.Timestamp.ToUniversalTime(),
+                laEvt.OperationName,
+                laEvt.CorrelationId,
+                graceMinutes));
+        }
+
+        if (events.Count == 0)
+            return [];
+
+        return BuildIntervalsFromEvents(events, periodStart, periodEnd);
+    }
+
+    /// <summary>
+    /// Builds merged lifecycle intervals for a supported resource kind from Activity Log events
+    /// fetched via the REST API.
     /// </summary>
     public static async Task<List<(DateTimeOffset From, DateTimeOffset To)>> BuildLifecycleIntervalsAsync(
         HttpClient http,
@@ -77,6 +111,19 @@ public static class ActivityLogService
         if (events.Count == 0)
             return [];
 
+        return BuildIntervalsFromEvents(events, periodStart, periodEnd);
+    }
+
+    /// <summary>
+    /// Builds merged lifecycle intervals from a list of parsed activity events.
+    /// Groups events by operation+correlationId, computes per-group intervals with
+    /// grace windows, clamps to the observation period, and merges overlaps.
+    /// </summary>
+    private static List<(DateTimeOffset From, DateTimeOffset To)> BuildIntervalsFromEvents(
+        List<ActivityLogEvent> events,
+        DateTimeOffset periodStart,
+        DateTimeOffset periodEnd)
+    {
         var rawIntervals = new List<(DateTimeOffset From, DateTimeOffset To)>();
 
         foreach (var group in events.GroupBy(BuildActivityGroupKey, StringComparer.OrdinalIgnoreCase))
