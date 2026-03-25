@@ -306,7 +306,8 @@ let healthData = AzureActivity
     | where CategoryValue == 'ResourceHealth'
     | where ResourceProviderValue in ('MICROSOFT.COMPUTE', 'MICROSOFT.SQL', 'MICROSOFT.STORAGE')
     | project TimeGenerated, ResourceId=tolower(_ResourceId),
-              Source='Health', Properties=todynamic(Properties);
+              Source='Health', OperationName=OperationNameValue,
+              Properties=todynamic(Properties);
 actData | union healthData
 "@
 
@@ -344,6 +345,7 @@ actData | union healthData
 
     # Build per-resource data
     $dataByRes = @{}
+    $rawHealthEvents = @{}
 
     foreach ($row in $rows) {
         $resId = [string]$row[$iResId]
@@ -376,42 +378,157 @@ actData | union healthData
             } else { $null }
 
             if ($props) {
-                # Resource Health properties in AzureActivity use different
-                # field names than the REST API.  Map them to the same model
-                # used by the direct-API path.
                 $state = ''
-                $reasonType = ''
-                $context = ''
-                $healthEventCause = ''
-
-                # Availability state
                 if ($props.PSObject.Properties['currentHealthStatus']) {
                     $state = [string]$props.currentHealthStatus
                 } elseif ($props.PSObject.Properties['availabilityState']) {
                     $state = [string]$props.availabilityState
                 }
 
-                # Reason / cause
+                $rawCause = ''
                 if ($props.PSObject.Properties['cause']) {
-                    $reasonType = [string]$props.cause
-                    # Map LA field values to REST API equivalents
-                    if ($reasonType -eq 'UserInitiated') { $reasonType = 'Customer Initiated' }
-                    elseif ($reasonType -eq 'PlatformInitiated') { $reasonType = 'Platform Initiated' }
-                }
-                if ($props.PSObject.Properties['context']) {
-                    $context = [string]$props.context
-                }
-                if ($props.PSObject.Properties['healthEventCause']) {
-                    $healthEventCause = [string]$props.healthEventCause
+                    $rawCause = [string]$props.cause
                 }
 
-                $entry.HealthTransitions.Add([PSCustomObject]@{
-                    OccurredOn       = $ts
-                    State            = $state
-                    ReasonType       = $reasonType
-                    Context          = $context
-                    HealthEventCause = $healthEventCause
-                })
+                if ($state) {
+                    # Determine operation type from OperationNameValue
+                    $opName = [string]$row[$iOp]
+                    $opType = if ($opName -match '/Activated/') { 'Activated' }
+                              elseif ($opName -match '/Resolved/')  { 'Resolved' }
+                              elseif ($opName -match '/InProgress/') { 'InProgress' }
+                              else { 'Updated' }
+
+                    if (-not $rawHealthEvents.ContainsKey($resId)) {
+                        $rawHealthEvents[$resId] = [System.Collections.Generic.List[object]]::new()
+                    }
+                    $rawHealthEvents[$resId].Add([PSCustomObject]@{
+                        Timestamp     = $ts
+                        State         = $state
+                        RawCause      = $rawCause
+                        OperationType = $opType
+                    })
+                }
+            }
+        }
+    }
+
+    # ── Post-process health events into clean, incident-based transitions ──
+    # AzureActivity ResourceHealth events include lifecycle events (Activated,
+    # Updated, InProgress, Resolved) for each health incident.  Multiple events
+    # per incident create spurious transitions and the initial Activated event
+    # always has cause=Unknown (cause is determined later via Updated events).
+    # The REST API retroactively applies the final cause to the entire incident.
+    # This post-processing replicates that behaviour:
+    # 1. Only create transitions when the health state actually changes.
+    # 2. Track incidents (Activated/InProgress → Resolved) and collect the
+    #    latest non-Unknown cause within each incident.
+    # 3. On Resolved, retroactively apply the final cause to all transitions
+    #    in that incident.
+    # 4. Skip orphan Updated events outside any incident (stale events).
+    foreach ($resId in $rawHealthEvents.Keys) {
+        if (-not $dataByRes.ContainsKey($resId)) { continue }
+        $entry = $dataByRes[$resId]
+        $sorted = $rawHealthEvents[$resId] | Sort-Object Timestamp
+
+        $trackedState = 'Available'
+        $lastTransition = $null
+        $inIncident = $false
+        $incidentTransitions = [System.Collections.Generic.List[object]]::new()
+        $incidentCause = ''
+
+        foreach ($evt in $sorted) {
+            $st   = $evt.State
+            $rc   = $evt.RawCause
+            $op   = $evt.OperationType
+
+            # Open incident on Activated or InProgress
+            if (($op -eq 'Activated' -or $op -eq 'InProgress') -and -not $inIncident) {
+                $inIncident = $true
+                $incidentTransitions = [System.Collections.Generic.List[object]]::new()
+                $incidentCause = ''
+            }
+
+            # Track the latest non-Unknown cause within the incident
+            if ($inIncident -and $rc -and $rc -ne 'Unknown') {
+                $incidentCause = $rc
+            }
+
+            # Skip orphan Updated events (stale / out-of-incident)
+            if ($op -ne 'Activated' -and $op -ne 'InProgress' -and
+                $op -ne 'Resolved' -and -not $inIncident) {
+                continue
+            }
+
+            # Only create a transition when the state actually changes
+            if ($st -ne $trackedState) {
+                $mapped = switch ($rc) {
+                    'UserInitiated'     { 'Customer Initiated' }
+                    'PlatformInitiated' { 'Platform Initiated' }
+                    default { '' }
+                }
+                $transition = [PSCustomObject]@{
+                    OccurredOn       = $evt.Timestamp
+                    State            = $st
+                    ReasonType       = $mapped
+                    Context          = if ($rc -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
+                    HealthEventCause = if ($rc -eq 'UserInitiated') { 'UserInitiated' } else { '' }
+                }
+                $entry.HealthTransitions.Add($transition)
+                $trackedState = $st
+                $lastTransition = $transition
+
+                if ($inIncident -and $st -ne 'Available') {
+                    $incidentTransitions.Add($transition)
+                }
+            }
+            else {
+                # Same state — update cause on last transition if more specific
+                if ($lastTransition -and $rc -and $rc -ne 'Unknown' -and
+                    $lastTransition.ReasonType -in @('', 'Unknown')) {
+                    $mapped = switch ($rc) {
+                        'UserInitiated'     { 'Customer Initiated' }
+                        'PlatformInitiated' { 'Platform Initiated' }
+                        default { $rc }
+                    }
+                    $lastTransition.ReasonType       = $mapped
+                    $lastTransition.Context          = if ($rc -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
+                    $lastTransition.HealthEventCause = if ($rc -eq 'UserInitiated') { 'UserInitiated' } else { '' }
+                }
+            }
+
+            # Close incident on Resolved — retroactively apply final cause
+            if ($op -eq 'Resolved') {
+                if ($incidentCause -and $incidentCause -ne 'Unknown' -and
+                    $incidentTransitions.Count -gt 0) {
+                    $mapped = switch ($incidentCause) {
+                        'UserInitiated'     { 'Customer Initiated' }
+                        'PlatformInitiated' { 'Platform Initiated' }
+                        default { $incidentCause }
+                    }
+                    foreach ($t in $incidentTransitions) {
+                        $t.ReasonType       = $mapped
+                        $t.Context          = if ($incidentCause -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
+                        $t.HealthEventCause = if ($incidentCause -eq 'UserInitiated') { 'UserInitiated' } else { '' }
+                    }
+                }
+                $inIncident = $false
+                $incidentTransitions = [System.Collections.Generic.List[object]]::new()
+                $incidentCause = ''
+            }
+        }
+
+        # Handle open incident at end of event stream
+        if ($inIncident -and $incidentTransitions.Count -gt 0 -and
+            $incidentCause -and $incidentCause -ne 'Unknown') {
+            $mapped = switch ($incidentCause) {
+                'UserInitiated'     { 'Customer Initiated' }
+                'PlatformInitiated' { 'Platform Initiated' }
+                default { $incidentCause }
+            }
+            foreach ($t in $incidentTransitions) {
+                $t.ReasonType       = $mapped
+                $t.Context          = if ($incidentCause -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
+                $t.HealthEventCause = if ($incidentCause -eq 'UserInitiated') { 'UserInitiated' } else { '' }
             }
         }
     }
