@@ -1303,7 +1303,7 @@ function Invoke-SuspectGapInvestigation {
                             GraceMinutes  = $eventGrace
                         })
                     }
-                } elseif (-not $resLaData) {
+                } elseif (-not $laData) {
                     # ── REST API path (original) ──────────────────────
                     $filter = "eventTimestamp ge '$($pStart.ToString('O'))' and eventTimestamp le '$($pEnd.ToString('O'))' and resourceUri eq '$($c.ResourceId)'"
                     $select = 'eventTimestamp,operationName,correlationId,status'
@@ -1444,7 +1444,7 @@ function Invoke-SuspectGapInvestigation {
                     foreach ($ht in $resLaData.HealthTransitions) {
                         $transitions.Add($ht)
                     }
-                } elseif (-not $resLaData) {
+                } elseif (-not $laData) {
                     # ── REST API path (original) ─────────────────────────
                     $url = "https://management.azure.com$($c.ResourceId)" +
                            "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
