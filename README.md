@@ -62,9 +62,8 @@ If Azure authentication fails, the tool prints the SDK/module exception message 
 | `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for Activity Log lifecycle events |
 | `--batch` | `-b` | off | Use the regional Metrics Batch API instead of per-resource calls |
 | `--batch-size` | | `10` | Max resources per batch call (1–50); implies `--batch` |
+| `--workspace` | `-w` | *(none)* | Log Analytics workspace ID (GUID). Fetches Activity Log via bulk KQL; Resource Health uses hybrid approach (KQL for older + REST for last ~30 days) |
 | `--version` | `-v` | | Print version and exit |
-
-> **Note:** The `-Workspace` / `--workspace` option is currently available in the PowerShell version only. C# support is planned.
 
 **PowerShell (`get-availability.ps1`):**
 
@@ -81,7 +80,7 @@ If Azure authentication fails, the tool prints the SDK/module exception message 
 | `-Workspace` | *(none)* | Log Analytics workspace ID (GUID). Fetches Activity Log lifecycle events from the workspace via a single bulk KQL query (faster for large estates). Resource Health uses a hybrid approach: KQL transitions cover the period beyond the REST API's ~30-day retention, while REST API transitions (curated, with corrected causes) are authoritative for the last ~30 days. Provides complete Resource Health coverage across the full observation window. |
 | `-Version` | | Print version and exit |
 
-The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the ~30-day REST API retention window. When `-Workspace` is used, Health History coverage extends to the full observation period via a hybrid approach (Log Analytics for older transitions + REST API for the last ~30 days).
+The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the ~30-day REST API retention window. When `-Workspace` / `--workspace` is used, Health History coverage extends to the full observation period via a hybrid approach (Log Analytics for older transitions + REST API for the last ~30 days).
 
 ### Examples
 
@@ -103,6 +102,9 @@ dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/p
 
 # Batch API with custom batch size
 ./GetAvailability --subscriptions Contoso-Production Contoso-Development --month 202603 --batch-size 20
+
+# Use Log Analytics for Activity Log + Resource Health (faster, extended retention)
+./GetAvailability --subscriptions Contoso-Production --month 202603 --workspace b233a4b7-3c43-433c-ac60-1f6ff217ddd4
 
 # Run directly without publishing
 cd csharp/GetAvailability

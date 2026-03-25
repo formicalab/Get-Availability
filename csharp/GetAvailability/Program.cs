@@ -229,6 +229,9 @@ static async Task RunAsync(
     // Step 5: For resources with suspect metric minutes, investigate null/0% suspect minutes and
     // positive degraded datapoints. Activity Log is checked first for supported lifecycle actions,
     // then Resource Health is applied where still retained.
+    // Build the candidate list: each entry carries the resource, its combined null+zero tick array,
+    // a HashSet of zero-valued ticks (for O(1) null-vs-zero discrimination during classification),
+    // and any degraded samples (0% < value < 100%).
     var suspectCandidates = new List<(TrackedResource Res, long[] AllGapTicks, HashSet<long>? ZeroTicks, MetricValueSample[]? DegradedSamples)>();
     foreach (var res in resources)
     {
@@ -269,7 +272,11 @@ static async Task RunAsync(
             laData);
     }
 
-    // Step 6: Assemble final results — apply suspect-gap investigation outcomes and zero-tx storage exclusions
+    // Step 6: Assemble final results — apply suspect-gap investigation outcomes and zero-tx storage exclusions.
+    // For each resource, print per-resource classification narration (suspect count, Activity Log matches,
+    // Health History outcomes, eligibility adjustments) and compute the final availability figures:
+    //   SuspectMinutes, ConfirmedDowntimeMinutes, ExcusedMinutes, UnexplainedSuspectMinutes,
+    //   AvailableMinutes, EligibleMinutes, AvailabilityPct.
     foreach (var res in resources)
     {
         var key = res.ResourceId.ToLowerInvariant();
@@ -289,7 +296,8 @@ static async Task RunAsync(
                 continue;
             }
 
-            // Apply suspect-gap investigation results
+            // Apply suspect-gap investigation results: walk through each classification bucket
+            // and subtract excused/explained minutes from eligibility, accumulate counters.
             int activityLogExcludedGapMinutes = 0;
             int healthExplainedGapMinutes = 0;
             int metricIssueNullMinutes = 0;
@@ -372,6 +380,8 @@ static async Task RunAsync(
                 }
             }
 
+            // Compute downtime and unresolved counters from investigation results.
+            // ConfirmedDowntime = platform faults (gap + degraded); Unresolved = zero-downtime + remaining degraded.
             int confirmedHealthDowntimeMinutes = 0;
             int unexplainedPositiveDegradedMinutes = mr.DegradedMinutes;
             int unexplainedSuspectMinutes = mr.SuspectMinutes;

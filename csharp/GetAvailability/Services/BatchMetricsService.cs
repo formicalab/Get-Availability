@@ -48,7 +48,8 @@ public static class BatchMetricsService
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tokenResponse.Token);
         http.Timeout = TimeSpan.FromMinutes(5);
 
-        // Group resources by (subscriptionId, location, kind)
+        // Group resources by (subscriptionId, location, kind) — the batch API requires all
+        // resources in a single call to share subscription, region, and resource type.
         var groups = new Dictionary<string, List<TrackedResource>>(StringComparer.OrdinalIgnoreCase);
         foreach (var res in resources)
         {
@@ -61,7 +62,7 @@ public static class BatchMetricsService
             list.Add(res);
         }
 
-        // Build batch work items (chunks of batchSize)
+        // Split each group into chunks of batchSize (max 50 per API call)
         var workItems = new List<BatchWorkItem>();
         foreach (var (key, resList) in groups)
         {
@@ -171,7 +172,7 @@ public static class BatchMetricsService
                     break;
                 }
 
-                if ((statusCode == 401 || statusCode == 429 || statusCode >= 500) && attempt < 5)
+                if ((statusCode == 429 || statusCode >= 500) && attempt < 5)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 1 << attempt)), ct);
                     continue;
@@ -204,6 +205,9 @@ public static class BatchMetricsService
             return;
         }
 
+        // Parse the batch response JSON: { "values": [ { "resourceid": "...", "value": [...] }, ... ] }
+        // Each entry contains per-metric timeseries data that is dispatched to the appropriate
+        // storage or VM/SQL processor based on resource kind.
         try
         {
             if (!doc.RootElement.TryGetProperty("values", out var valuesArray))
@@ -235,6 +239,11 @@ public static class BatchMetricsService
         }
     }
 
+    /// <summary>
+    /// Processes VM or SQL batch response: walks each timeseries data point, classifies it as
+    /// available (value = 1.0), degraded (0 &lt; value &lt; 1.0), zero (value = 0), or null (missing).
+    /// VM metrics are natively 0.0–1.0; SQL metrics are 0–100 and normalised to 0.0–1.0.
+    /// </summary>
     private static MetricScalars ProcessVmOrSqlBatch(JsonElement metricValueArr, bool isVm)
     {
         double availSum = 0;
@@ -290,6 +299,11 @@ public static class BatchMetricsService
             degraded.Count > 0 ? degraded.ToArray() : null);
     }
 
+    /// <summary>
+    /// Processes Storage Account batch response: correlates Availability with Transactions.
+    /// Minutes with zero transactions have no availability signal and are excluded from eligibility.
+    /// Availability is normalised from 0–100 to 0.0–1.0.
+    /// </summary>
     private static MetricScalars ProcessStorageBatch(JsonElement metricValueArr)
     {
         double availSum = 0;

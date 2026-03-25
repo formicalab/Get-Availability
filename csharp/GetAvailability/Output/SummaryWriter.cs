@@ -8,7 +8,9 @@ public static class SummaryWriter
     /// <summary>Prints a fixed-width table with one row per resource showing availability metrics.</summary>
     public static void WriteResults(EligibilityResult[] sorted)
     {
-        // Table header — compact column widths to fit standard terminals
+        // Table header — compact column widths to fit standard terminals.
+        // Columns: Subscription(24) Name(30) Kind(7) Location(12) Suspect(7) Faults(6)
+        //          Excused(7) Unresolved(10) AvailMin(10) EligMin(8) Avail%(10)
         const string fmt = "{0,-24} {1,-30} {2,-7} {3,-12} {4,7} {5,6} {6,7} {7,10} {8,10} {9,8} {10,10}";
         Console.WriteLine();
         Console.WriteLine(string.Format(fmt,
