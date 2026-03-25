@@ -21,12 +21,18 @@
     Activity Log lifecycle operations:
       - Virtual Machines: start/deallocate/power off/restart
       - Azure SQL Databases: pause/resume
-    Resource Health is then applied for the overlap with its current 30-day
-    retention window:
+    Resource Health is then applied to classify remaining suspects:
       - platform fault confirmed (Unavailable/Degraded) -> counts as downtime
       - Unknown / customer-initiated -> valid explanation, excluded from eligibility
     Remaining null minutes become metric issues (excluded from eligibility),
     while remaining 0% minutes are trusted as downtime.
+
+    When -Workspace is specified, Activity Log and Resource Health data are
+    fetched in a single bulk KQL query from a Log Analytics workspace instead
+    of per-resource REST API calls. This is faster for large estates and
+    extends Resource Health coverage beyond the 30-day API retention limit
+    (uses workspace retention, typically 365 days). Without -Workspace, the
+    REST APIs are used directly (30-day Resource Health retention applies).
 
     The observation window is a UTC calendar month selected via -Month YYYYMM.
     Current month runs month-to-date; past months run full-month.
@@ -55,6 +61,14 @@
 .PARAMETER BatchSize
     Max resources per batch call (default: 10, max 50). Implies -Batch.
 
+.PARAMETER Workspace
+    Log Analytics workspace ID (GUID). When provided, Activity Log and Resource
+    Health data are fetched from the AzureActivity table in this workspace via a
+    single bulk KQL query instead of per-resource REST API calls. This is faster
+    for large estates and extends Resource Health retention beyond the 30-day API
+    limit (uses workspace retention, typically 365 days). Requires the workspace
+    to receive Activity Log diagnostic settings from the target subscriptions.
+
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'MySubscription' -Month 202506
 
@@ -63,6 +77,9 @@
 
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Batch -BatchSize 20
+
+.EXAMPLE
+    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Workspace 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Run')]
@@ -96,6 +113,10 @@ param(
     [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(1, 50)]
     [int]$BatchSize = 10,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
+    [string]$Workspace,
 
     [Parameter(Mandatory, ParameterSetName = 'ShowVersion')]
     [switch]$Version
@@ -229,12 +250,174 @@ function Get-ShortKind([string]$Kind) {
 
 ## Returns the effective start of the Resource Health 30-day retention window,
 ## clamped to PeriodStart if Health History covers the full observation period.
-function Get-HealthCoverageStart([DateTimeOffset]$PeriodStart) {
+## When using Log Analytics (-Workspace), retention is workspace-defined (typically
+## 365 days), so we return PeriodStart directly.
+function Get-HealthCoverageStart([DateTimeOffset]$PeriodStart, [switch]$UseLogAnalytics) {
+    if ($UseLogAnalytics) { return $PeriodStart }
     $now = [DateTimeOffset]::UtcNow
     $cm = [DateTimeOffset]::new($now.Year, $now.Month, $now.Day,
         $now.Hour, $now.Minute, 0, [TimeSpan]::Zero)
     $ret = $cm.AddDays(-30)
     $ret -gt $PeriodStart ? $ret : $PeriodStart
+}
+
+# ── Log Analytics bulk data fetch ─────────────────────────────────────────────
+
+## Fetches all Activity Log lifecycle events and Resource Health transitions for
+## the given subscriptions and resource types from a Log Analytics workspace in a
+## single KQL query.  Returns a hashtable keyed by lowercase resource ID, each
+## value containing ActivityEvents and HealthTransitions arrays.
+function Get-LogAnalyticsData {
+    param(
+        [string]$WorkspaceId,
+        [string[]]$SubscriptionIds,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [string]$ArmToken
+    )
+
+    $startIso = $PeriodStart.ToString('O')
+    $endIso   = $PeriodEnd.ToString('O')
+    $subList  = ($SubscriptionIds | ForEach-Object { "'$_'" }) -join ', '
+
+    # Single KQL query that fetches both Activity Log operations and Resource
+    # Health transitions, tagged with a Source column to distinguish them.
+    $kql = @"
+let subs = dynamic([$subList]);
+let actOps = dynamic([
+  'MICROSOFT.COMPUTE/VIRTUALMACHINES/START/ACTION',
+  'MICROSOFT.COMPUTE/VIRTUALMACHINES/DEALLOCATE/ACTION',
+  'MICROSOFT.COMPUTE/VIRTUALMACHINES/POWEROFF/ACTION',
+  'MICROSOFT.COMPUTE/VIRTUALMACHINES/RESTART/ACTION',
+  'MICROSOFT.SQL/SERVERS/DATABASES/PAUSE/ACTION',
+  'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION'
+]);
+let actData = AzureActivity
+    | where SubscriptionId in (subs)
+    | where CategoryValue == 'Administrative'
+    | where OperationNameValue in~ (actOps)
+    | where ActivityStatusValue == 'Success'
+    | where TimeGenerated >= datetime($startIso) and TimeGenerated <= datetime($endIso)
+    | project TimeGenerated, ResourceId=tolower(_ResourceId),
+              OperationName=OperationNameValue, CorrelationId,
+              Source='Activity';
+let healthData = AzureActivity
+    | where SubscriptionId in (subs)
+    | where CategoryValue == 'ResourceHealth'
+    | where ResourceProviderValue in ('MICROSOFT.COMPUTE', 'MICROSOFT.SQL', 'MICROSOFT.STORAGE')
+    | project TimeGenerated, ResourceId=tolower(_ResourceId),
+              Source='Health', Properties=todynamic(Properties);
+actData | union healthData
+"@
+
+    # Call the Log Analytics REST API
+    $laUrl = "https://api.loganalytics.io/v1/workspaces/$WorkspaceId/query"
+    $body = @{ query = $kql } | ConvertTo-Json -Depth 4
+
+    $httpClient = [System.Net.Http.HttpClient]::new()
+    $httpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $httpClient.Timeout = [TimeSpan]::FromMinutes(5)
+
+    try {
+        $content = [System.Net.Http.StringContent]::new(
+            $body, [System.Text.Encoding]::UTF8, 'application/json')
+        $response = $httpClient.PostAsync($laUrl, $content).GetAwaiter().GetResult()
+        $response.EnsureSuccessStatusCode() | Out-Null
+        $jsonStr = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    }
+    finally {
+        $httpClient.Dispose()
+    }
+
+    $result = $jsonStr | ConvertFrom-Json
+    $table = $result.tables[0]
+    $columns = @($table.columns | ForEach-Object { $_.name })
+    $rows = @($table.rows)
+
+    # Index columns
+    $iTime     = [array]::IndexOf($columns, 'TimeGenerated')
+    $iResId    = [array]::IndexOf($columns, 'ResourceId')
+    $iOp       = [array]::IndexOf($columns, 'OperationName')
+    $iCorr     = [array]::IndexOf($columns, 'CorrelationId')
+    $iSource   = [array]::IndexOf($columns, 'Source')
+    $iProps    = [array]::IndexOf($columns, 'Properties')
+
+    # Build per-resource data
+    $dataByRes = @{}
+
+    foreach ($row in $rows) {
+        $resId = [string]$row[$iResId]
+        if (-not $dataByRes.ContainsKey($resId)) {
+            $dataByRes[$resId] = [PSCustomObject]@{
+                ActivityEvents    = [System.Collections.Generic.List[object]]::new()
+                HealthTransitions = [System.Collections.Generic.List[object]]::new()
+            }
+        }
+        $entry = $dataByRes[$resId]
+
+        $ts = [DateTimeOffset]::Parse([string]$row[$iTime],
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AssumeUniversal)
+        $source = [string]$row[$iSource]
+
+        if ($source -eq 'Activity') {
+            $entry.ActivityEvents.Add([PSCustomObject]@{
+                Timestamp     = $ts
+                OperationName = [string]$row[$iOp]
+                CorrelationId = [string]$row[$iCorr]
+            })
+        }
+        elseif ($source -eq 'Health') {
+            $propsRaw = $row[$iProps]
+            $props = if ($propsRaw -is [string] -and $propsRaw) {
+                $propsRaw | ConvertFrom-Json
+            } elseif ($propsRaw -is [PSCustomObject]) {
+                $propsRaw
+            } else { $null }
+
+            if ($props) {
+                # Resource Health properties in AzureActivity use different
+                # field names than the REST API.  Map them to the same model
+                # used by the direct-API path.
+                $state = ''
+                $reasonType = ''
+                $context = ''
+                $healthEventCause = ''
+
+                # Availability state
+                if ($props.PSObject.Properties['currentHealthStatus']) {
+                    $state = [string]$props.currentHealthStatus
+                } elseif ($props.PSObject.Properties['availabilityState']) {
+                    $state = [string]$props.availabilityState
+                }
+
+                # Reason / cause
+                if ($props.PSObject.Properties['cause']) {
+                    $reasonType = [string]$props.cause
+                    # Map LA field values to REST API equivalents
+                    if ($reasonType -eq 'UserInitiated') { $reasonType = 'Customer Initiated' }
+                    elseif ($reasonType -eq 'PlatformInitiated') { $reasonType = 'Platform Initiated' }
+                }
+                if ($props.PSObject.Properties['context']) {
+                    $context = [string]$props.context
+                }
+                if ($props.PSObject.Properties['healthEventCause']) {
+                    $healthEventCause = [string]$props.healthEventCause
+                }
+
+                $entry.HealthTransitions.Add([PSCustomObject]@{
+                    OccurredOn       = $ts
+                    State            = $state
+                    ReasonType       = $reasonType
+                    Context          = $context
+                    HealthEventCause = $healthEventCause
+                })
+            }
+        }
+    }
+
+    Write-Host "Log Analytics: fetched $($rows.Count) events for $($dataByRes.Count) resource(s)"
+    $dataByRes
 }
 
 ## Truncates a string to max length with '...' suffix.
@@ -952,8 +1135,9 @@ function Get-AvailabilityMetrics {
 # ── Suspect gap investigation (parallel) ──────────────────────────────────────
 
 ## For each resource with suspect minutes, queries Activity Log (for supported
-## lifecycle operations) and Resource Health (for the overlap with the 30-day
-## retention window) to classify every suspect minute.
+## lifecycle operations) and Resource Health to classify every suspect minute.
+## When Log Analytics data is provided, uses pre-fetched events; otherwise falls
+## back to per-resource REST API calls (30-day Resource Health retention applies).
 ## Classification precedence:
 ##   1. Platform fault (Resource Health)       → stays eligible, counts as downtime
 ##   2. Lifecycle activity (Activity Log)       → excluded from eligibility
@@ -969,7 +1153,8 @@ function Invoke-SuspectGapInvestigation {
         [int]$ThrottleLimit,
         [int]$GraceMinutes,
         [string]$ArmToken,
-        [DateTimeOffset]$HealthCoverageStart
+        [DateTimeOffset]$HealthCoverageStart,
+        [hashtable]$LogAnalyticsData
     )
     Write-Host "Investigating suspect gaps for $($Candidates.Count) resource(s)..."
 
@@ -977,11 +1162,14 @@ function Invoke-SuspectGapInvestigation {
     $total = $Candidates.Count
     $resultByRes = @{}
 
-    # Shared HttpClient for all Activity Log and Resource Health API calls within
-    # the parallel block — avoids per-request TCP/TLS overhead.
-    $gapHttpClient = [System.Net.Http.HttpClient]::new()
-    $gapHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
-    $gapHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
+    # Shared HttpClient for Activity Log and Resource Health API calls within
+    # the parallel block — only needed when NOT using Log Analytics.
+    $gapHttpClient = $null
+    if (-not $LogAnalyticsData) {
+        $gapHttpClient = [System.Net.Http.HttpClient]::new()
+        $gapHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+        $gapHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
+    }
 
     $Candidates | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         $c         = $_
@@ -990,6 +1178,16 @@ function Invoke-SuspectGapInvestigation {
         $pEnd      = $using:PeriodEnd
         $graceMin  = $using:GraceMinutes
         $hcStart   = $using:HealthCoverageStart
+        $laData    = $using:LogAnalyticsData
+
+        # Pre-fetched Log Analytics data for this resource (if available)
+        $resLaData = $null
+        if ($laData) {
+            $resKey = $c.ResourceId.ToLowerInvariant()
+            if ($laData.ContainsKey($resKey)) {
+                $resLaData = $laData[$resKey]
+            }
+        }
 
         # ── Local helpers ─────────────────────────────────────────────
         ## ARM GET with retry on 429/5xx and exponential backoff (shared HttpClient).
@@ -1057,6 +1255,8 @@ function Invoke-SuspectGapInvestigation {
         # ── Activity Log ──────────────────────────────────────────────
         # Query Activity Log for supported lifecycle operations (VM: start/deallocate/
         # powerOff/restart; SQL: pause/resume) and build intervals that explain metric gaps.
+        # When Log Analytics data is available, use pre-fetched events; otherwise call
+        # the Activity Log REST API per-resource.
         $activityIntervals = @()
         $supportsActivity = $c.Kind -eq 'VirtualMachine' -or $c.Kind -eq 'AzureSqlDatabase'
 
@@ -1074,69 +1274,98 @@ function Invoke-SuspectGapInvestigation {
                 )
                 $rules = if ($c.Kind -eq 'VirtualMachine') { $vmRules } else { $sqlRules }
 
-                $filter = "eventTimestamp ge '$($pStart.ToString('O'))' and eventTimestamp le '$($pEnd.ToString('O'))' and resourceUri eq '$($c.ResourceId)'"
-                $select = 'eventTimestamp,operationName,correlationId,status'
-                $url = "https://management.azure.com/subscriptions/$($c.SubscriptionId)" +
-                       "/providers/microsoft.insights/eventtypes/management/values" +
-                       "?api-version=2015-04-01&`$filter=$([uri]::EscapeDataString($filter))" +
-                       "&`$select=$([uri]::EscapeDataString($select))"
-
                 $events = [System.Collections.Generic.List[object]]::new()
-                while ($url) {
-                    $json = ArmGet $url $client
-                    $doc = [System.Text.Json.JsonDocument]::Parse($json)
-                    try {
-                        $valEl = [System.Text.Json.JsonElement]::new()
-                        if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
-                            $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
-                            foreach ($item in $valEl.EnumerateArray()) {
-                                $tsStr = GetJsonStr $item 'eventTimestamp'
-                                $ts = ParseTimestamp $tsStr
-                                if ($null -eq $ts) { continue }
 
-                                # Parse operationName (nested object with value + localizedValue)
-                                $opValue = ''; $opLabel = ''
-                                $opEl = [System.Text.Json.JsonElement]::new()
-                                if ($item.TryGetProperty('operationName', [ref]$opEl) -and
-                                    $opEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
-                                    $opValue = GetJsonStr $opEl 'value'
-                                    $opLabel = GetJsonStr $opEl 'localizedValue'
+                if ($resLaData -and $resLaData.ActivityEvents.Count -gt 0) {
+                    # ── Log Analytics path: use pre-fetched events ────
+                    foreach ($laEvt in $resLaData.ActivityEvents) {
+                        $opKey = [string]$laEvt.OperationName
+                        if (-not $opKey) { continue }
+
+                        $matched = $false; $eventGrace = 0
+                        $normalized = $opKey.ToLowerInvariant()
+                        foreach ($rule in $rules) {
+                            foreach ($t in $rule.Tokens) {
+                                if ($normalized.Contains($t)) {
+                                    $matched = $true
+                                    $eventGrace = if ($rule.ApplyGrace) { $graceMin } else { 0 }
+                                    break
                                 }
-                                $opKey = if ($opValue) { $opValue } else { $opLabel }
-                                if (-not $opKey) { continue }
-
-                                # Match against rules
-                                $matched = $false; $eventGrace = 0
-                                $normalized = $opKey.ToLowerInvariant()
-                                foreach ($rule in $rules) {
-                                    foreach ($t in $rule.Tokens) {
-                                        if ($normalized.Contains($t)) {
-                                            $matched = $true
-                                            $eventGrace = if ($rule.ApplyGrace) { $graceMin } else { 0 }
-                                            break
-                                        }
-                                    }
-                                    if ($matched) { break }
-                                }
-                                if (-not $matched) { continue }
-
-                                $corrId = GetJsonStr $item 'correlationId'
-                                $events.Add([PSCustomObject]@{
-                                    Timestamp    = [DateTimeOffset]$ts
-                                    OperationKey = $opKey
-                                    CorrelationId = $corrId
-                                    GraceMinutes = $eventGrace
-                                })
                             }
+                            if ($matched) { break }
                         }
+                        if (-not $matched) { continue }
 
-                        $nextEl = [System.Text.Json.JsonElement]::new()
-                        $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
-                                   $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
-                            $nextEl.GetString()
-                        } else { $null }
+                        $events.Add([PSCustomObject]@{
+                            Timestamp     = $laEvt.Timestamp
+                            OperationKey  = $opKey
+                            CorrelationId = [string]$laEvt.CorrelationId
+                            GraceMinutes  = $eventGrace
+                        })
                     }
-                    finally { $doc.Dispose() }
+                } elseif (-not $resLaData) {
+                    # ── REST API path (original) ──────────────────────
+                    $filter = "eventTimestamp ge '$($pStart.ToString('O'))' and eventTimestamp le '$($pEnd.ToString('O'))' and resourceUri eq '$($c.ResourceId)'"
+                    $select = 'eventTimestamp,operationName,correlationId,status'
+                    $url = "https://management.azure.com/subscriptions/$($c.SubscriptionId)" +
+                           "/providers/microsoft.insights/eventtypes/management/values" +
+                           "?api-version=2015-04-01&`$filter=$([uri]::EscapeDataString($filter))" +
+                           "&`$select=$([uri]::EscapeDataString($select))"
+
+                    while ($url) {
+                        $json = ArmGet $url $client
+                        $doc = [System.Text.Json.JsonDocument]::Parse($json)
+                        try {
+                            $valEl = [System.Text.Json.JsonElement]::new()
+                            if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
+                                $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                                foreach ($item in $valEl.EnumerateArray()) {
+                                    $tsStr = GetJsonStr $item 'eventTimestamp'
+                                    $ts = ParseTimestamp $tsStr
+                                    if ($null -eq $ts) { continue }
+
+                                    $opValue = ''; $opLabel = ''
+                                    $opEl = [System.Text.Json.JsonElement]::new()
+                                    if ($item.TryGetProperty('operationName', [ref]$opEl) -and
+                                        $opEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                                        $opValue = GetJsonStr $opEl 'value'
+                                        $opLabel = GetJsonStr $opEl 'localizedValue'
+                                    }
+                                    $opKey = if ($opValue) { $opValue } else { $opLabel }
+                                    if (-not $opKey) { continue }
+
+                                    $matched = $false; $eventGrace = 0
+                                    $normalized = $opKey.ToLowerInvariant()
+                                    foreach ($rule in $rules) {
+                                        foreach ($t in $rule.Tokens) {
+                                            if ($normalized.Contains($t)) {
+                                                $matched = $true
+                                                $eventGrace = if ($rule.ApplyGrace) { $graceMin } else { 0 }
+                                                break
+                                            }
+                                        }
+                                        if ($matched) { break }
+                                    }
+                                    if (-not $matched) { continue }
+
+                                    $corrId = GetJsonStr $item 'correlationId'
+                                    $events.Add([PSCustomObject]@{
+                                        Timestamp    = [DateTimeOffset]$ts
+                                        OperationKey = $opKey
+                                        CorrelationId = $corrId
+                                        GraceMinutes = $eventGrace
+                                    })
+                                }
+                            }
+
+                            $nextEl = [System.Text.Json.JsonElement]::new()
+                            $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
+                                       $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                                $nextEl.GetString()
+                            } else { $null }
+                        }
+                        finally { $doc.Dispose() }
+                    }
                 }
 
                 # Build intervals from events: group by operation+correlationId,
@@ -1197,8 +1426,10 @@ function Invoke-SuspectGapInvestigation {
         }
 
         # ── Resource Health ───────────────────────────────────────────
-        # Query the Resource Health REST API for the portion of the window
-        # covered by the current 30-day retention window.
+        # Query Resource Health transitions to classify platform faults,
+        # unknown states, and customer-initiated events.  When Log Analytics
+        # data is available, use pre-fetched transitions; otherwise call the
+        # Resource Health REST API (limited to 30-day retention).
         $healthHistoryApplied = [DateTimeOffset]$hcStart -lt [DateTimeOffset]$pEnd
         $faultIntervals    = @()
         $unknownIntervals  = @()
@@ -1207,47 +1438,56 @@ function Invoke-SuspectGapInvestigation {
         if ($healthHistoryApplied) {
             try {
                 $transitions = [System.Collections.Generic.List[object]]::new()
-                $url = "https://management.azure.com$($c.ResourceId)" +
-                       "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
-                       "?api-version=2025-05-01"
 
-                while ($url) {
-                    $json = ArmGet $url $client
-                    $doc = [System.Text.Json.JsonDocument]::Parse($json)
-                    try {
-                        $valEl = [System.Text.Json.JsonElement]::new()
-                        if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
-                            $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
-                            foreach ($item in $valEl.EnumerateArray()) {
-                                $propsEl = [System.Text.Json.JsonElement]::new()
-                                if (-not $item.TryGetProperty('properties', [ref]$propsEl)) { continue }
-
-                                $occurredStr = GetJsonStr $propsEl 'occuredTime'
-                                $occurred = ParseTimestamp $occurredStr
-                                if ($null -eq $occurred) { continue }
-
-                                $transitions.Add([PSCustomObject]@{
-                                    OccurredOn       = [DateTimeOffset]$occurred
-                                    State            = GetJsonStr $propsEl 'availabilityState'
-                                    ReasonType       = GetJsonStr $propsEl 'reasonType'
-                                    Context          = GetJsonStr $propsEl 'context'
-                                    HealthEventCause = GetJsonStr $propsEl 'healthEventCause'
-                                })
-                            }
-                        }
-
-                        $nextEl = [System.Text.Json.JsonElement]::new()
-                        $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
-                                   $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
-                            $nextEl.GetString()
-                        } else { $null }
+                if ($resLaData -and $resLaData.HealthTransitions.Count -gt 0) {
+                    # ── Log Analytics path: use pre-fetched transitions ──
+                    foreach ($ht in $resLaData.HealthTransitions) {
+                        $transitions.Add($ht)
                     }
-                    finally { $doc.Dispose() }
+                } elseif (-not $resLaData) {
+                    # ── REST API path (original) ─────────────────────────
+                    $url = "https://management.azure.com$($c.ResourceId)" +
+                           "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
+                           "?api-version=2025-05-01"
+
+                    while ($url) {
+                        $json = ArmGet $url $client
+                        $doc = [System.Text.Json.JsonDocument]::Parse($json)
+                        try {
+                            $valEl = [System.Text.Json.JsonElement]::new()
+                            if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
+                                $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                                foreach ($item in $valEl.EnumerateArray()) {
+                                    $propsEl = [System.Text.Json.JsonElement]::new()
+                                    if (-not $item.TryGetProperty('properties', [ref]$propsEl)) { continue }
+
+                                    $occurredStr = GetJsonStr $propsEl 'occuredTime'
+                                    $occurred = ParseTimestamp $occurredStr
+                                    if ($null -eq $occurred) { continue }
+
+                                    $transitions.Add([PSCustomObject]@{
+                                        OccurredOn       = [DateTimeOffset]$occurred
+                                        State            = GetJsonStr $propsEl 'availabilityState'
+                                        ReasonType       = GetJsonStr $propsEl 'reasonType'
+                                        Context          = GetJsonStr $propsEl 'context'
+                                        HealthEventCause = GetJsonStr $propsEl 'healthEventCause'
+                                    })
+                                }
+                            }
+
+                            $nextEl = [System.Text.Json.JsonElement]::new()
+                            $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
+                                       $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                                $nextEl.GetString()
+                            } else { $null }
+                        }
+                        finally { $doc.Dispose() }
+                    }
                 }
 
-                # API returns newest-first; reverse to chronological
-                $transArr = @($transitions)
-                [array]::Reverse($transArr)
+                # Sort transitions chronologically (REST API returns newest-
+                # first; LA data arrives in query order — sort to be safe)
+                $transArr = @($transitions | Sort-Object { $_.OccurredOn })
 
                 # Helper: IsCustomerInitiated
                 $isCust = {
@@ -1395,7 +1635,7 @@ function Invoke-SuspectGapInvestigation {
         }
     }
     Write-Progress -Activity 'Investigating suspect gaps' -Completed
-    $gapHttpClient.Dispose()
+    if ($gapHttpClient) { $gapHttpClient.Dispose() }
     $resultByRes
 }
 
@@ -1486,13 +1726,19 @@ $utcStart     = $window.Start
 $utcEnd       = $window.End
 $totalMinutes = $window.TotalMinutes
 
-$healthCoverageStart = Get-HealthCoverageStart $utcStart
+$healthCoverageStart = if ($Workspace) {
+    Get-HealthCoverageStart $utcStart -UseLogAnalytics
+} else {
+    Get-HealthCoverageStart $utcStart
+}
 $healthCoveredMinutes = $healthCoverageStart -lt $utcEnd ? [int]($utcEnd - $healthCoverageStart).TotalMinutes : 0
 
 $periodLabel = $window.IsMonthToDate ? "month $($window.NormalizedMonth) (month-to-date)" : "month $($window.NormalizedMonth)"
 Write-Host "Period: $periodLabel ($($utcStart.ToString('u')) -> $($utcEnd.ToString('u')), $totalMinutes min)"
 
-if ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
+if ($Workspace) {
+    Write-Host "Log Analytics workspace: $Workspace (Activity Log + Resource Health via KQL)"
+} elseif ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
     Write-Host "WARNING: Resource Health history covers only part of this period ($($healthCoverageStart.ToString('u')) -> $($utcEnd.ToString('u')), $healthCoveredMinutes of $totalMinutes min). Earlier minutes will use Activity Log and metric fallback rules."
 } elseif ($healthCoveredMinutes -eq 0) {
     Write-Host 'WARNING: Resource Health history does not cover this period. All suspect minutes will use Activity Log and metric fallback rules.'
@@ -1594,12 +1840,26 @@ foreach ($res in $resources) {
     }
 }
 
+# Step 6b: If using Log Analytics, bulk-fetch Activity Log + Resource Health data
+$logAnalyticsData = $null
+if ($Workspace -and $suspectCandidates.Count -gt 0) {
+    Write-Host -NoNewline 'Fetching Activity Log + Resource Health from Log Analytics... '
+    $laToken = (Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io').Token
+    $laTokenStr = ($laToken -is [securestring]) ? ($laToken | ConvertFrom-SecureString -AsPlainText) : [string]$laToken
+    $laToken = $null
+    $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $Workspace `
+        -SubscriptionIds $subIds -PeriodStart $utcStart -PeriodEnd $utcEnd `
+        -ArmToken $laTokenStr
+    $laTokenStr = $null
+}
+
 $suspectResults = $null
 if ($suspectCandidates.Count -gt 0) {
     $suspectResults = Invoke-SuspectGapInvestigation -Candidates @($suspectCandidates) `
         -PeriodStart $utcStart -PeriodEnd $utcEnd -ThrottleLimit $Parallelism `
         -GraceMinutes $ActivityGraceMinutes -ArmToken $armToken `
-        -HealthCoverageStart $healthCoverageStart
+        -HealthCoverageStart $healthCoverageStart `
+        -LogAnalyticsData $logAnalyticsData
 }
 
 # Step 7: Assemble final results
