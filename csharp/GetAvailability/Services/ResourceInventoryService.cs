@@ -6,7 +6,10 @@ using System.Text.Json;
 
 namespace GetAvailability.Services;
 
-/// <summary>Queries Resource Graph resources table for VMs, SQL DBs, and Storage Accounts.</summary>
+/// <summary>
+/// Queries the Resource Graph resources table for VMs, SQL DBs, Storage Accounts,
+/// and Web Apps (excluding Function Apps which share the microsoft.web/sites type).
+/// </summary>
 public static class ResourceInventoryService
 {
     /// <summary>Maps CLI kind abbreviations to Azure Resource Graph type identifiers.</summary>
@@ -15,6 +18,7 @@ public static class ResourceInventoryService
         ["vm"] = "microsoft.compute/virtualmachines",
         ["sql"] = "microsoft.sql/servers/databases",
         ["storage"] = "microsoft.storage/storageaccounts",
+        ["webapp"] = "microsoft.web/sites",
     };
 
     /// <summary>
@@ -30,7 +34,7 @@ public static class ResourceInventoryService
             .OrderBy(k => k, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         if (unsupportedKinds.Length > 0)
-            throw new ArgumentException($"Unsupported kind(s): {string.Join(", ", unsupportedKinds)}. Allowed values: vm, sql, storage.");
+            throw new ArgumentException($"Unsupported kind(s): {string.Join(", ", unsupportedKinds)}. Allowed values: vm, sql, storage, webapp.");
 
         // Build the type filter clause from selected kinds
         var types = kinds
@@ -52,6 +56,7 @@ public static class ResourceInventoryService
         string query = $"""
             resources
             | where {typeFilter}
+            | where not(type =~ 'microsoft.web/sites' and kind contains 'functionapp')
             | extend idParts = split(id, '/')
             | extend sqlServerName = iff(type =~ 'microsoft.sql/servers/databases', tostring(idParts[8]), '')
             | extend databaseName = iff(type =~ 'microsoft.sql/servers/databases', tostring(idParts[10]), '')
@@ -62,6 +67,7 @@ public static class ResourceInventoryService
                 type =~ 'microsoft.compute/virtualmachines', 'VirtualMachine',
                 type =~ 'microsoft.sql/servers/databases', 'AzureSqlDatabase',
                 type =~ 'microsoft.storage/storageaccounts', 'StorageAccount',
+                type =~ 'microsoft.web/sites', 'WebApp',
                 'Other'
             )
             | project id, name, displayName, type, subscriptionId, resourceGroup, location, resourceKind,

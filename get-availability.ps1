@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-    Reports month-scoped availability for VMs, Azure SQL databases, and Storage Accounts.
+    Reports month-scoped availability for VMs, Azure SQL databases, Storage Accounts, and Web Apps.
 
 .DESCRIPTION
     Mirrors the C# Get-Availability pipeline:
@@ -17,10 +17,13 @@
     A suspect minute is any metric datapoint that is null or below 100%.
     Contiguous suspect minutes form "suspect gaps" for narration.
 
-    For supported resource types, suspect minutes are first checked against
-    Activity Log lifecycle operations:
+    Suspect minutes are first checked against Activity Log events:
+      - Resource creation/deletion (all kinds): minutes when the resource
+        did not exist are excused (before creation, between delete/recreate
+        cycles, after final deletion).
       - Virtual Machines: start/deallocate/power off/restart
       - Azure SQL Databases: pause/resume
+      - Web Apps: stop/start/restart
     Resource Health is then applied to classify remaining suspects:
       - platform fault confirmed (Unavailable/Degraded) -> counts as downtime
       - Unknown / customer-initiated -> valid explanation, excluded from eligibility
@@ -47,7 +50,7 @@
     Observation month in UTC, format YYYYMM.
 
 .PARAMETER Kinds
-    Resource kinds: vm, sql, storage (default: all).
+    Resource kinds: vm, sql, storage, webapp (default: all).
 
 .PARAMETER Resource
     Optional single resource name filter.
@@ -99,8 +102,8 @@ param(
     [string]$Month,
 
     [Parameter(ParameterSetName = 'Run')]
-    [ValidateSet('vm','sql','storage')]
-    [string[]]$Kinds = @('vm','sql','storage'),
+    [ValidateSet('vm','sql','storage','webapp')]
+    [string[]]$Kinds = @('vm','sql','storage','webapp'),
 
     [Parameter(ParameterSetName = 'Run')]
     [string]$Resource,
@@ -181,10 +184,11 @@ function Get-ResourceInventory {
         'vm'      = 'microsoft.compute/virtualmachines'
         'sql'     = 'microsoft.sql/servers/databases'
         'storage' = 'microsoft.storage/storageaccounts'
+        'webapp'  = 'microsoft.web/sites'
     }
     $unsupported = @($Kinds | Where-Object { -not $kindToType.ContainsKey($_) })
     if ($unsupported.Count -gt 0) {
-        throw "Unsupported kind(s): $($unsupported -join ', '). Allowed values: vm, sql, storage."
+        throw "Unsupported kind(s): $($unsupported -join ', '). Allowed values: vm, sql, storage, webapp."
     }
 
     $types = @($Kinds | ForEach-Object { $kindToType[$_] })
@@ -205,10 +209,12 @@ resources
 | extend databaseName = iff(type =~ 'microsoft.sql/servers/databases', tostring(idParts[10]), '')
 | where not(type =~ 'microsoft.sql/servers/databases' and databaseName =~ 'master')
 | extend displayName = iff(type =~ 'microsoft.sql/servers/databases', strcat(sqlServerName, '/', databaseName), name)
-${nameFilter}| extend resourceKind = case(
+${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functionapp')
+| extend resourceKind = case(
     type =~ 'microsoft.compute/virtualmachines', 'VirtualMachine',
     type =~ 'microsoft.sql/servers/databases', 'AzureSqlDatabase',
     type =~ 'microsoft.storage/storageaccounts', 'StorageAccount',
+    type =~ 'microsoft.web/sites', 'WebApp',
     'Other'
 )
 | project id, name, displayName, type, subscriptionId, resourceGroup, location, resourceKind,
@@ -250,6 +256,7 @@ function Get-ShortKind([string]$Kind) {
         'VirtualMachine'   { 'VM' }
         'AzureSqlDatabase' { 'SQL' }
         'StorageAccount'   { 'Storage' }
+        'WebApp'           { 'Web' }
         default            { $Kind }
     }
 }
@@ -280,11 +287,12 @@ function Get-RestHealthCutoff {
 
 # ── Log Analytics bulk data fetch ─────────────────────────────────────────────
 
-## Fetches all Activity Log lifecycle events and Resource Health transitions for
-## the given subscriptions and resource types from a Log Analytics workspace in a
-## single KQL query.  Returns a hashtable keyed by lowercase resource ID, each
-## value containing ActivityEvents and HealthTransitions arrays.
-## ActivityEvents are used directly for lifecycle classification.
+## Fetches Activity Log events (lifecycle operations + creation/deletion) and
+## Resource Health transitions for the given subscriptions and resource types
+## from a Log Analytics workspace in a single KQL query.
+## Returns a hashtable keyed by lowercase resource ID, each value containing
+## ActivityEvents and HealthTransitions arrays.
+## ActivityEvents are used for lifecycle classification and existence tracking.
 ## HealthTransitions are used only for transitions older than the REST API's
 ## ~30-day retention cutoff; the investigation function merges them with REST
 ## API transitions for the last ~30 days to form complete coverage.
@@ -311,7 +319,18 @@ let actOps = dynamic([
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/POWEROFF/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/RESTART/ACTION',
   'MICROSOFT.SQL/SERVERS/DATABASES/PAUSE/ACTION',
-  'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION'
+  'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION',
+  'MICROSOFT.WEB/SITES/STOP/ACTION',
+  'MICROSOFT.WEB/SITES/START/ACTION',
+  'MICROSOFT.WEB/SITES/RESTART/ACTION',
+  'MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE',
+  'MICROSOFT.SQL/SERVERS/DATABASES/WRITE',
+  'MICROSOFT.STORAGE/STORAGEACCOUNTS/WRITE',
+  'MICROSOFT.WEB/SITES/WRITE',
+  'MICROSOFT.COMPUTE/VIRTUALMACHINES/DELETE',
+  'MICROSOFT.SQL/SERVERS/DATABASES/DELETE',
+  'MICROSOFT.STORAGE/STORAGEACCOUNTS/DELETE',
+  'MICROSOFT.WEB/SITES/DELETE'
 ]);
 let actData = AzureActivity
     | where SubscriptionId in (subs)
@@ -325,7 +344,7 @@ let actData = AzureActivity
 let healthData = AzureActivity
     | where SubscriptionId in (subs)
     | where CategoryValue == 'ResourceHealth'
-    | where ResourceProviderValue in ('MICROSOFT.COMPUTE', 'MICROSOFT.SQL', 'MICROSOFT.STORAGE')
+    | where ResourceProviderValue in ('MICROSOFT.COMPUTE', 'MICROSOFT.SQL', 'MICROSOFT.STORAGE', 'MICROSOFT.WEB')
     | project TimeGenerated, ResourceId=tolower(_ResourceId),
               Source='Health', OperationName=OperationNameValue,
               Properties=todynamic(Properties);
@@ -378,9 +397,17 @@ actData | union healthData
         }
         $entry = $dataByRes[$resId]
 
-        $ts = [DateTimeOffset]::Parse([string]$row[$iTime],
-            [System.Globalization.CultureInfo]::InvariantCulture,
-            [System.Globalization.DateTimeStyles]::AssumeUniversal)
+        # ConvertFrom-Json may convert ISO 8601 strings to DateTime objects,
+        # and [string]$datetime uses locale formatting which loses sub-second
+        # precision.  Handle both types to preserve tick-accurate timestamps.
+        $tsRaw = $row[$iTime]
+        $ts = if ($tsRaw -is [datetime]) {
+            [DateTimeOffset]([datetime]$tsRaw)
+        } else {
+            [DateTimeOffset]::Parse([string]$tsRaw,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AssumeUniversal)
+        }
         $source = [string]$row[$iSource]
 
         if ($source -eq 'Activity') {
@@ -617,11 +644,11 @@ public sealed class BatchResourceResult
 public static class MetricProcessor
 {
     /// <summary>Per-resource response: root has "value" array.</summary>
-    public static MetricProcessorResult ProcessSingle(JsonDocument doc, bool isVm, bool isStorage)
-        => ProcessMetricArray(doc.RootElement.GetProperty("value"), isVm, isStorage);
+    public static MetricProcessorResult ProcessSingle(JsonDocument doc, bool isVm, bool isStorage, bool isWebApp = false)
+        => ProcessMetricArray(doc.RootElement.GetProperty("value"), isVm, isStorage, isWebApp);
 
     /// <summary>Batch response: root has "values" array, each with "resourceid" + "value".</summary>
-    public static BatchResourceResult[] ProcessBatch(JsonDocument doc, bool isVm, bool isStorage)
+    public static BatchResourceResult[] ProcessBatch(JsonDocument doc, bool isVm, bool isStorage, bool isWebApp = false)
     {
         var results = new List<BatchResourceResult>();
         foreach (var entry in doc.RootElement.GetProperty("values").EnumerateArray())
@@ -631,7 +658,7 @@ public static class MetricProcessor
             {
                 ResourceId      = resId,
                 ResourceIdLower = resId.ToLowerInvariant(),
-                Metrics         = ProcessMetricArray(entry.GetProperty("value"), isVm, isStorage)
+                Metrics         = ProcessMetricArray(entry.GetProperty("value"), isVm, isStorage, isWebApp)
             });
         }
         return results.ToArray();
@@ -639,7 +666,7 @@ public static class MetricProcessor
 
     // ── shared inner loop ────────────────────────────────────────────────────
     private static MetricProcessorResult ProcessMetricArray(
-        JsonElement valueArr, bool isVm, bool isStorage)
+        JsonElement valueArr, bool isVm, bool isStorage, bool isWebApp)
     {
         var r = new MetricProcessorResult();
         var nullTicks      = new List<long>();
@@ -687,6 +714,39 @@ public static class MetricProcessor
                     }
                     else if (hasTx)  nullTicks.Add(ticks);
                     else             r.ZeroTxMin++;
+                }
+            }
+        }
+        else if (isWebApp)
+        {
+            // Web App: MemoryWorkingSet as availability proxy.
+            // Average aggregation (bytes): value > 0 means the app process is alive (available 1.0),
+            // value == 0 means the app is stopped (suspect zero), null means platform could not
+            // collect metrics (suspect null). No degraded state — binary up/down model.
+            foreach (var metricEl in valueArr.EnumerateArray())
+            {
+                string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
+                if (!string.Equals(mName, "MemoryWorkingSet", StringComparison.OrdinalIgnoreCase)) continue;
+
+                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
+                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
+                {
+                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
+                                         .ToUniversalTime().Ticks;
+                    double? avgVal = null;
+                    if (dp.TryGetProperty("average", out var avgEl) && avgEl.ValueKind == JsonValueKind.Number)
+                        avgVal = avgEl.GetDouble();
+
+                    if (avgVal.HasValue)
+                    {
+                        r.NumericPoints++;
+                        if (avgVal.Value > 0.0)
+                            r.AvailableSum += 1.0;   // process alive → fully available
+                        else
+                            zeroTicks.Add(ticks);     // process not running → suspect zero
+                    }
+                    else
+                        nullTicks.Add(ticks);         // no data from platform → suspect null
                 }
             }
         }
@@ -853,6 +913,15 @@ $KindConfig = @{
         Namespace   = 'Microsoft.Storage/storageAccounts'
         MetricNames = 'Availability,Transactions'
         Aggregation = 'Minimum,Total'
+    }
+    # Web App: MemoryWorkingSet as availability proxy — non-null value > 0 means
+    # the app process is alive (available); value = 0 means the app is stopped
+    # (suspect zero, like a deallocated VM); null means the platform could not
+    # collect metrics (suspect null). No degraded state — binary up/down model.
+    'WebApp' = @{
+        Namespace   = 'Microsoft.Web/sites'
+        MetricNames = 'MemoryWorkingSet'
+        Aggregation = 'Average'
     }
 }
 
@@ -1022,6 +1091,7 @@ function Get-BatchAvailabilityMetrics {
 
         $isVm      = $kind -eq 'VirtualMachine'
         $isStorage = $kind -eq 'StorageAccount'
+        $isWebApp  = $kind -eq 'WebApp'
 
         $resourceIds = @($resources | ForEach-Object { $_.ResourceId })
 
@@ -1111,7 +1181,7 @@ function Get-BatchAvailabilityMetrics {
 
         # Parse the batch response and extract per-resource metric results.
         try {
-            $batchResults = [MetricProcessor]::ProcessBatch($doc, $isVm, $isStorage)
+            $batchResults = [MetricProcessor]::ProcessBatch($doc, $isVm, $isStorage, $isWebApp)
             foreach ($br in $batchResults) {
                 $resObj  = if ($resById.ContainsKey($br.ResourceIdLower)) { $resById[$br.ResourceIdLower] } else { $null }
                 $resName = if ($resObj) { $resObj.Name } else { $br.ResourceId }
@@ -1200,6 +1270,7 @@ function Get-AvailabilityMetrics {
 
         $isVm      = $resource.Kind -eq 'VirtualMachine'
         $isStorage  = $resource.Kind -eq 'StorageAccount'
+        $isWebApp   = $resource.Kind -eq 'WebApp'
 
         # Look up metric namespace, names, and aggregation for this resource kind
         $kindCfg = ($using:KindConfig)[$resource.Kind]
@@ -1253,7 +1324,7 @@ function Get-AvailabilityMetrics {
         # each per-minute datapoint as available, null, zero, or degraded.
         $m = $null
         if ($doc) {
-            try   { $m = [MetricProcessor]::ProcessSingle($doc, $isVm, $isStorage) }
+            try   { $m = [MetricProcessor]::ProcessSingle($doc, $isVm, $isStorage, $isWebApp) }
             catch { Write-Warning "Metric processing failed for '$($resource.Name)': $_" }
             finally { $doc.Dispose() }
         }
@@ -1309,8 +1380,8 @@ function Get-AvailabilityMetrics {
 
 # ── Suspect gap investigation (parallel) ──────────────────────────────────────
 
-## For each resource with suspect minutes, queries Activity Log (for supported
-## lifecycle operations) and Resource Health to classify every suspect minute.
+## For each resource with suspect minutes, queries Activity Log and Resource
+## Health to classify every suspect minute.
 ## When Log Analytics data is provided, Activity Log uses pre-fetched events;
 ## Resource Health uses a hybrid approach: LA transitions older than the REST
 ## API ~30-day retention cutoff are merged with REST API transitions for the
@@ -1433,29 +1504,71 @@ function Invoke-SuspectGapInvestigation {
             $null
         }
 
+        ## Sorts intervals by FromTicks and merges overlapping/adjacent ones.
+        function script:MergeIntervals([object[]]$intervals) {
+            if ($intervals.Count -le 1) { return $intervals }
+            $sorted = @($intervals | Sort-Object FromTicks)
+            $merged = [System.Collections.Generic.List[object]]::new()
+            $merged.Add($sorted[0])
+            for ($i = 1; $i -lt $sorted.Count; $i++) {
+                $last = $merged[$merged.Count - 1]
+                if ($sorted[$i].FromTicks -le $last.ToTicks) {
+                    if ($sorted[$i].ToTicks -gt $last.ToTicks) {
+                        $last.ToTicks = $sorted[$i].ToTicks
+                        $last.To = $sorted[$i].To
+                    }
+                } else { $merged.Add($sorted[$i]) }
+            }
+            @($merged)
+        }
+
         # ── Activity Log ──────────────────────────────────────────────
-        # Query Activity Log for supported lifecycle operations (VM: start/deallocate/
-        # powerOff/restart; SQL: pause/resume) and build intervals that explain metric gaps.
+        # Checks Activity Log for events that explain metric gaps:
+        #   a) Resource creation/deletion — excuses non-existence intervals
+        #      (before first write, between delete→write cycles, after final delete).
+        #   b) Kind-specific lifecycle operations (VM start/deallocate/poweroff/restart,
+        #      SQL pause/resume, WebApp stop/start/restart). Kinds with no known
+        #      lifecycle ops (e.g. Storage) produce no matches here.
         # When Log Analytics data is available, use pre-fetched events; otherwise call
         # the Activity Log REST API per-resource.
         $activityIntervals = @()
-        $supportsActivity = $c.Kind -eq 'VirtualMachine' -or $c.Kind -eq 'AzureSqlDatabase'
 
-        if ($supportsActivity -and ($c.AllGapTicks.Count -gt 0 -or $c.DegradedTicks.Count -gt 0)) {
+        if ($c.AllGapTicks.Count -gt 0 -or $c.DegradedTicks.Count -gt 0) {
             try {
                 $vmRules = @(
-                    @{ ApplyGrace = $false; Tokens = @('microsoft.compute/virtualmachines/start/action', 'start virtual machine') }
+                    @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/start/action', 'start virtual machine') }
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/deallocate/action', 'deallocate virtual machine') }
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/poweroff/action', 'power off virtual machine') }
-                    @{ ApplyGrace = $false; Tokens = @('microsoft.compute/virtualmachines/restart/action', 'restart virtual machine') }
+                    @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/restart/action', 'restart virtual machine') }
                 )
                 $sqlRules = @(
                     @{ ApplyGrace = $true; Tokens = @('microsoft.sql/servers/databases/pause', 'pause sql database', 'pause database') }
                     @{ ApplyGrace = $true; Tokens = @('microsoft.sql/servers/databases/resume', 'resume sql database', 'resume database') }
                 )
-                $rules = if ($c.Kind -eq 'VirtualMachine') { $vmRules } else { $sqlRules }
+                # Web App lifecycle: stop applies grace (trailing zero metrics while process
+                # shuts down), start/restart apply grace for the brief recycle window.
+                $webAppRules = @(
+                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/stop/action', 'stop web app', 'stopwebsite') }
+                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/start/action', 'start web app', 'startwebsite') }
+                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/restart/action', 'restart web app', 'restartwebsite') }
+                )
+                $rules = switch ($c.Kind) {
+                    'VirtualMachine'   { $vmRules }
+                    'AzureSqlDatabase' { $sqlRules }
+                    'WebApp'           { $webAppRules }
+                    default            { @() }
+                }
 
                 $events = [System.Collections.Generic.List[object]]::new()
+
+                # Resource creation/deletion tokens — derived from KindConfig
+                # namespace (e.g. 'microsoft.web/sites/write', 'microsoft.web/sites/delete').
+                # Used to build non-existence intervals where the resource did not exist:
+                # before the first write, between delete→write pairs, and after a
+                # trailing delete.  Applies universally to all resource kinds.
+                $createToken = (($using:KindConfig)[$c.Kind].Namespace + '/write').ToLowerInvariant()
+                $deleteToken = (($using:KindConfig)[$c.Kind].Namespace + '/delete').ToLowerInvariant()
+                $existenceEvents = [System.Collections.Generic.List[object]]::new()
 
                 if ($resLaData -and $resLaData.ActivityEvents.Count -gt 0) {
                     # ── Log Analytics path: use pre-fetched events ────
@@ -1463,8 +1576,17 @@ function Invoke-SuspectGapInvestigation {
                         $opKey = [string]$laEvt.OperationName
                         if (-not $opKey) { continue }
 
-                        $matched = $false; $eventGrace = 0
                         $normalized = $opKey.ToLowerInvariant()
+
+                        # Check for resource creation/deletion events
+                        if ($normalized.Contains($createToken)) {
+                            $existenceEvents.Add([PSCustomObject]@{ Timestamp = $laEvt.Timestamp; Type = 'Write' })
+                        }
+                        elseif ($normalized.Contains($deleteToken)) {
+                            $existenceEvents.Add([PSCustomObject]@{ Timestamp = $laEvt.Timestamp; Type = 'Delete' })
+                        }
+
+                        $matched = $false; $eventGrace = 0
                         foreach ($rule in $rules) {
                             foreach ($t in $rule.Tokens) {
                                 if ($normalized.Contains($t)) {
@@ -1515,8 +1637,17 @@ function Invoke-SuspectGapInvestigation {
                                     $opKey = if ($opValue) { $opValue } else { $opLabel }
                                     if (-not $opKey) { continue }
 
-                                    $matched = $false; $eventGrace = 0
                                     $normalized = $opKey.ToLowerInvariant()
+
+                                    # Check for resource creation/deletion events
+                                    if ($normalized.Contains($createToken)) {
+                                        $existenceEvents.Add([PSCustomObject]@{ Timestamp = [DateTimeOffset]$ts; Type = 'Write' })
+                                    }
+                                    elseif ($normalized.Contains($deleteToken)) {
+                                        $existenceEvents.Add([PSCustomObject]@{ Timestamp = [DateTimeOffset]$ts; Type = 'Delete' })
+                                    }
+
+                                    $matched = $false; $eventGrace = 0
                                     foreach ($rule in $rules) {
                                         foreach ($t in $rule.Tokens) {
                                             if ($normalized.Contains($t)) {
@@ -1588,25 +1719,106 @@ function Invoke-SuspectGapInvestigation {
                         }
                     }
 
-                    # Merge overlapping/adjacent intervals into a minimal set
-                    # so that overlapping lifecycle events don't double-count.
-                    if ($rawIntervals.Count -gt 1) {
-                        $sorted = @($rawIntervals | Sort-Object FromTicks)
-                        $merged = [System.Collections.Generic.List[object]]::new()
-                        $merged.Add($sorted[0])
-                        for ($i = 1; $i -lt $sorted.Count; $i++) {
-                            $last = $merged[$merged.Count - 1]
-                            if ($sorted[$i].FromTicks -le $last.ToTicks) {
-                                # Overlaps or adjacent — extend current interval
-                                if ($sorted[$i].ToTicks -gt $last.ToTicks) {
-                                    $last.ToTicks = $sorted[$i].ToTicks
-                                    $last.To = $sorted[$i].To
-                                }
-                            } else { $merged.Add($sorted[$i]) }
+                    # Merge overlapping/adjacent intervals so that overlapping
+                    # lifecycle events don't double-count.
+                    $activityIntervals = MergeIntervals $rawIntervals
+
+                    # Build paired stop→start intervals for web apps.  Unlike VMs
+                    # (where Resource Health reports "Unavailable – Customer Initiated"
+                    # for the entire deallocated period), stopped web apps show only
+                    # "Available" in Resource Health.  We must infer the full stopped
+                    # window from the Activity Log stop and start/restart events.
+                    if ($c.Kind -eq 'WebApp') {
+                        $stopTokens  = $webAppRules[0].Tokens          # stop
+                        $startTokens = $webAppRules[1].Tokens + $webAppRules[2].Tokens  # start + restart
+
+                        $stopTs  = [System.Collections.Generic.List[DateTimeOffset]]::new()
+                        $startTs = [System.Collections.Generic.List[DateTimeOffset]]::new()
+                        foreach ($evt in $events) {
+                            $norm = $evt.OperationKey.ToLowerInvariant()
+                            foreach ($t in $stopTokens)  { if ($norm.Contains($t)) { $stopTs.Add($evt.Timestamp); break } }
+                            foreach ($t in $startTokens) { if ($norm.Contains($t)) { $startTs.Add($evt.Timestamp); break } }
                         }
-                        $activityIntervals = @($merged)
-                    } elseif ($rawIntervals.Count -eq 1) {
-                        $activityIntervals = @($rawIntervals[0])
+
+                        if ($stopTs.Count -gt 0) {
+                            $stopTs  = [System.Collections.Generic.List[DateTimeOffset]]($stopTs  | Sort-Object | Select-Object -Unique)
+                            $startTs = [System.Collections.Generic.List[DateTimeOffset]]($startTs | Sort-Object | Select-Object -Unique)
+
+                            $pairedIntervals = [System.Collections.Generic.List[object]]::new()
+                            foreach ($st in $stopTs) {
+                                $nextStart = $startTs | Where-Object { $_ -gt $st } | Select-Object -First 1
+                                $from = TruncMin $st
+                                $to   = if ($nextStart) { (TruncMin $nextStart).AddMinutes(1 + $graceMin) } else { $pEnd }
+                                if ($from -lt $pStart) { $from = $pStart }
+                                if ($to -gt $pEnd)     { $to = $pEnd }
+                                if ($to -gt $from) {
+                                    $pairedIntervals.Add([PSCustomObject]@{
+                                        From = $from;  To = $to
+                                        FromTicks = $from.UtcTicks; ToTicks = $to.UtcTicks
+                                    })
+                                }
+                            }
+                            if ($pairedIntervals.Count -gt 0) {
+                                $activityIntervals = MergeIntervals (@($activityIntervals) + @($pairedIntervals))
+                            }
+                        }
+                    }
+                }
+
+                # Build non-existence intervals from resource creation/deletion
+                # events.  Walk write+delete events chronologically as a state machine:
+                #   Write  → resource comes into existence (non-existence ends)
+                #   Delete → resource destroyed (non-existence begins)
+                # Non-existence intervals cover:
+                #   - periodStart → first Write (resource created mid-period)
+                #   - Delete → next Write (destroy/recreate cycle)
+                #   - last Delete → periodEnd (resource deleted, not recreated)
+                if ($existenceEvents.Count -gt 0) {
+                    $sortedExEvts = $existenceEvents | Sort-Object Timestamp
+                    $nonExistIntervals = [System.Collections.Generic.List[object]]::new()
+                    $exState = 'unknown'     # unknown | exists | not-exists
+                    $nonExistStart = $null   # timestamp where non-existence began
+
+                    foreach ($exEvt in $sortedExEvts) {
+                        if ($exEvt.Type -eq 'Write') {
+                            if ($exState -ne 'exists') {
+                                # Resource came into existence — close non-existence interval
+                                $nFrom = if ($nonExistStart) { TruncMin $nonExistStart } else { $pStart }
+                                $nTo   = (TruncMin $exEvt.Timestamp).AddMinutes(1 + $graceMin)
+                                if ($nFrom -lt $pStart) { $nFrom = $pStart }
+                                if ($nTo -gt $pEnd)     { $nTo = $pEnd }
+                                if ($nTo -gt $nFrom) {
+                                    $nonExistIntervals.Add([PSCustomObject]@{
+                                        From = $nFrom; To = $nTo
+                                        FromTicks = $nFrom.UtcTicks; ToTicks = $nTo.UtcTicks
+                                    })
+                                }
+                                $exState = 'exists'
+                                $nonExistStart = $null
+                            }
+                            # else: already exists, this is an update — ignore
+                        }
+                        elseif ($exEvt.Type -eq 'Delete') {
+                            $exState = 'not-exists'
+                            $nonExistStart = $exEvt.Timestamp
+                        }
+                    }
+
+                    # If resource was deleted and not recreated, non-existence extends to period end
+                    if ($exState -eq 'not-exists' -and $null -ne $nonExistStart) {
+                        $nFrom = TruncMin $nonExistStart
+                        if ($nFrom -lt $pStart) { $nFrom = $pStart }
+                        if ($pEnd -gt $nFrom) {
+                            $nonExistIntervals.Add([PSCustomObject]@{
+                                From = $nFrom; To = $pEnd
+                                FromTicks = $nFrom.UtcTicks; ToTicks = $pEnd.UtcTicks
+                            })
+                        }
+                    }
+
+                    # Merge non-existence intervals with lifecycle activity intervals
+                    if ($nonExistIntervals.Count -gt 0) {
+                        $activityIntervals = MergeIntervals (@($activityIntervals) + @($nonExistIntervals))
                     }
                 }
             }

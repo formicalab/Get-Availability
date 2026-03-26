@@ -16,6 +16,9 @@ namespace GetAvailability.Services;
 ///   - positive datapoints below 100% (DegradedSamples)
 /// Resources are only flagged for N/A exclusion when the metric API returns no usable datapoints
 /// at all for the full window.
+///
+/// Web Apps use MemoryWorkingSet (Average, bytes) instead of an availability percentage:
+///   >0 = available (1.0),  =0 = suspect zero,  null = suspect null.
 /// </summary>
 public static class MetricsService
 {
@@ -58,6 +61,7 @@ public static class MetricsService
     ///   VM:      VmAvailabilityMetric (0–1) — 1 metric
     ///   SQL DB:  Availability (0–100, normalised to 0–1) — 1 metric
     ///   Storage: Availability (0–100) + Transactions — 2 metrics, 1 API call
+    ///   WebApp:  MemoryWorkingSet (bytes, Average) — >0 = available (1.0), =0 = suspect zero
     /// Retries up to 5 times on 429 (throttle) and 5xx errors with exponential backoff.
     /// </summary>
     private static async Task<MetricScalars> QuerySingleResourceAsync(
@@ -69,12 +73,15 @@ public static class MetricsService
     {
         bool isVm = resource.Kind == "VirtualMachine";
         bool isStorage = resource.Kind == "StorageAccount";
+        bool isWebApp = resource.Kind == "WebApp";
 
         string[] metricNames;
         if (isVm)
             metricNames = ["VmAvailabilityMetric"];
         else if (isStorage)
             metricNames = ["Availability", "Transactions"];
+        else if (isWebApp)
+            metricNames = ["MemoryWorkingSet"];
         else
             metricNames = ["Availability"];
 
@@ -87,6 +94,10 @@ public static class MetricsService
         {
             options.Aggregations.Add(MetricAggregationType.Minimum);
             options.Aggregations.Add(MetricAggregationType.Total);
+        }
+        else if (isWebApp)
+        {
+            options.Aggregations.Add(MetricAggregationType.Average);
         }
         else
         {
@@ -133,6 +144,8 @@ public static class MetricsService
 
         if (isStorage)
             ProcessStorage(response, ref availSum, ref zeroTxMin, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks, out excludeFromAvailability, out degradedSamples);
+        else if (isWebApp)
+            ProcessWebApp(response, ref availSum, ref gapMinutes, out gapTicks, out zeroAvailTicks, out excludeFromAvailability);
         else
             ProcessVmOrSql(response, isVm, ref availSum, ref gapMinutes, ref degradedMinutes, out gapTicks, out zeroAvailTicks, out excludeFromAvailability, out degradedSamples);
 
@@ -218,6 +231,49 @@ public static class MetricsService
         zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
         excludeFromAvailability = numericAvailabilityPoints == 0 && nullTicks.Count == 0 && zeroTicks.Count == 0 && degraded.Count == 0;
         degradedSamples = degraded.Count > 0 ? degraded.ToArray() : null;
+    }
+
+    /// <summary>
+    /// Processes Web App metrics using MemoryWorkingSet (Average, bytes).
+    /// A non-null value >0 means the app process is running (available = 1.0).
+    /// A value of exactly 0 is suspect (stopped app). Null means no data (suspect null).
+    /// Web Apps have no degraded state — they are either running or not.
+    /// </summary>
+    private static void ProcessWebApp(MetricsQueryResult response,
+        ref double availSum, ref int gapMinutes,
+        out long[]? gapTicks, out long[]? zeroAvailTicks, out bool excludeFromAvailability)
+    {
+        var nullTicks = new List<long>();
+        var zeroTicks = new List<long>();
+        int numericPoints = 0;
+
+        foreach (var metric in response.Metrics)
+        {
+            if (!string.Equals(metric.Name, "MemoryWorkingSet", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            foreach (var ts in metric.TimeSeries)
+            foreach (var val in ts.Values)
+            {
+                if (val.Average.HasValue)
+                {
+                    numericPoints++;
+                    if (val.Average.Value > 0)
+                        availSum += 1.0;
+                    else
+                        zeroTicks.Add(val.TimeStamp.UtcTicks);
+                }
+                else
+                {
+                    nullTicks.Add(val.TimeStamp.UtcTicks);
+                }
+            }
+        }
+
+        gapMinutes = nullTicks.Count + zeroTicks.Count;
+        gapTicks = nullTicks.Count > 0 ? nullTicks.ToArray() : null;
+        zeroAvailTicks = zeroTicks.Count > 0 ? zeroTicks.ToArray() : null;
+        excludeFromAvailability = numericPoints == 0 && nullTicks.Count == 0 && zeroTicks.Count == 0;
     }
 
     /// <summary>

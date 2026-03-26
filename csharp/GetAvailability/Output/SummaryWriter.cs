@@ -1,3 +1,4 @@
+using System.Globalization;
 using GetAvailability.Models;
 
 namespace GetAvailability.Output;
@@ -55,13 +56,17 @@ public static class SummaryWriter
                 double a = g.Sum(r => r.AvailableMinutes);
                 double e = g.Sum(r => r.EligibleMinutes);
                 double pct = e > 0 ? Math.Round(a / e * 100, 5) : 0;
-                Console.WriteLine($"  {ShortKind(g.Key.Kind)}, {g.Key.Location} [{n} res]: {pct}% ({Math.Round(a, 2)} / {Math.Round(e, 2)} eligible min)");
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "  {0}, {1} [{2} res]: {3}% ({4} / {5} eligible min)",
+                    ShortKind(g.Key.Kind), g.Key.Location, n, pct, Math.Round(a, 2), Math.Round(e, 2)));
             }
             int tn = subGroup.Count();
             double ta = subGroup.Sum(r => r.AvailableMinutes);
             double te = subGroup.Sum(r => r.EligibleMinutes);
             double tpct = te > 0 ? Math.Round(ta / te * 100, 5) : 0;
-            Console.WriteLine($"  TOTAL [{tn} res]: {tpct}% ({Math.Round(ta, 2)} / {Math.Round(te, 2)} eligible min)");
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "  TOTAL [{0} res]: {1}% ({2} / {3} eligible min)",
+                tn, tpct, Math.Round(ta, 2), Math.Round(te, 2)));
             Console.WriteLine();
         }
 
@@ -78,13 +83,17 @@ public static class SummaryWriter
                 double a = g.Sum(r => r.AvailableMinutes);
                 double e = g.Sum(r => r.EligibleMinutes);
                 double pct = e > 0 ? Math.Round(a / e * 100, 5) : 0;
-                Console.WriteLine($"  {ShortKind(g.Key.Kind)}, {g.Key.Location} [{n} res]: {pct}% ({Math.Round(a, 2)} / {Math.Round(e, 2)} eligible min)");
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "  {0}, {1} [{2} res]: {3}% ({4} / {5} eligible min)",
+                    ShortKind(g.Key.Kind), g.Key.Location, n, pct, Math.Round(a, 2), Math.Round(e, 2)));
             }
             int on = eligible.Length;
             double oa = eligible.Sum(r => r.AvailableMinutes);
             double oe = eligible.Sum(r => r.EligibleMinutes);
             double opct = oe > 0 ? Math.Round(oa / oe * 100, 5) : 0;
-            Console.WriteLine($"  OVERALL [{on} res]: {opct}% ({Math.Round(oa, 2)} / {Math.Round(oe, 2)} eligible min)");
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "  OVERALL [{0} res]: {1}% ({2} / {3} eligible min)",
+                on, opct, Math.Round(oa, 2), Math.Round(oe, 2)));
             Console.WriteLine();
         }
     }
@@ -99,6 +108,7 @@ public static class SummaryWriter
         "VirtualMachine" => "VM",
         "AzureSqlDatabase" => "SQL",
         "StorageAccount" => "Storage",
+        "WebApp" => "Web",
         _ => kind
     };
 }

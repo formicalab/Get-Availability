@@ -112,8 +112,7 @@ public static class ResourceHealthService
         CancellationToken ct)
     {
         var activityIntervals = new List<(DateTimeOffset From, DateTimeOffset To)>();
-        if (ActivityLogService.SupportsKind(resource.Kind) &&
-            (allGapTicks.Length > 0 || (degradedSamples?.Length ?? 0) > 0))
+        if (allGapTicks.Length > 0 || (degradedSamples?.Length ?? 0) > 0)
         {
             try
             {

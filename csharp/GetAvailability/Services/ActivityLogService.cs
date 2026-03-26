@@ -4,14 +4,23 @@ using GetAvailability.Models;
 namespace GetAvailability.Services;
 
 /// <summary>
-/// Queries Azure Activity Log for lifecycle operations that can explain suspect availability
-/// minutes before Health History and fallback rules are applied.
+/// Queries Azure Activity Log for lifecycle operations and resource creation/deletion
+/// events that can explain suspect availability minutes before Health History and
+/// fallback rules are applied.
+///
+/// Lifecycle rules are kind-specific (VM, SQL, WebApp). Kinds with no known lifecycle
+/// operations (e.g. Storage) still get creation/deletion detection.
+///
+/// For Web Apps, paired stop→start intervals cover the full stopped window because
+/// Resource Health does not track stopped web app state (unlike VMs where deallocation
+/// creates "Unavailable – Customer Initiated").
 /// </summary>
 public static class ActivityLogService
 {
+    // All VM lifecycle operations apply grace (trailing metrics during state transitions).
     private static readonly ActivityOperationRule[] VmActivityRules =
     [
-        new(false,
+        new(true,
         [
             "microsoft.compute/virtualmachines/start/action",
             "start virtual machine",
@@ -26,7 +35,7 @@ public static class ActivityLogService
             "microsoft.compute/virtualmachines/poweroff/action",
             "power off virtual machine",
         ]),
-        new(false,
+        new(true,
         [
             "microsoft.compute/virtualmachines/restart/action",
             "restart virtual machine",
@@ -49,12 +58,43 @@ public static class ActivityLogService
         ]),
     ];
 
-    public static bool SupportsKind(string resourceKind)
-        => TryGetActivityLogRules(resourceKind, out _);
+    // Web App lifecycle: stop/start/restart all apply grace for trailing zero metrics
+    // during process shutdown/startup.
+    private static readonly ActivityOperationRule[] WebAppActivityRules =
+    [
+        new(true,
+        [
+            "microsoft.web/sites/stop/action",
+            "stop web app",
+            "stopwebsite",
+        ]),
+        new(true,
+        [
+            "microsoft.web/sites/start/action",
+            "start web app",
+            "startwebsite",
+        ]),
+        new(true,
+        [
+            "microsoft.web/sites/restart/action",
+            "restart web app",
+            "restartwebsite",
+        ]),
+    ];
+
+    /// <summary>Maps resource kind to its ARM namespace for creation/deletion token matching.</summary>
+    private static readonly Dictionary<string, string> KindNamespace = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["VirtualMachine"] = "microsoft.compute/virtualmachines",
+        ["AzureSqlDatabase"] = "microsoft.sql/servers/databases",
+        ["StorageAccount"] = "microsoft.storage/storageaccounts",
+        ["WebApp"] = "microsoft.web/sites",
+    };
 
     /// <summary>
-    /// Builds merged lifecycle intervals from pre-fetched Log Analytics activity events.
-    /// Used when -Workspace is specified, replacing REST API calls with bulk KQL data.
+    /// Builds merged lifecycle + existence intervals from pre-fetched Log Analytics
+    /// activity events. Used when --workspace is specified, replacing REST API calls
+    /// with bulk KQL data.
     /// </summary>
     public static List<(DateTimeOffset From, DateTimeOffset To)> BuildLifecycleIntervalsFromEvents(
         IReadOnlyList<LogAnalyticsActivityEvent> laEvents,
@@ -63,31 +103,63 @@ public static class ActivityLogService
         DateTimeOffset periodEnd,
         int activityGraceMinutes)
     {
-        if (!TryGetActivityLogRules(resourceKind, out var activityRules))
-            return [];
+        TryGetActivityLogRules(resourceKind, out var activityRules);
 
-        var events = new List<ActivityLogEvent>();
-        foreach (var laEvt in laEvents)
+        string? createToken = null, deleteToken = null;
+        if (KindNamespace.TryGetValue(resourceKind, out var ns))
         {
-            if (!TryMatchActivityOperation(laEvt.OperationName, activityRules, activityGraceMinutes, out int graceMinutes))
-                continue;
-
-            events.Add(new ActivityLogEvent(
-                laEvt.Timestamp.ToUniversalTime(),
-                laEvt.OperationName,
-                laEvt.CorrelationId,
-                graceMinutes));
+            createToken = ns + "/write";
+            deleteToken = ns + "/delete";
         }
 
-        if (events.Count == 0)
-            return [];
+        var lifecycleEvents = new List<ActivityLogEvent>();
+        var existenceEvents = new List<(DateTimeOffset Timestamp, string Type)>();
 
-        return BuildIntervalsFromEvents(events, periodStart, periodEnd);
+        foreach (var laEvt in laEvents)
+        {
+            var normalized = laEvt.OperationName.ToLowerInvariant();
+
+            // Check for resource creation/deletion events
+            if (createToken is not null && normalized.Contains(createToken, StringComparison.OrdinalIgnoreCase))
+                existenceEvents.Add((laEvt.Timestamp.ToUniversalTime(), "Write"));
+            else if (deleteToken is not null && normalized.Contains(deleteToken, StringComparison.OrdinalIgnoreCase))
+                existenceEvents.Add((laEvt.Timestamp.ToUniversalTime(), "Delete"));
+
+            // Check for lifecycle operations
+            if (activityRules is not null &&
+                TryMatchActivityOperation(laEvt.OperationName, activityRules, activityGraceMinutes, out int graceMinutes))
+            {
+                lifecycleEvents.Add(new ActivityLogEvent(
+                    laEvt.Timestamp.ToUniversalTime(),
+                    laEvt.OperationName,
+                    laEvt.CorrelationId,
+                    graceMinutes));
+            }
+        }
+
+        var intervals = lifecycleEvents.Count > 0
+            ? BuildIntervalsFromEvents(lifecycleEvents, periodStart, periodEnd)
+            : new List<(DateTimeOffset, DateTimeOffset)>();
+
+        // For web apps, build paired stop→start spanning intervals
+        if (resourceKind.Equals("WebApp", StringComparison.OrdinalIgnoreCase) && lifecycleEvents.Count > 0)
+        {
+            var pairedIntervals = BuildPairedStopStartIntervals(lifecycleEvents, periodStart, periodEnd, activityGraceMinutes);
+            if (pairedIntervals.Count > 0)
+                intervals = MergeIntervals([.. intervals, .. pairedIntervals]);
+        }
+
+        // Build non-existence intervals from creation/deletion events
+        var nonExistIntervals = BuildNonExistenceIntervals(existenceEvents, periodStart, periodEnd, activityGraceMinutes);
+        if (nonExistIntervals.Count > 0)
+            intervals = MergeIntervals([.. intervals, .. nonExistIntervals]);
+
+        return intervals;
     }
 
     /// <summary>
-    /// Builds merged lifecycle intervals for a supported resource kind from Activity Log events
-    /// fetched via the REST API.
+    /// Builds merged lifecycle + existence intervals for a resource from Activity Log
+    /// events fetched via the REST API.
     /// </summary>
     public static async Task<List<(DateTimeOffset From, DateTimeOffset To)>> BuildLifecycleIntervalsAsync(
         HttpClient http,
@@ -97,10 +169,9 @@ public static class ActivityLogService
         int activityGraceMinutes,
         CancellationToken ct)
     {
-        if (!TryGetActivityLogRules(resource.Kind, out var activityRules))
-            return [];
+        TryGetActivityLogRules(resource.Kind, out var activityRules);
 
-        var events = await FetchLifecycleEventsAsync(
+        var (lifecycleEvents, existenceEvents) = await FetchActivityEventsAsync(
             http,
             resource,
             periodStart,
@@ -108,10 +179,25 @@ public static class ActivityLogService
             activityGraceMinutes,
             activityRules,
             ct);
-        if (events.Count == 0)
-            return [];
 
-        return BuildIntervalsFromEvents(events, periodStart, periodEnd);
+        var intervals = lifecycleEvents.Count > 0
+            ? BuildIntervalsFromEvents(lifecycleEvents, periodStart, periodEnd)
+            : new List<(DateTimeOffset, DateTimeOffset)>();
+
+        // For web apps, build paired stop→start spanning intervals
+        if (resource.Kind.Equals("WebApp", StringComparison.OrdinalIgnoreCase) && lifecycleEvents.Count > 0)
+        {
+            var pairedIntervals = BuildPairedStopStartIntervals(lifecycleEvents, periodStart, periodEnd, activityGraceMinutes);
+            if (pairedIntervals.Count > 0)
+                intervals = MergeIntervals([.. intervals, .. pairedIntervals]);
+        }
+
+        // Build non-existence intervals from creation/deletion events
+        var nonExistIntervals = BuildNonExistenceIntervals(existenceEvents, periodStart, periodEnd, activityGraceMinutes);
+        if (nonExistIntervals.Count > 0)
+            intervals = MergeIntervals([.. intervals, .. nonExistIntervals]);
+
+        return intervals;
     }
 
     /// <summary>
@@ -146,16 +232,30 @@ public static class ActivityLogService
         return MergeIntervals(rawIntervals);
     }
 
-    private static async Task<List<ActivityLogEvent>> FetchLifecycleEventsAsync(
+    /// <summary>
+    /// Fetches Activity Log events via the REST API, collecting both lifecycle events
+    /// (matched by kind-specific rules) and creation/deletion events (matched by
+    /// namespace write/delete tokens). Returns both lists.
+    /// </summary>
+    private static async Task<(List<ActivityLogEvent> LifecycleEvents, List<(DateTimeOffset Timestamp, string Type)> ExistenceEvents)> FetchActivityEventsAsync(
         HttpClient http,
         TrackedResource resource,
         DateTimeOffset periodStart,
         DateTimeOffset periodEnd,
         int activityGraceMinutes,
-        IReadOnlyList<ActivityOperationRule> activityRules,
+        ActivityOperationRule[]? activityRules,
         CancellationToken ct)
     {
-        var events = new List<ActivityLogEvent>();
+        var lifecycleEvents = new List<ActivityLogEvent>();
+        var existenceEvents = new List<(DateTimeOffset Timestamp, string Type)>();
+
+        string? createToken = null, deleteToken = null;
+        if (KindNamespace.TryGetValue(resource.Kind, out var ns))
+        {
+            createToken = ns + "/write";
+            deleteToken = ns + "/delete";
+        }
+
         string filter = $"eventTimestamp ge '{periodStart:O}' and eventTimestamp le '{periodEnd:O}' and resourceUri eq '{resource.ResourceId}'";
         string select = "eventTimestamp,operationName,correlationId,status";
 
@@ -183,16 +283,24 @@ public static class ActivityLogService
                     string operationValue = GetNestedPropString(item, "operationName", "value");
                     string operationLabel = GetNestedPropString(item, "operationName", "localizedValue");
                     string operationKey = string.IsNullOrWhiteSpace(operationValue) ? operationLabel : operationValue;
-                    if (!TryMatchActivityOperation(operationKey, activityRules, activityGraceMinutes, out int graceMinutes))
-                        continue;
+                    if (string.IsNullOrWhiteSpace(operationKey)) continue;
 
-                    string correlationId = GetPropString(item, "correlationId");
+                    var normalized = operationKey.ToLowerInvariant();
+                    var ts = occurred.Value.ToUniversalTime();
 
-                    events.Add(new ActivityLogEvent(
-                        occurred.Value.ToUniversalTime(),
-                        operationKey,
-                        correlationId,
-                        graceMinutes));
+                    // Check for resource creation/deletion events
+                    if (createToken is not null && normalized.Contains(createToken, StringComparison.OrdinalIgnoreCase))
+                        existenceEvents.Add((ts, "Write"));
+                    else if (deleteToken is not null && normalized.Contains(deleteToken, StringComparison.OrdinalIgnoreCase))
+                        existenceEvents.Add((ts, "Delete"));
+
+                    // Check for lifecycle operations
+                    if (activityRules is not null &&
+                        TryMatchActivityOperation(operationKey, activityRules, activityGraceMinutes, out int graceMinutes))
+                    {
+                        string correlationId = GetPropString(item, "correlationId");
+                        lifecycleEvents.Add(new ActivityLogEvent(ts, operationKey, correlationId, graceMinutes));
+                    }
                 }
             }
 
@@ -202,7 +310,7 @@ public static class ActivityLogService
                 : null;
         }
 
-        return events;
+        return (lifecycleEvents, existenceEvents);
     }
 
     private static async Task<string> GetWithRetryAsync(HttpClient http, string url, CancellationToken ct)
@@ -226,7 +334,7 @@ public static class ActivityLogService
         }
     }
 
-    private static bool TryGetActivityLogRules(string resourceKind, out ActivityOperationRule[] rules)
+    private static bool TryGetActivityLogRules(string resourceKind, out ActivityOperationRule[]? rules)
     {
         if (resourceKind.Equals("VirtualMachine", StringComparison.OrdinalIgnoreCase))
         {
@@ -240,7 +348,13 @@ public static class ActivityLogService
             return true;
         }
 
-        rules = [];
+        if (resourceKind.Equals("WebApp", StringComparison.OrdinalIgnoreCase))
+        {
+            rules = WebAppActivityRules;
+            return true;
+        }
+
+        rules = null;
         return false;
     }
 
@@ -301,6 +415,116 @@ public static class ActivityLogService
         }
 
         return merged;
+    }
+
+    /// <summary>
+    /// For web apps, builds spanning intervals from stop→start/restart pairs.
+    /// Unlike VMs (where Resource Health reports "Unavailable – Customer Initiated"
+    /// for the entire deallocated period), stopped web apps show only "Available"
+    /// in Resource Health. We infer the full stopped window from Activity Log events.
+    /// An unpaired trailing stop extends to periodEnd.
+    /// </summary>
+    private static List<(DateTimeOffset From, DateTimeOffset To)> BuildPairedStopStartIntervals(
+        List<ActivityLogEvent> events,
+        DateTimeOffset periodStart,
+        DateTimeOffset periodEnd,
+        int activityGraceMinutes)
+    {
+        var stopTokens = WebAppActivityRules[0].MatchTokens;   // stop
+        var startTokens = WebAppActivityRules[1].MatchTokens    // start
+            .Concat(WebAppActivityRules[2].MatchTokens)         // restart
+            .ToArray();
+
+        var stopTimes = new List<DateTimeOffset>();
+        var startTimes = new List<DateTimeOffset>();
+
+        foreach (var evt in events)
+        {
+            var norm = evt.OperationKey.ToLowerInvariant();
+            if (stopTokens.Any(t => norm.Contains(t, StringComparison.OrdinalIgnoreCase)))
+                stopTimes.Add(evt.Timestamp);
+            else if (startTokens.Any(t => norm.Contains(t, StringComparison.OrdinalIgnoreCase)))
+                startTimes.Add(evt.Timestamp);
+        }
+
+        if (stopTimes.Count == 0)
+            return [];
+
+        stopTimes.Sort();
+        startTimes.Sort();
+
+        var intervals = new List<(DateTimeOffset From, DateTimeOffset To)>();
+        foreach (var stop in stopTimes)
+        {
+            var nextStart = startTimes.FirstOrDefault(s => s > stop);
+            var from = TruncateToMinute(stop);
+            var to = nextStart != default
+                ? TruncateToMinute(nextStart).AddMinutes(1 + activityGraceMinutes)
+                : periodEnd;
+            if (from < periodStart) from = periodStart;
+            if (to > periodEnd) to = periodEnd;
+            if (to > from)
+                intervals.Add((from, to));
+        }
+
+        return intervals;
+    }
+
+    /// <summary>
+    /// Builds non-existence intervals from resource creation/deletion events using a
+    /// state machine. Non-existence intervals cover:
+    ///   - periodStart → first Write (resource created mid-period)
+    ///   - Delete → next Write (destroy/recreate cycle)
+    ///   - last Delete → periodEnd (resource deleted, not recreated)
+    /// </summary>
+    private static List<(DateTimeOffset From, DateTimeOffset To)> BuildNonExistenceIntervals(
+        List<(DateTimeOffset Timestamp, string Type)> existenceEvents,
+        DateTimeOffset periodStart,
+        DateTimeOffset periodEnd,
+        int activityGraceMinutes)
+    {
+        if (existenceEvents.Count == 0)
+            return [];
+
+        var sorted = existenceEvents.OrderBy(e => e.Timestamp).ToList();
+        var intervals = new List<(DateTimeOffset From, DateTimeOffset To)>();
+        string state = "unknown";     // unknown | exists | not-exists
+        DateTimeOffset? nonExistStart = null;
+
+        foreach (var (timestamp, type) in sorted)
+        {
+            if (type == "Write")
+            {
+                if (state != "exists")
+                {
+                    // Resource came into existence — close non-existence interval
+                    var from = nonExistStart.HasValue ? TruncateToMinute(nonExistStart.Value) : periodStart;
+                    var to = TruncateToMinute(timestamp).AddMinutes(1 + activityGraceMinutes);
+                    if (from < periodStart) from = periodStart;
+                    if (to > periodEnd) to = periodEnd;
+                    if (to > from)
+                        intervals.Add((from, to));
+                    state = "exists";
+                    nonExistStart = null;
+                }
+            }
+            else if (type == "Delete")
+            {
+                state = "not-exists";
+                nonExistStart = timestamp;
+            }
+        }
+
+        // If resource was deleted and not recreated, non-existence extends to period end
+        if (state == "not-exists" && nonExistStart.HasValue)
+        {
+            var from = TruncateToMinute(nonExistStart.Value);
+            if (from < periodStart) from = periodStart;
+            if (periodEnd > from)
+                intervals.Add((from, periodEnd));
+        }
+
+        return intervals;
     }
 
     private static DateTimeOffset ExtendActivityInterval(int graceMinutes, DateTimeOffset currentEnd)

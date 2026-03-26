@@ -24,6 +24,7 @@ public static class BatchMetricsService
         ["VirtualMachine"] = new("Microsoft.Compute/virtualMachines", "VmAvailabilityMetric", "Minimum"),
         ["AzureSqlDatabase"] = new("Microsoft.Sql/servers/databases", "Availability", "Minimum"),
         ["StorageAccount"] = new("Microsoft.Storage/storageAccounts", "Availability,Transactions", "Minimum,Total"),
+        ["WebApp"] = new("Microsoft.Web/sites", "MemoryWorkingSet", "Average"),
     };
 
     /// <summary>
@@ -131,6 +132,7 @@ public static class BatchMetricsService
     {
         bool isVm = workItem.Kind == "VirtualMachine";
         bool isStorage = workItem.Kind == "StorageAccount";
+        bool isWebApp = workItem.Kind == "WebApp";
 
         var resourceIds = workItem.Resources.Select(r => r.ResourceId).ToArray();
 
@@ -229,6 +231,8 @@ public static class BatchMetricsService
 
                 if (isStorage)
                     results[resIdLower] = ProcessStorageBatch(metricValueArr);
+                else if (isWebApp)
+                    results[resIdLower] = ProcessWebAppBatch(metricValueArr);
                 else
                     results[resIdLower] = ProcessVmOrSqlBatch(metricValueArr, isVm);
             }
@@ -379,6 +383,53 @@ public static class BatchMetricsService
             degraded.Count > 0 ? degraded.ToArray() : null);
     }
 
+    /// <summary>
+    /// Processes Web App batch response using MemoryWorkingSet (Average, bytes).
+    /// Non-null value >0 = available (1.0), exactly 0 = suspect zero, null = suspect null.
+    /// </summary>
+    private static MetricScalars ProcessWebAppBatch(JsonElement metricValueArr)
+    {
+        double availSum = 0;
+        int numericPoints = 0;
+        var nullTicks = new List<long>();
+        var zeroTicks = new List<long>();
+
+        foreach (var metricEl in metricValueArr.EnumerateArray())
+        {
+            string mName = metricEl.GetProperty("name").GetProperty("value").GetString()!;
+            if (!mName.Equals("MemoryWorkingSet", StringComparison.OrdinalIgnoreCase)) continue;
+
+            foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
+            foreach (var dp in tsEl.GetProperty("data").EnumerateArray())
+            {
+                long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!).ToUniversalTime().Ticks;
+                double? avgVal = TryGetDouble(dp, "average");
+
+                if (avgVal.HasValue)
+                {
+                    numericPoints++;
+                    if (avgVal.Value > 0)
+                        availSum += 1.0;
+                    else
+                        zeroTicks.Add(ticks);
+                }
+                else
+                {
+                    nullTicks.Add(ticks);
+                }
+            }
+        }
+
+        int gapMinutes = nullTicks.Count + zeroTicks.Count;
+        bool exclude = numericPoints == 0 && nullTicks.Count == 0 && zeroTicks.Count == 0;
+
+        return new MetricScalars(
+            availSum, gapMinutes, 0, exclude,
+            nullTicks.Count > 0 ? nullTicks.ToArray() : null,
+            zeroTicks.Count > 0 ? zeroTicks.ToArray() : null,
+            0, null);
+    }
+
     /// <summary>Tries to read a double from a JSON data-point element. Returns null if the property is absent or not a number.</summary>
     private static double? TryGetDouble(JsonElement element, string propertyName)
     {
@@ -400,6 +451,7 @@ public static class BatchMetricsService
         "VirtualMachine" => "VM",
         "AzureSqlDatabase" => "SQL",
         "StorageAccount" => "Storage",
+        "WebApp" => "Web",
         _ => kind,
     };
 
