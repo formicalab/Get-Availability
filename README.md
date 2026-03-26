@@ -3,7 +3,7 @@
 [![CI](https://github.com/formicalab/Get-Availability/actions/workflows/ci.yml/badge.svg)](https://github.com/formicalab/Get-Availability/actions/workflows/ci.yml)
 [![Release](https://github.com/formicalab/Get-Availability/actions/workflows/release.yml/badge.svg)](https://github.com/formicalab/Get-Availability/actions/workflows/release.yml)
 
-Reports month-scoped availability for Azure Virtual Machines, Azure SQL Databases, and Azure Storage Accounts across one or more Azure subscriptions.
+Reports month-scoped availability for Azure Virtual Machines, Azure SQL Databases, Azure Storage Accounts, and Azure Web Apps across one or more Azure subscriptions.
 
 Two equivalent implementations are provided:
 
@@ -56,7 +56,7 @@ If Azure authentication fails, the tool prints the SDK/module exception message 
 |---|---|---|---|
 | `--subscriptions` | `-s` | *(required)* | One or more Azure subscription display names |
 | `--month` | `-m` | *(required)* | Observation month in UTC, format `YYYYMM` |
-| `--kinds` | `-k` | `vm sql storage` | Resource kinds to process |
+| `--kinds` | `-k` | `vm sql storage webapp` | Resource kinds to process |
 | `--resource` | `-r` | *(all)* | Filter to a single resource name |
 | `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
 | `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for Activity Log lifecycle events |
@@ -71,7 +71,7 @@ If Azure authentication fails, the tool prints the SDK/module exception message 
 |---|---|---|
 | `-Subscriptions` | *(required)* | One or more Azure subscription display names |
 | `-Month` | *(required)* | Observation month in UTC, format `YYYYMM` |
-| `-Kinds` | `vm,sql,storage` | Resource kinds to process |
+| `-Kinds` | `vm,sql,storage,webapp` | Resource kinds to process |
 | `-Resource` | *(all)* | Filter to a single resource name |
 | `-Parallelism` | *(auto)* | Max concurrent API calls (scales to CPU cores, 4–16) |
 | `-ActivityGraceMinutes` | `10` | Post-operation grace window for Activity Log lifecycle events |
@@ -153,7 +153,7 @@ When `-Workspace` is used, the 30-day warning is suppressed (hybrid coverage app
 Log Analytics workspace: b233a4b7-…-1f6ff217ddd4 (Activity Log via KQL, Resource Health via KQL + REST API hybrid)
 ```
 
-Table view (Kind is abbreviated: VM, SQL, Storage):
+Table view (Kind is abbreviated: VM, SQL, Storage, Web):
 
 | Subscription | Name | Kind | Location | Suspect | Faults | Excused | Unresolved | AvailMin | EligMin | Avail% |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -177,7 +177,7 @@ The PowerShell version also emits result objects to the pipeline, so output can 
 
 ### Resource inventory
 
-A KQL query against the Resource Graph `resources` table returns all matching VMs, SQL databases (excluding system `master` DBs), and Storage Accounts. Server-side filters are applied when `--kinds` or `--resource` are provided.
+A KQL query against the Resource Graph `resources` table returns all matching VMs, SQL databases (excluding system `master` DBs), Storage Accounts, and Web Apps (excluding Function Apps). Server-side filters are applied when `--kinds` or `--resource` are provided.
 
 ### Metric collection
 
@@ -191,6 +191,7 @@ Azure Monitor is queried at PT1M granularity (one data point per minute) with re
 | Virtual Machine | `VmAvailabilityMetric` | 0.0–1.0 | Minimum |
 | Azure SQL Database | `Availability` | 0–100 → normalised to 0.0–1.0 | Minimum |
 | Storage Account | `Availability`, `Transactions` | 0–100 → normalised to 0.0–1.0 | Minimum, Total |
+| Web App | `MemoryWorkingSet` | bytes (binary: >0 = available, 0 = stopped, null = suspect) | Average |
 
 Each data point is classified as follows:
 
@@ -201,6 +202,9 @@ Each data point is classified as follows:
 | Value = 0% | Recorded as a **0%-valued suspect minute** |
 | Value = null | Recorded as a **null suspect minute** |
 | Storage: Transactions = 0 | No availability signal — counted as both suspect and excused, excluded from eligibility |
+| Web App: MemoryWorkingSet > 0 | App process is alive — adds `1.0` to `AvailableSum` (fully available) |
+| Web App: MemoryWorkingSet = 0 | App process is stopped — recorded as a **0%-valued suspect minute** |
+| Web App: MemoryWorkingSet = null | Platform cannot collect data — recorded as a **null suspect minute** |
 
 Any minute with `null` or a value below `100%` is a **suspect minute**. Contiguous suspect minutes form a **suspect gap** (used for narration only — investigation is always minute-by-minute).
 
@@ -208,10 +212,12 @@ Any minute with `null` or a value below `100%` is a **suspect minute**. Contiguo
 
 For every resource with suspect minutes, the tool investigates each minute with the following precedence:
 
-**1. Activity Log** — For supported resource kinds, lifecycle operations representing deliberate administrative action are checked:
+**1. Activity Log** — Lifecycle operations representing deliberate administrative action are checked:
 
+- **All kinds**: resource creation (`*/write`) and deletion (`*/delete`) — minutes when the resource did not exist are excused (before first creation, between delete→recreate cycles, after final deletion)
 - **VMs**: `start/action`, `deallocate/action`, `powerOff/action`, `restart/action`
 - **SQL DBs**: `pause`, `resume`
+- **Web Apps**: `stop/action`, `start/action`, `restart/action`
 
 Matching minutes are treated as customer/admin lifecycle activity and removed from eligibility. A configurable grace window (`--activity-grace-minutes`, default 10) extends these intervals to cover trailing transition datapoints.
 

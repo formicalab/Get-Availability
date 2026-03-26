@@ -45,7 +45,18 @@ public static class LogAnalyticsService
               'MICROSOFT.COMPUTE/VIRTUALMACHINES/POWEROFF/ACTION',
               'MICROSOFT.COMPUTE/VIRTUALMACHINES/RESTART/ACTION',
               'MICROSOFT.SQL/SERVERS/DATABASES/PAUSE/ACTION',
-              'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION'
+              'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION',
+              'MICROSOFT.WEB/SITES/STOP/ACTION',
+              'MICROSOFT.WEB/SITES/START/ACTION',
+              'MICROSOFT.WEB/SITES/RESTART/ACTION',
+              'MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE',
+              'MICROSOFT.COMPUTE/VIRTUALMACHINES/DELETE',
+              'MICROSOFT.SQL/SERVERS/DATABASES/WRITE',
+              'MICROSOFT.SQL/SERVERS/DATABASES/DELETE',
+              'MICROSOFT.STORAGE/STORAGEACCOUNTS/WRITE',
+              'MICROSOFT.STORAGE/STORAGEACCOUNTS/DELETE',
+              'MICROSOFT.WEB/SITES/WRITE',
+              'MICROSOFT.WEB/SITES/DELETE'
             ]);
             let actData = AzureActivity
                 | where SubscriptionId in (subs)
@@ -59,7 +70,7 @@ public static class LogAnalyticsService
             let healthData = AzureActivity
                 | where SubscriptionId in (subs)
                 | where CategoryValue == 'ResourceHealth'
-                | where ResourceProviderValue in ('MICROSOFT.COMPUTE', 'MICROSOFT.SQL', 'MICROSOFT.STORAGE')
+                | where ResourceProviderValue in ('MICROSOFT.COMPUTE', 'MICROSOFT.SQL', 'MICROSOFT.STORAGE', 'MICROSOFT.WEB')
                 | project TimeGenerated, ResourceId=tolower(_ResourceId),
                           Source='Health', OperationName=OperationNameValue,
                           Properties=todynamic(Properties);

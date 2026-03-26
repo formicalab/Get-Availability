@@ -7,10 +7,14 @@
 //
 // A suspect minute is any metric datapoint that is null or below 100%.
 // Contiguous suspect minutes form "suspect gaps" for narration purposes.
-// For supported resource types, suspect minutes are first checked against
-// Activity Log lifecycle operations:
-//   – Virtual Machines: start/deallocate/power off/restart
-//   – Azure SQL Databases: pause/resume
+// Suspect minutes are first checked against Activity Log events:
+//   a) Resource creation/deletion — excuses non-existence intervals
+//      (before first write, between delete→write cycles, after final delete).
+//   b) Kind-specific lifecycle operations:
+//      – Virtual Machines: start/deallocate/power off/restart
+//      – Azure SQL Databases: pause/resume
+//      – Web Apps: stop/start/restart (paired stop→start spanning intervals)
+//   Kinds with no known lifecycle ops (e.g. Storage) produce no matches here.
 // Resource Health is then applied for the overlap with its current retention window:
 //   – platform fault confirmed (Unavailable/Degraded) → counts as downtime
 //   – Unknown / customer-initiated → valid explanation for null and 0% suspect minutes
@@ -44,7 +48,7 @@ using GetAvailability.Services;
 //           --batch, --batch-size, --workspace, --help
 
 string[] subscriptionNames = [];
-string[] kinds = ["vm", "sql", "storage"];
+string[] kinds = ["vm", "sql", "storage", "webapp"];
 string? resourceName = null;
 string? monthParameter = null;
 int parallelism = Math.Clamp(Environment.ProcessorCount, 4, 16);
@@ -95,7 +99,7 @@ for (int i = 0; i < args.Length; i++)
             Console.WriteLine("Usage: GetAvailability --subscriptions <name1> [name2 ...] [options]");
             Console.WriteLine("  --subscriptions, -s  Required. One or more Azure subscription display names.");
             Console.WriteLine("  --month, -m          Required. Observation month in UTC, format YYYYMM.");
-            Console.WriteLine("  --kinds, -k          Resource kinds: vm, sql, storage (default: all).");
+            Console.WriteLine("  --kinds, -k          Resource kinds: vm, sql, storage, webapp (default: all).");
             Console.WriteLine("  --resource, -r       Filter to a single resource name.");
             Console.WriteLine("  --parallelism, -p    Max concurrent metric calls (default: auto).");
             Console.WriteLine("  --activity-grace-minutes, -g  Post-operation grace window for supported Activity Log lifecycle events (default: 10).");
@@ -191,7 +195,7 @@ static async Task RunAsync(
     Console.WriteLine($"Processing {resolved.Count} subscription(s): {string.Join(", ", resolved.Select(r => r.Name))}");
     Console.WriteLine($"Kinds: {string.Join(", ", kinds)}");
 
-    // Step 2: Query Resource Graph for all VMs, SQL DBs, and Storage Accounts
+    // Step 2: Query Resource Graph for all VMs, SQL DBs, Storage Accounts, and Web Apps
     Console.Write("Querying resource inventory... ");
     var resources = await ResourceInventoryService.QueryAsync(armClient, subIds, subIdToName, kinds, resourceName);
     Console.WriteLine($"Found {resources.Count} resource(s) across {resolved.Count} subscription(s).");
