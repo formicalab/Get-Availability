@@ -30,15 +30,17 @@
     Remaining null minutes become metric issues (excluded from eligibility),
     while remaining 0% minutes are trusted as downtime.
 
-    When -Workspace is specified, Activity Log lifecycle events are fetched
-    from a Log Analytics workspace via a single bulk KQL query instead of
-    per-resource REST API calls. This is faster for large estates and uses
+    When -SourceWorkspaceId is specified, Activity Log lifecycle events are
+    fetched from a Log Analytics workspace via a single bulk KQL query instead
+    of per-resource REST API calls. This is faster for large estates and uses
     workspace retention (typically 365 days). Resource Health data uses a
     hybrid approach: Log Analytics transitions cover the period beyond the
     REST API's ~30-day retention, while REST API transitions (curated,
     synthetic, with retroactively corrected causes) are authoritative for
     the last ~30 days. The two sources are merged to produce complete
-    coverage. Without -Workspace, the REST APIs are used directly.
+    coverage. Without -SourceWorkspaceId, the REST APIs are used directly.
+    Note: this is NOT the workspace used for result ingestion (see
+    -DceEndpoint / -DcrImmutableId for that).
 
     The observation window is a UTC calendar month selected via -Month YYYYMM.
     Current month runs month-to-date; past months run full-month.
@@ -67,16 +69,16 @@
 .PARAMETER BatchSize
     Max resources per batch call (default: 10, max 50). Implies -Batch.
 
-.PARAMETER Workspace
-    Log Analytics workspace ID (GUID). When provided, Activity Log lifecycle
-    events are fetched from the AzureActivity table in this workspace via a
-    single bulk KQL query instead of per-resource REST API calls. Resource
-    Health uses a hybrid approach: Log Analytics transitions cover the period
-    beyond the REST API's ~30-day retention limit, while REST API transitions
-    (curated, with corrected causes) are authoritative for the last ~30 days.
-    Faster for large estates and provides complete Resource Health coverage
-    across the full observation window. Requires the workspace to receive
-    Activity Log diagnostic settings from the target subscriptions.
+.PARAMETER SourceWorkspaceId
+    Log Analytics workspace ID (GUID) used as a source for historical Activity
+    Log and Resource Health data. This is NOT the ingestion target — it is
+    an existing workspace that receives Activity Log diagnostic settings from
+    the target subscriptions. When provided, lifecycle events are fetched via
+    a single bulk KQL query (faster for large estates, uses workspace
+    retention). Resource Health uses a hybrid approach: Log Analytics
+    transitions cover the period beyond the REST API's ~30-day retention
+    limit, while REST API transitions (curated, with corrected causes) are
+    authoritative for the last ~30 days.
 
 .PARAMETER DceEndpoint
     Data Collection Endpoint ingestion URL. When both -DceEndpoint and
@@ -100,7 +102,7 @@
     ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Batch -BatchSize 20
 
 .EXAMPLE
-    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Workspace 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
+    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -SourceWorkspaceId 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
 
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -DceEndpoint 'https://dce-getavail-itn-001.italynorth-1.ingest.monitor.azure.com' -DcrImmutableId 'dcr-00000000000000000000000000000000'
@@ -140,7 +142,7 @@ param(
 
     [Parameter(ParameterSetName = 'Run')]
     [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
-    [string]$Workspace,
+    [string]$SourceWorkspaceId,
 
     [Parameter(ParameterSetName = 'Run')]
     [ValidateNotNullOrEmpty()]
@@ -358,9 +360,9 @@ function Get-ShortKind([string]$Kind) {
 
 ## Returns the effective start of the Resource Health coverage window, clamped
 ## to PeriodStart if coverage spans the full observation period.
-## When using Log Analytics (-Workspace), the hybrid approach (LA for older
-## transitions + REST API for the last ~30 days) provides coverage from
-## PeriodStart. Without -Workspace, coverage is limited to ~30 days.
+## When using Log Analytics (-SourceWorkspaceId), the hybrid approach (LA for
+## older transitions + REST API for the last ~30 days) provides coverage from
+## PeriodStart. Without -SourceWorkspaceId, coverage is limited to ~30 days.
 function Get-HealthCoverageStart([DateTimeOffset]$PeriodStart, [switch]$UseLogAnalytics) {
     if ($UseLogAnalytics) { return $PeriodStart }
     $now = [DateTimeOffset]::UtcNow
@@ -1511,8 +1513,8 @@ function Invoke-SuspectGapInvestigation {
 
     # Shared HttpClient for REST API calls within the parallel block.
     # Always created: needed for Resource Health REST calls (sole source
-    # without -Workspace; hybrid supplement with -Workspace) and for
-    # Activity Log REST calls when -Workspace is not specified.
+    # without -SourceWorkspaceId; hybrid supplement with -SourceWorkspaceId)
+    # and for Activity Log REST calls when -SourceWorkspaceId is not specified.
     $gapHttpClient = [System.Net.Http.HttpClient]::new()
     $gapHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
     $gapHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
@@ -1925,12 +1927,12 @@ function Invoke-SuspectGapInvestigation {
         # ── Resource Health ───────────────────────────────────────────
         # Query Resource Health transitions to classify platform faults,
         # unknown states, and customer-initiated events.
-        # Hybrid mode (-Workspace): LA transitions older than the REST API
-        # ~30-day cutoff are merged with REST API transitions for the last
+        # Hybrid mode (-SourceWorkspaceId): LA transitions older than the REST
+        # API ~30-day cutoff are merged with REST API transitions for the last
         # ~30 days.  REST data is authoritative within its retention window:
         # it provides curated synthetic entries that fill coverage gaps
         # between incidents and retroactively corrects cause classification.
-        # REST-only mode (no -Workspace): REST API is the sole source.
+        # REST-only mode (no -SourceWorkspaceId): REST API is the sole source.
         $healthHistoryApplied = [DateTimeOffset]$hcStart -lt [DateTimeOffset]$pEnd
         $faultIntervals    = @()
         $unknownIntervals  = @()
@@ -1950,7 +1952,7 @@ function Invoke-SuspectGapInvestigation {
                 }
 
                 # Fetch REST API health transitions — sole source without
-                # -Workspace; covers last ~30 days with curated authoritative
+                # -SourceWorkspaceId; covers last ~30 days with curated authoritative
                 # data in hybrid mode.
                 $url = "https://management.azure.com$($c.ResourceId)" +
                        "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
@@ -2240,7 +2242,7 @@ $utcStart     = $window.Start
 $utcEnd       = $window.End
 $totalMinutes = $window.TotalMinutes
 
-$healthCoverageStart = if ($Workspace) {
+$healthCoverageStart = if ($SourceWorkspaceId) {
     Get-HealthCoverageStart $utcStart -UseLogAnalytics
 } else {
     Get-HealthCoverageStart $utcStart
@@ -2250,8 +2252,8 @@ $healthCoveredMinutes = $healthCoverageStart -lt $utcEnd ? [int]($utcEnd - $heal
 $periodLabel = $window.IsMonthToDate ? "month $($window.NormalizedMonth) (month-to-date)" : "month $($window.NormalizedMonth)"
 Write-Host "Period: $periodLabel ($($utcStart.ToString('u')) -> $($utcEnd.ToString('u')), $totalMinutes min)"
 
-if ($Workspace) {
-    Write-Host "Log Analytics workspace: $Workspace (Activity Log via KQL, Resource Health via KQL + REST API hybrid)"
+if ($SourceWorkspaceId) {
+    Write-Host "Log Analytics source workspace: $SourceWorkspaceId (Activity Log via KQL, Resource Health via KQL + REST API hybrid)"
 } elseif ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
     Write-Host "WARNING: Resource Health history covers only part of this period ($($healthCoverageStart.ToString('u')) -> $($utcEnd.ToString('u')), $healthCoveredMinutes of $totalMinutes min). Earlier minutes will use Activity Log and metric fallback rules."
 } elseif ($healthCoveredMinutes -eq 0) {
@@ -2364,12 +2366,12 @@ foreach ($res in $resources) {
 # complement REST API data in hybrid mode (LA covers pre-30-day, REST provides
 # curated authoritative data for the last ~30 days).
 $logAnalyticsData = $null
-if ($Workspace -and $suspectCandidates.Count -gt 0) {
+if ($SourceWorkspaceId -and $suspectCandidates.Count -gt 0) {
     Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
     $laToken = (Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io').Token
     $laTokenStr = ($laToken -is [securestring]) ? ($laToken | ConvertFrom-SecureString -AsPlainText) : [string]$laToken
     $laToken = $null
-    $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $Workspace `
+    $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId `
         -SubscriptionIds $subIds -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -ArmToken $laTokenStr
     $laTokenStr = $null
