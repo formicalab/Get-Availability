@@ -214,7 +214,7 @@ function Send-ToLogAnalytics {
     # Try full payload as a single call; split only if compressed size exceeds 900 KB
     $compressed = & $compressJson $Payload
     if ($compressed.Length -lt 900KB) {
-        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $compressed -UseBasicParsing | Out-Null
+        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $compressed -UseBasicParsing -ProgressAction SilentlyContinue | Out-Null
         return
     }
 
@@ -223,7 +223,7 @@ function Send-ToLogAnalytics {
     for ($i = 0; $i -lt $Payload.Count; $i += $chunkSize) {
         $chunk = @($Payload[$i..([math]::Min($i + $chunkSize - 1, $Payload.Count - 1))])
         $body = & $compressJson $chunk
-        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $body -UseBasicParsing | Out-Null
+        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $body -UseBasicParsing -ProgressAction SilentlyContinue | Out-Null
     }
 }
 
@@ -2330,6 +2330,39 @@ if ($Batch) {
         -EndDate $utcEnd -ThrottleLimit $Parallelism -ArmToken $armToken
 }
 
+# Step 5b: Detect perpetually-deallocated VMs
+# VMs that are currently deallocated/stopped AND had zero healthy minutes for the
+# entire period are excused — the VM was never running so availability is N/A.
+# This handles cases where the deallocate event fell outside Activity Log and
+# Resource Health retention windows.
+$perpetuallyDeallocated = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$vmCandidates = @($resources | Where-Object {
+    $_.Kind -eq 'VirtualMachine' -and
+    $metricResults.ContainsKey($_.ResourceId.ToLowerInvariant()) -and
+    $metricResults[$_.ResourceId.ToLowerInvariant()].SuspectMinutes -ge $totalMinutes
+})
+if ($vmCandidates.Count -gt 0) {
+    foreach ($vm in $vmCandidates) {
+        try {
+            $ivUrl = "https://management.azure.com$($vm.ResourceId)/instanceView?api-version=2024-07-01"
+            $ivResp = Invoke-RestMethod -Uri $ivUrl -Headers @{ Authorization = "Bearer $armToken" } -Method Get
+            $powerCode = ($ivResp.statuses | Where-Object { $_.code -like 'PowerState/*' } | Select-Object -First 1).code
+            if ($powerCode -eq 'PowerState/deallocated' -or $powerCode -eq 'PowerState/stopped') {
+                $perpetuallyDeallocated.Add($vm.ResourceId) | Out-Null
+                $elig = $eligByRes[$vm.ResourceId.ToLowerInvariant()]
+                $elig.EligibleMinutes = 0
+                $elig.ExcusedMinutes = $totalMinutes
+                $elig.SuspectMinutes = $totalMinutes
+                $elig.AvailabilityPct = 'N/A'
+                Write-Host "  [$($vm.Name)] Deallocated for entire period — excluded from availability counts"
+            }
+        }
+        catch {
+            Write-Warning "Instance View check failed for '$($vm.Name)': $_"
+        }
+    }
+}
+
 # Step 6: Build suspect candidates and investigate via Activity Log + Resource Health
 # Build the list of resources that have at least one suspect minute —
 # these need Activity Log + Resource Health investigation. Combine null
@@ -2337,6 +2370,7 @@ if ($Batch) {
 $suspectCandidates = [System.Collections.Generic.List[object]]::new()
 foreach ($res in $resources) {
     $key = $res.ResourceId.ToLowerInvariant()
+    if ($perpetuallyDeallocated.Contains($res.ResourceId)) { continue }
     $mr = $metricResults[$key]
     if ($mr -and $mr.SuspectMinutes -gt 0) {
         $allTicks = [System.Collections.Generic.List[long]]::new()
@@ -2405,6 +2439,9 @@ foreach ($res in $resources) {
         Write-Host "  [$($res.Name)] excluded from availability (no numeric availability datapoints in period)"
         continue
     }
+
+    # Skip perpetually-deallocated VMs — already handled in Step 5b
+    if ($perpetuallyDeallocated.Contains($res.ResourceId)) { continue }
 
     $activityLogExcludedGapMinutes = 0
     $healthExplainedGapMinutes = 0
