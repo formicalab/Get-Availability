@@ -9,8 +9,8 @@ Two implementations are provided:
 
 | Version | Path | Runtime | Notes |
 |---|---|---|---|
-| **C#** | [`csharp/`](csharp/README.md) | .NET 10 Native AOT (~15 MB standalone binary, no runtime required) | Fastest; recommended for production use |
-| **PowerShell** | `get-availability.ps1` | PowerShell 7+ with `Az.Accounts` and `Az.ResourceGraph` modules | No build step; convenient for ad-hoc use; supports Log Analytics ingestion |
+| **C#** (legacy) | [`Old/`](Old/README.md) | .NET 10 Native AOT (~15 MB standalone binary, no runtime required) | Moved to `Old/`; not actively maintained |
+| **PowerShell** | [`Functions/GetAvail/get-availability.ps1`](Functions/GetAvail/get-availability.ps1) | PowerShell 7+ with `Az.Accounts` and `Az.ResourceGraph` modules | No build step; convenient for ad-hoc use; supports Log Analytics ingestion; also runs as an Azure Function |
 
 Both versions share the same pipeline, classification rules, output format, and invariants.
 
@@ -37,7 +37,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
 If Azure authentication fails, the tool prints the module exception message directly. Re-run `Connect-AzAccount` to fix.
 
-For the C# version prerequisites and usage, see the [C# README](csharp/README.md).
+For the C# version prerequisites and usage, see the [C# README](Old/README.md).
 
 ### Parameters
 
@@ -56,7 +56,7 @@ For the C# version prerequisites and usage, see the [C# README](csharp/README.md
 | `-DcrImmutableId` | *(none)* | Data Collection Rule immutable ID. Required together with `-DceEndpoint` to enable Log Analytics ingestion. |
 | `-Version` | | Print version and exit |
 
-For C# parameters, see the [C# README](csharp/README.md).
+For C# parameters, see the [C# README](Old/README.md).
 
 The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the ~30-day REST API retention window. When `-SourceWorkspaceId` / `--workspace` is used, Health History coverage extends to the full observation period via a hybrid approach (Log Analytics for older transitions + REST API for the last ~30 days).
 
@@ -64,30 +64,30 @@ The observation window is a UTC calendar month: past months use the full calenda
 
 ```powershell
 # Single subscription
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603
+./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603
 
 # Multiple subscriptions, filtered by kind
-./get-availability.ps1 -Subscriptions 'Contoso-Development','Contoso-Production' -Month 202603 -Kinds vm,sql
+./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Development','Contoso-Production' -Month 202603 -Kinds vm,sql
 
 # Single resource with custom grace window
-./get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm02 -ActivityGraceMinutes 15
+./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Development' -Month 202603 -Resource myvm02 -ActivityGraceMinutes 15
 
 # Batch API with custom batch size
-./get-availability.ps1 -Subscriptions 'Contoso-Production','Contoso-Development' -Month 202603 -BatchSize 20
+./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Production','Contoso-Development' -Month 202603 -BatchSize 20
 
 # Use Log Analytics for Activity Log + Resource Health (faster, extended retention)
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -SourceWorkspaceId 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
+./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -SourceWorkspaceId 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
 
 # Send results to Log Analytics custom tables
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 `
+./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 `
   -DceEndpoint 'https://dce-getavail-itn-001.italynorth-1.ingest.monitor.azure.com' `
   -DcrImmutableId 'dcr-00000000000000000000000000000000'
 
 # Pipe results to CSV
-./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
+./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
 ```
 
-For C# examples, see the [C# README](csharp/README.md).
+For C# examples, see the [C# README](Old/README.md).
 
 ### Output
 
@@ -243,7 +243,7 @@ AvailabilityPct  = 40,066 / 40,125 × 100 = 99.85390%
 
 ## Implementation notes
 
-These notes cover performance and implementation details specific to the PowerShell version. For C# implementation notes, see the [C# README](csharp/README.md).
+These notes cover performance and implementation details specific to the PowerShell version. For C# implementation notes, see the [C# README](Old/README.md).
 
 - **`ForEach-Object -Parallel`** for concurrent metric, Activity Log, and Resource Health queries with configurable parallelism.
 - **Shared `HttpClient`** with connection pooling — avoids per-request TCP/TLS overhead; streams JSON responses directly into `System.Text.Json` without intermediate string allocation. Used for both per-resource metrics and gap investigation paths.
@@ -266,4 +266,132 @@ When `-DceEndpoint` and `-DcrImmutableId` are provided, the script sends results
 
 Authentication uses `Get-AzAccessToken -ResourceUrl 'https://monitor.azure.com'`, which works identically for interactive sessions (`Connect-AzAccount`) and Azure Function managed identities. Payloads are gzip-compressed and batched at 900 KB to stay within API limits.
 
-The infrastructure (Log Analytics workspace, custom tables, DCE, DCR) is deployed via the Bicep templates in the [`Setup/`](Setup/README.md) directory.
+The infrastructure is deployed via the Bicep template in [`Bicep/`](Bicep/). The template creates the full stack (Log Analytics workspace, custom tables, DCE, DCR, Storage Account, Function App, Application Insights, Private Endpoints, and RBAC) and **auto-wires all Function App settings** — after deployment and `func publish`, the function runs with no manual configuration.
+
+## Infrastructure Deployment
+
+### What it deploys
+
+The Bicep template deploys the following resources into the target resource group:
+
+| # | Resource | Purpose |
+|---|----------|--------|
+| 1 | **Log Analytics Workspace** | Stores availability data in custom tables; enables KQL queries and Workbooks |
+| 2 | **Custom Table `GetAvailResources_CL`** | Per-resource availability detail (one row per resource per run) |
+| 3 | **Custom Table `GetAvailSummary_CL`** | Aggregated summaries (per Kind+Location, per subscription, overall) |
+| 4 | **Data Collection Endpoint (DCE)** | Ingestion URL for the Azure Monitor Ingestion API |
+| 5 | **Data Collection Rule (DCR)** | Routes two custom streams to the corresponding tables with `TimeGenerated` injection |
+| 6 | **Storage Account** | Backing store for the Function App (deployment blobs) |
+| 7 | **Flex Consumption Plan** | Serverless hosting plan for the Function App |
+| 8 | **Function App** | Runs the Get-Availability script on a schedule with system-assigned managed identity |
+| 9 | **Application Insights** | Monitoring and telemetry for the Function App (Entra-only auth) |
+| 10 | **Private Endpoint (Storage blob)** | Private connectivity for the Function App to its backing storage |
+| 11 | **Private Endpoint (Function App sites)** | Private connectivity for publishing and management |
+
+RBAC role assignments are created automatically:
+
+| Principal | Role | Scope | Why |
+|-----------|------|-------|-----|
+| Function App | Monitoring Metrics Publisher | DCR | Ingest custom logs via the Azure Monitor Ingestion API |
+| Function App | Monitoring Metrics Publisher | Application Insights | Send telemetry when local auth is disabled |
+| Function App | Storage Blob Data Owner | Storage Account | Flex Consumption plan deployment blobs |
+
+### Deployment prerequisites
+
+- **Azure CLI** with Bicep support (`az bicep version`)
+- **Contributor** role on the target resource group
+- A **subnet** delegated to `Microsoft.App/environments` for the Function App VNet integration
+- A **subnet** for private endpoints
+- Existing **Private DNS Zones** for `privatelink.blob.core.windows.net` and `privatelink.azurewebsites.net`
+
+### Bicep parameters
+
+Configured in `Bicep/parameters.dev.bicepparam`:
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `location` | Azure region (defaults to resource group location) | `italynorth` |
+| `logAnalyticsWorkspaceName` | Log Analytics workspace name | `log-getavail-itn-001` |
+| `dataCollectionEndpointName` | Data Collection Endpoint name | `dce-getavail-itn-001` |
+| `dataCollectionRuleName` | Data Collection Rule name | `dcr-getavail-itn-001` |
+| `storageAccountName` | Storage account for the Function App | `stgetavailitn001` |
+| `functionAppName` | Function App name | `fn-getavail-itn-001` |
+| `applicationInsightsName` | Application Insights name | `appi-getavail-itn-001` |
+| `fnSubnetId` | Subnet resource ID for Function App VNet integration | `/subscriptions/.../subnets/snet-fn` |
+| `peSubnetId` | Subnet resource ID for private endpoints | `/subscriptions/.../subnets/snet-pe` |
+| `dnsZonesSubscriptionId` | Subscription ID containing Private DNS Zones | `00000000-0000-...` |
+| `dnsZonesResourceGroupName` | Resource group containing Private DNS Zones | `rg-dns-001` |
+| `getavailSubscriptions` | Comma-separated subscription names/IDs to monitor | `Contoso-Production,Contoso-Dev` |
+| `getavailKinds` | Resource kinds to monitor (default: `vm,sql,storage,webapp`) | `vm,sql` |
+| `sourceWorkspaceId` | Log Analytics workspace ID for Activity Log / Resource Health queries (optional) | `f25755bb-...` |
+| `timerSchedule` | CRON expression for the timer trigger (default: `0 0 6 1 * *` — 6 AM on the 1st of every month) | `0 0 8 1 * *` |
+
+### Deploy
+
+This is a **resource-group scoped** deployment. Create the resource group first, then deploy:
+
+```powershell
+# Create resource group (one-time)
+az group create --name rg-getavail-itn-001 --location italynorth --tags solution=Get-Availability
+
+# Validate
+az deployment group validate --resource-group rg-getavail-itn-001 --parameters Bicep/parameters.dev.bicepparam
+
+# What-if (dry run)
+az deployment group what-if --resource-group rg-getavail-itn-001 --parameters Bicep/parameters.dev.bicepparam
+
+# Deploy
+az deployment group create --resource-group rg-getavail-itn-001 --parameters Bicep/parameters.dev.bicepparam
+```
+
+### Auto-wired app settings
+
+The Bicep template configures the Function App with all required settings — values are resolved from sibling resources at deploy time:
+
+| App Setting | Bicep source | Used by `run.ps1` |
+|---|---|---|
+| `DCE_ENDPOINT` | DCE ingestion endpoint | `$env:DCE_ENDPOINT` |
+| `DCR_IMMUTABLE_ID` | DCR immutable ID | `$env:DCR_IMMUTABLE_ID` |
+| `SOURCE_WORKSPACE_ID` | `sourceWorkspaceId` parameter | `$env:SOURCE_WORKSPACE_ID` |
+| `GETAVAIL_SUBSCRIPTIONS` | `getavailSubscriptions` parameter | `$env:GETAVAIL_SUBSCRIPTIONS` |
+| `GETAVAIL_KINDS` | `getavailKinds` parameter | `$env:GETAVAIL_KINDS` |
+| `TIMER_SCHEDULE` | `timerSchedule` parameter | *(timer trigger via `%TIMER_SCHEDULE%`)* |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | App Insights connection string | *(Functions runtime)* |
+
+No manual post-deployment configuration is required.
+
+The template also configures CORS to allow `https://portal.azure.com`, so you can test-run the function directly from the Azure Portal.
+
+### Deployment outputs
+
+Outputs are available for reference or cross-stack integration:
+
+| Output | Description |
+|--------|-------------|
+| `logAnalyticsWorkspaceId` | Workspace resource ID |
+| `dceIngestionEndpoint` | DCE ingestion URL |
+| `dataCollectionRuleImmutableId` | DCR immutable ID |
+| `functionAppId` | Function App resource ID |
+| `applicationInsightsId` | Application Insights resource ID |
+| `storageAccountId` | Storage Account resource ID |
+
+```powershell
+# Retrieve outputs
+$outputs = (az deployment group show --resource-group rg-getavail-itn-001 --name getavailability --query properties.outputs -o json | ConvertFrom-Json)
+$outputs.dceIngestionEndpoint.value
+$outputs.dataCollectionRuleImmutableId.value
+```
+
+### Publishing the Function App
+
+The `get-availability.ps1` script lives inside the function app folder (`Functions/GetAvail/`) and is deployed alongside the function code. All app settings (`DCE_ENDPOINT`, `DCR_IMMUTABLE_ID`, `SOURCE_WORKSPACE_ID`, `GETAVAIL_SUBSCRIPTIONS`, `GETAVAIL_KINDS`) are auto-wired by Bicep — after `func publish` the function is ready to run with no manual configuration.
+
+```powershell
+# Save required modules (one-time or when upgrading)
+Save-Module -Name Az.Accounts     -Path Functions/GetAvail/Modules -Repository PSGallery -Force
+Save-Module -Name Az.ResourceGraph -Path Functions/GetAvail/Modules -Repository PSGallery -Force
+
+# Publish (from the Functions/GetAvail directory)
+cd Functions/GetAvail
+func azure functionapp publish fn-getavail-itn-001 --powershell
+```

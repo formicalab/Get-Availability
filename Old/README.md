@@ -33,7 +33,7 @@ If Azure authentication fails, the tool prints the SDK exception message directl
 ## Build
 
 ```bash
-cd csharp/GetAvailability
+cd Old/GetAvailability
 
 # Debug (JIT, for development)
 dotnet build
@@ -61,7 +61,7 @@ dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/p
 ./GetAvailability --subscriptions Contoso-Production --month 202603 --workspace b233a4b7-3c43-433c-ac60-1f6ff217ddd4
 
 # Run directly without publishing
-cd csharp/GetAvailability
+cd Old/GetAvailability
 dotnet run -- --subscriptions Contoso-Production --month 202603
 ```
 
