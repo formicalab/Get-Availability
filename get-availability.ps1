@@ -177,8 +177,8 @@ if ($DceEndpoint -and $DcrImmutableId) {
 # ── Log Analytics Ingestion ───────────────────────────────────────────────────
 
 ## Sends an array of objects to a Log Analytics custom table via the Azure
-## Monitor Ingestion REST API. Handles gzip compression and batching for
-## the 1 MB per-call payload limit.
+## Monitor Ingestion REST API. Gzip-compresses the JSON payload and splits
+## into multiple calls if the compressed size exceeds 900 KB (API limit is 1 MB).
 function Send-ToLogAnalytics {
     param(
         [string]$Endpoint,
@@ -188,58 +188,51 @@ function Send-ToLogAnalytics {
         [object[]]$Payload
     )
 
+    if ($Payload.Count -eq 0) { return }
+
     $uri = "$Endpoint/dataCollectionRules/$RuleId/streams/${StreamName}?api-version=2023-01-01"
-
-    # Split into batches if payload is large (target < 900 KB compressed)
-    $batchSize = $Payload.Count
-    $batches = @()
-    if ($Payload.Count -gt 0) {
-        # Start with a single batch; split only if the compressed size exceeds the limit
-        $json = $Payload | ConvertTo-Json -Depth 5 -Compress -AsArray
-        $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-        $ms = [System.IO.MemoryStream]::new()
-        $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal)
-        $gz.Write($jsonBytes, 0, $jsonBytes.Length)
-        $gz.Dispose()
-        $compressed = $ms.ToArray()
-        $ms.Dispose()
-
-        if ($compressed.Length -lt 900KB) {
-            $batches = @(, $compressed)
-        } else {
-            # Split into smaller chunks and compress each
-            $chunkSize = [math]::Max(1, [math]::Floor($Payload.Count / [math]::Ceiling($compressed.Length / 900KB)))
-            for ($i = 0; $i -lt $Payload.Count; $i += $chunkSize) {
-                $chunk = @($Payload[$i..([math]::Min($i + $chunkSize - 1, $Payload.Count - 1))])
-                $cJson = $chunk | ConvertTo-Json -Depth 5 -Compress -AsArray
-                $cBytes = [System.Text.Encoding]::UTF8.GetBytes($cJson)
-                $cMs = [System.IO.MemoryStream]::new()
-                $cGz = [System.IO.Compression.GZipStream]::new($cMs, [System.IO.Compression.CompressionLevel]::Optimal)
-                $cGz.Write($cBytes, 0, $cBytes.Length)
-                $cGz.Dispose()
-                $batches += , $cMs.ToArray()
-                $cMs.Dispose()
-            }
-        }
+    $headers = @{
+        'Authorization'    = "Bearer $Token"
+        'Content-Type'     = 'application/json'
+        'Content-Encoding' = 'gzip'
     }
 
-    $batchNum = 0
-    foreach ($body in $batches) {
-        $batchNum++
-        $headers = @{
-            'Authorization'    = "Bearer $Token"
-            'Content-Type'     = 'application/json'
-            'Content-Encoding' = 'gzip'
-        }
-        $response = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $body -UseBasicParsing -ErrorAction Stop
-        if ($response.StatusCode -notin 200, 204) {
-            throw "Ingestion failed (batch $batchNum/$($batches.Count)): HTTP $($response.StatusCode) — $($response.Content)"
-        }
+    # Gzip-compress a JSON array into a byte[]
+    $compressJson = {
+        param([object[]]$Items)
+        $json = $Items | ConvertTo-Json -Depth 5 -Compress -AsArray
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $ms = [System.IO.MemoryStream]::new()
+        $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal)
+        $gz.Write($bytes, 0, $bytes.Length)
+        $gz.Dispose()
+        $result = $ms.ToArray()
+        $ms.Dispose()
+        $result
+    }
+
+    # Try full payload as a single call; split only if compressed size exceeds 900 KB
+    $compressed = & $compressJson $Payload
+    if ($compressed.Length -lt 900KB) {
+        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $compressed -UseBasicParsing | Out-Null
+        return
+    }
+
+    # Estimate chunk size from compression ratio and send each chunk separately
+    $chunkSize = [math]::Max(1, [math]::Floor($Payload.Count / [math]::Ceiling($compressed.Length / 900KB)))
+    for ($i = 0; $i -lt $Payload.Count; $i += $chunkSize) {
+        $chunk = @($Payload[$i..([math]::Min($i + $chunkSize - 1, $Payload.Count - 1))])
+        $body = & $compressJson $chunk
+        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $body -UseBasicParsing | Out-Null
     }
 }
 
 # ── Observation window ────────────────────────────────────────────────────────
 
+## Parses a YYYYMM string into a start/end observation window, clamped to the
+## current UTC minute.  Returns Start, End, NormalizedMonth, IsMonthToDate, and
+## TotalMinutes.  Throws if the month is in the future, older than 90 days, or
+## produces an empty period.
 function Resolve-ObservationWindow([string]$MonthParam) {
     $parsed = [datetime]::new(1, 1, 1)
     if (-not [datetime]::TryParseExact($MonthParam, 'yyyyMM',
@@ -270,6 +263,9 @@ function Resolve-ObservationWindow([string]$MonthParam) {
 
 # ── Resource inventory via Azure Resource Graph ───────────────────────────────
 
+## Queries Azure Resource Graph for resources matching the requested -Kind and
+## optional -ResourceName filter across the supplied subscriptions.  Returns
+## an array of lightweight resource descriptors used by the metrics pipeline.
 function Get-ResourceInventory {
     param(
         [string[]]$SubscriptionIds,
