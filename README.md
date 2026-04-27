@@ -5,14 +5,9 @@
 
 Reports month-scoped availability for Azure Virtual Machines, Azure SQL Databases, Azure Storage Accounts, and Azure Web Apps across one or more Azure subscriptions.
 
-Two implementations are provided:
+No build step; runs as a standalone PowerShell 7 script or as an Azure Function on a schedule. Supports optional Log Analytics ingestion for dashboarding.
 
-| Version | Path | Runtime | Notes |
-|---|---|---|---|
-| **C#** (legacy) | [`Old/`](Old/README.md) | .NET 10 Native AOT (~15 MB standalone binary, no runtime required) | Moved to `Old/`; not actively maintained |
-| **PowerShell** | [`Functions/GetAvail/get-availability.ps1`](Functions/GetAvail/get-availability.ps1) | PowerShell 7+ with `Az.Accounts` and `Az.ResourceGraph` modules | No build step; convenient for ad-hoc use; supports Log Analytics ingestion; also runs as an Azure Function |
-
-Both versions share the same pipeline, classification rules, output format, and invariants.
+> A legacy C# (Native AOT) implementation is preserved in [`Old/`](Old/README.md) but is not actively maintained.
 
 For each resource, the tool answers:
 
@@ -37,8 +32,6 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
 If Azure authentication fails, the tool prints the module exception message directly. Re-run `Connect-AzAccount` to fix.
 
-For the C# version prerequisites and usage, see the [C# README](Old/README.md).
-
 ### Parameters
 
 | Parameter | Default | Description |
@@ -55,8 +48,6 @@ For the C# version prerequisites and usage, see the [C# README](Old/README.md).
 | `-DceEndpoint` | *(none)* | Data Collection Endpoint ingestion URL. When provided together with `-DcrImmutableId`, results are sent to Log Analytics custom tables via the Azure Monitor Ingestion API. |
 | `-DcrImmutableId` | *(none)* | Data Collection Rule immutable ID. Required together with `-DceEndpoint` to enable Log Analytics ingestion. |
 | `-Version` | | Print version and exit |
-
-For C# parameters, see the [C# README](Old/README.md).
 
 The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the ~30-day REST API retention window. When `-SourceWorkspaceId` / `--workspace` is used, Health History coverage extends to the full observation period via a hybrid approach (Log Analytics for older transitions + REST API for the last ~30 days).
 
@@ -86,8 +77,6 @@ The observation window is a UTC calendar month: past months use the full calenda
 # Pipe results to CSV
 ./Functions/GetAvail/get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
 ```
-
-For C# examples, see the [C# README](Old/README.md).
 
 ### Output
 
@@ -242,8 +231,6 @@ AvailabilityPct  = 40,066 / 40,125 × 100 = 99.85390%
 ```
 
 ## Implementation notes
-
-These notes cover performance and implementation details specific to the PowerShell version. For C# implementation notes, see the [C# README](Old/README.md).
 
 - **`ForEach-Object -Parallel`** for concurrent metric, Activity Log, and Resource Health queries with configurable parallelism.
 - **Shared `HttpClient`** with connection pooling — avoids per-request TCP/TLS overhead; streams JSON responses directly into `System.Text.Json` without intermediate string allocation. Used for both per-resource metrics and gap investigation paths.

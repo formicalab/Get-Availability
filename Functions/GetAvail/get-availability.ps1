@@ -6,7 +6,7 @@
     Reports month-scoped availability for VMs, Azure SQL databases, Storage Accounts, and Web Apps.
 
 .DESCRIPTION
-    Mirrors the C# Get-Availability pipeline:
+    Availability pipeline:
       1. Resolve subscriptions
       2. Inventory via Resource Graph
       3. Fetch metrics (Azure Monitor, parallel)
@@ -1053,12 +1053,8 @@ function Test-BatchEndpoints {
         $body = '{"resourceids":[]}'
 
         try {
-            $oldPref = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-            try {
-                Invoke-WebRequest -Uri $testUri -Method POST -Body $body -ContentType 'application/json' `
-                    -Headers @{ Authorization = "Bearer $MetricsToken" } -UseBasicParsing -ErrorAction Stop | Out-Null
-            }
-            finally { $ProgressPreference = $oldPref }
+            Invoke-WebRequest -Uri $testUri -Method POST -Body $body -ContentType 'application/json' `
+                -Headers @{ Authorization = "Bearer $MetricsToken" } -ErrorAction Stop | Out-Null
             Write-Host "  $region`: OK"
         }
         catch {
@@ -2245,6 +2241,13 @@ function Write-SubscriptionSummaries([object[]]$Sorted) {
     }
 }
 
+## Acquires a plain-text bearer token via Az.Accounts.
+## Handles both SecureString (Az.Accounts ≥ 5.x) and legacy plain string returns.
+function Get-PlainToken([string]$ResourceUrl) {
+    $raw = (Get-AzAccessToken -ResourceUrl $ResourceUrl).Token
+    ($raw -is [securestring]) ? ($raw | ConvertFrom-SecureString -AsPlainText) : [string]$raw
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -2289,10 +2292,7 @@ $resolvedSubs = @(foreach ($name in $Subscriptions) {
 $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
 
-# Acquire ARM token — Az.Accounts may return SecureString or plain string
-$rawToken = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com').Token
-$armToken = ($rawToken -is [securestring]) ? ($rawToken | ConvertFrom-SecureString -AsPlainText) : [string]$rawToken
-$rawToken = $null
+$armToken = Get-PlainToken 'https://management.azure.com'
 
 Write-Host 'OK'
 Write-Host "Processing $($resolvedSubs.Count) subscription(s): $($resolvedSubs.Name -join ', ')"
@@ -2309,9 +2309,7 @@ Write-Host "Found $($resources.Count) resource(s) across $($resolvedSubs.Count) 
 if ($resources.Count -eq 0) { Write-Host 'No resources found.'; return }
 
 if ($Batch) {
-    $rawMetrics = (Get-AzAccessToken -ResourceUrl 'https://metrics.monitor.azure.com').Token
-    $metricsToken = ($rawMetrics -is [securestring]) ? ($rawMetrics | ConvertFrom-SecureString -AsPlainText) : [string]$rawMetrics
-    $rawMetrics = $null
+    $metricsToken = Get-PlainToken 'https://metrics.monitor.azure.com'
     Write-Host "Mode: Batch (batch-size=$BatchSize)"
 }
 
@@ -2415,9 +2413,7 @@ foreach ($res in $resources) {
 $logAnalyticsData = $null
 if ($SourceWorkspaceId -and $suspectCandidates.Count -gt 0) {
     Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
-    $laToken = (Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io').Token
-    $laTokenStr = ($laToken -is [securestring]) ? ($laToken | ConvertFrom-SecureString -AsPlainText) : [string]$laToken
-    $laToken = $null
+    $laTokenStr = Get-PlainToken 'https://api.loganalytics.io'
     $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId `
         -SubscriptionIds $subIds -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -ArmToken $laTokenStr
@@ -2608,10 +2604,7 @@ Write-SubscriptionSummaries $sorted
 if ($sendToLogAnalytics) {
     Write-Host -NoNewline 'Sending results to Log Analytics... '
 
-    # Acquire Azure Monitor ingestion token (same pattern as ARM token)
-    $rawMonitor = (Get-AzAccessToken -ResourceUrl 'https://monitor.azure.com').Token
-    $monitorToken = ($rawMonitor -is [securestring]) ? ($rawMonitor | ConvertFrom-SecureString -AsPlainText) : [string]$rawMonitor
-    $rawMonitor = $null
+    $monitorToken = Get-PlainToken 'https://monitor.azure.com'
 
     $runId = [guid]::NewGuid().ToString()
     $normalizedMonth = $window.NormalizedMonth
