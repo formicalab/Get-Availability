@@ -5,12 +5,12 @@
 
 Reports month-scoped availability for Azure Virtual Machines, Azure SQL Databases, Azure Storage Accounts, and Azure Web Apps across one or more Azure subscriptions.
 
-Two equivalent implementations are provided:
+Two implementations are provided:
 
 | Version | Path | Runtime | Notes |
 |---|---|---|---|
-| **C#** | `csharp/GetAvailability/` | .NET 10 Native AOT (~15 MB standalone binary, no runtime required) | Fastest; recommended for production use |
-| **PowerShell** | `get-availability.ps1` | PowerShell 7+ with `Az.Accounts` and `Az.ResourceGraph` modules | No build step; convenient for ad-hoc use |
+| **C#** | [`csharp/`](csharp/README.md) | .NET 10 Native AOT (~15 MB standalone binary, no runtime required) | Fastest; recommended for production use |
+| **PowerShell** | `get-availability.ps1` | PowerShell 7+ with `Az.Accounts` and `Az.ResourceGraph` modules | No build step; convenient for ad-hoc use; supports Log Analytics ingestion |
 
 Both versions share the same pipeline, classification rules, output format, and invariants.
 
@@ -28,17 +28,6 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
 ### Prerequisites
 
-**C# version:**
-
-| Requirement | Detail |
-|---|---|
-| .NET SDK | 10.0 or later (build from source only) |
-| Azure auth | `az login` or any method supported by `DefaultAzureCredential` |
-
-The published binary (`GetAvailability.exe`) requires no .NET runtime — it is a Native AOT self-contained executable.
-
-**PowerShell version:**
-
 | Requirement | Detail |
 |---|---|
 | PowerShell | 7.0 or later (`pwsh`) |
@@ -46,26 +35,11 @@ The published binary (`GetAvailability.exe`) requires no .NET runtime — it is 
 | Az.ResourceGraph | `Install-Module Az.ResourceGraph` |
 | Azure auth | `Connect-AzAccount` (used by both Az modules and for ARM token acquisition) |
 
-If Azure authentication fails, the tool prints the SDK/module exception message directly. For Azure CLI-based auth (C#), re-run `az login`; for PowerShell, re-run `Connect-AzAccount`.
+If Azure authentication fails, the tool prints the module exception message directly. Re-run `Connect-AzAccount` to fix.
+
+For the C# version prerequisites and usage, see the [C# README](csharp/README.md).
 
 ### Parameters
-
-**C# (`GetAvailability.exe`):**
-
-| Option | Short | Default | Description |
-|---|---|---|---|
-| `--subscriptions` | `-s` | *(required)* | One or more Azure subscription display names |
-| `--month` | `-m` | *(required)* | Observation month in UTC, format `YYYYMM` |
-| `--kinds` | `-k` | `vm sql storage webapp` | Resource kinds to process |
-| `--resource` | `-r` | *(all)* | Filter to a single resource name |
-| `--parallelism` | `-p` | *(auto)* | Max concurrent API calls (scales to CPU cores) |
-| `--activity-grace-minutes` | `-g` | `10` | Post-operation grace window for Activity Log lifecycle events |
-| `--batch` | `-b` | off | Use the regional Metrics Batch API instead of per-resource calls |
-| `--batch-size` | | `10` | Max resources per batch call (1–50); implies `--batch` |
-| `--workspace` | `-w` | *(none)* | Log Analytics workspace ID (GUID). Fetches Activity Log via bulk KQL; Resource Health uses hybrid approach (KQL for older + REST for last ~30 days) |
-| `--version` | `-v` | | Print version and exit |
-
-**PowerShell (`get-availability.ps1`):**
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -78,40 +52,15 @@ If Azure authentication fails, the tool prints the SDK/module exception message 
 | `-Batch` | off | Use the regional Metrics Batch API instead of per-resource calls |
 | `-BatchSize` | `10` | Max resources per batch call (1–50); implies `-Batch` |
 | `-Workspace` | *(none)* | Log Analytics workspace ID (GUID). Fetches Activity Log lifecycle events from the workspace via a single bulk KQL query (faster for large estates). Resource Health uses a hybrid approach: KQL transitions cover the period beyond the REST API's ~30-day retention, while REST API transitions (curated, with corrected causes) are authoritative for the last ~30 days. Provides complete Resource Health coverage across the full observation window. |
+| `-DceEndpoint` | *(none)* | Data Collection Endpoint ingestion URL. When provided together with `-DcrImmutableId`, results are sent to Log Analytics custom tables via the Azure Monitor Ingestion API. |
+| `-DcrImmutableId` | *(none)* | Data Collection Rule immutable ID. Required together with `-DceEndpoint` to enable Log Analytics ingestion. |
 | `-Version` | | Print version and exit |
+
+For C# parameters, see the [C# README](csharp/README.md).
 
 The observation window is a UTC calendar month: past months use the full calendar month, the current month is reported month-to-date. The requested month cannot start more than 90 days before the current UTC time. Metrics and Activity Log support that 90-day lookback; Health History is applied only for its overlap with the ~30-day REST API retention window. When `-Workspace` / `--workspace` is used, Health History coverage extends to the full observation period via a hybrid approach (Log Analytics for older transitions + REST API for the last ~30 days).
 
 ### Examples
-
-**C#:**
-
-```bash
-# Build the Native AOT binary (one-time)
-cd csharp/GetAvailability
-dotnet publish -c Release -r win-x64   # output in bin/Release/net10.0/win-x64/publish/
-
-# Single subscription
-./GetAvailability --subscriptions Contoso-Production --month 202603
-
-# Multiple subscriptions, filtered by kind
-./GetAvailability --subscriptions Contoso-Development Contoso-Production --month 202603 --kinds vm sql
-
-# Single resource (SQL database by server/database name)
-./GetAvailability --subscriptions Contoso-Development --month 202603 --resource sqlserver01/sqldb01
-
-# Batch API with custom batch size
-./GetAvailability --subscriptions Contoso-Production Contoso-Development --month 202603 --batch-size 20
-
-# Use Log Analytics for Activity Log + Resource Health (faster, extended retention)
-./GetAvailability --subscriptions Contoso-Production --month 202603 --workspace b233a4b7-3c43-433c-ac60-1f6ff217ddd4
-
-# Run directly without publishing
-cd csharp/GetAvailability
-dotnet run -- --subscriptions Contoso-Production --month 202603
-```
-
-**PowerShell:**
 
 ```powershell
 # Single subscription
@@ -129,9 +78,16 @@ dotnet run -- --subscriptions Contoso-Production --month 202603
 # Use Log Analytics for Activity Log + Resource Health (faster, extended retention)
 ./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 -Workspace 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
 
+# Send results to Log Analytics custom tables
+./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 `
+  -DceEndpoint 'https://dce-getavail-itn-001.italynorth-1.ingest.monitor.azure.com' `
+  -DcrImmutableId 'dcr-00000000000000000000000000000000'
+
 # Pipe results to CSV
 ./get-availability.ps1 -Subscriptions 'Contoso-Production' -Month 202603 | Export-Csv availability.csv
 ```
+
+For C# examples, see the [C# README](csharp/README.md).
 
 ### Output
 
@@ -287,15 +243,27 @@ AvailabilityPct  = 40,066 / 40,125 × 100 = 99.85390%
 
 ## Implementation notes
 
-These notes cover performance and implementation details specific to each version.
+These notes cover performance and implementation details specific to the PowerShell version. For C# implementation notes, see the [C# README](csharp/README.md).
 
-- **`Parallel.ForEachAsync`** (C#) / **`ForEach-Object -Parallel`** (PowerShell) for concurrent metric, Activity Log, and Resource Health queries with configurable parallelism.
-- **Shared `HttpClient`** with connection pooling (PowerShell) — avoids per-request TCP/TLS overhead; streams JSON responses directly into `System.Text.Json` without intermediate string allocation. Used for both per-resource metrics and gap investigation paths.
-- **Compiled metric processor** (PowerShell) — the ~44k-datapoint-per-resource JSON processing loop is compiled as C# via `Add-Type` and runs at native .NET speed.
-- **Compiled gap processor** (PowerShell) — `ExpandToTickSet` (interval → `HashSet<long>`) and `ClassifyGaps` (minute-by-minute classification) are also compiled via `Add-Type`.
-- **Idempotent `Add-Type` guards** (PowerShell) — each compiled C# block (`MetricProcessor`, `GapProcessor`) is independently guarded by a `PSTypeName` check so the script can be re-run within the same session.
+- **`ForEach-Object -Parallel`** for concurrent metric, Activity Log, and Resource Health queries with configurable parallelism.
+- **Shared `HttpClient`** with connection pooling — avoids per-request TCP/TLS overhead; streams JSON responses directly into `System.Text.Json` without intermediate string allocation. Used for both per-resource metrics and gap investigation paths.
+- **Compiled metric processor** — the ~44k-datapoint-per-resource JSON processing loop is compiled as C# via `Add-Type` and runs at native .NET speed.
+- **Compiled gap processor** — `ExpandToTickSet` (interval → `HashSet<long>`) and `ClassifyGaps` (minute-by-minute classification) are also compiled via `Add-Type`.
+- **Idempotent `Add-Type` guards** — each compiled C# block (`MetricProcessor`, `GapProcessor`) is independently guarded by a `PSTypeName` check so the script can be re-run within the same session.
 - **HashSet-based interval containment** — suspect-minute classification pre-expands intervals into `HashSet<long>` tick sets for O(1) lookups instead of linear scans.
 - **O(1) JSON property access** — `TryGetProperty` hash lookup instead of `EnumerateObject` linear scan (~44k calls per resource per month).
 - **Ticks-based metric keying** — `long` instead of `DateTime` for zero-allocation per data point.
-- **`System.Text.Json`** for efficient JSON parsing — avoids large PSObject trees in PowerShell and enables AOT-safe parsing in C#.
-- **Native AOT** (C#) — ~15 MB standalone binary, no .NET runtime required.
+- **`System.Text.Json`** for efficient JSON parsing — avoids large PSObject trees.
+
+## Log Analytics Ingestion (Optional)
+
+When `-DceEndpoint` and `-DcrImmutableId` are provided, the script sends results to two Log Analytics custom tables via the [Azure Monitor Ingestion API](https://learn.microsoft.com/azure/azure-monitor/logs/logs-ingestion-api-overview):
+
+| Table | Content |
+|---|---|
+| `GetAvailResources_CL` | Per-resource detail (one row per resource per run) |
+| `GetAvailSummary_CL` | Aggregated summaries (per Kind+Location, per subscription, overall) |
+
+Authentication uses `Get-AzAccessToken -ResourceUrl 'https://monitor.azure.com'`, which works identically for interactive sessions (`Connect-AzAccount`) and Azure Function managed identities. Payloads are gzip-compressed and batched at 900 KB to stay within API limits.
+
+The infrastructure (Log Analytics workspace, custom tables, DCE, DCR) is deployed via the Bicep templates in the [`Setup/`](Setup/README.md) directory.

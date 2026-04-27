@@ -78,6 +78,18 @@
     across the full observation window. Requires the workspace to receive
     Activity Log diagnostic settings from the target subscriptions.
 
+.PARAMETER DceEndpoint
+    Data Collection Endpoint ingestion URL. When both -DceEndpoint and
+    -DcrImmutableId are provided, results are sent to Log Analytics custom
+    tables in addition to the normal console output. Obtain the URL from
+    the Bicep deployment output 'dceIngestionEndpoint'. Works in both
+    interactive (az login / Connect-AzAccount) and Azure Function
+    (managed identity) execution contexts.
+
+.PARAMETER DcrImmutableId
+    Data Collection Rule immutable ID. Required together with -DceEndpoint.
+    Obtain from the Bicep deployment output 'dataCollectionRuleImmutableId'.
+
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'MySubscription' -Month 202506
 
@@ -89,6 +101,9 @@
 
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Workspace 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
+
+.EXAMPLE
+    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -DceEndpoint 'https://dce-getavail-itn-001.italynorth-1.ingest.monitor.azure.com' -DcrImmutableId 'dcr-00000000000000000000000000000000'
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Run')]
@@ -127,6 +142,14 @@ param(
     [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
     [string]$Workspace,
 
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateNotNullOrEmpty()]
+    [string]$DceEndpoint,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateNotNullOrEmpty()]
+    [string]$DcrImmutableId,
+
     [Parameter(Mandatory, ParameterSetName = 'ShowVersion')]
     [switch]$Version
 )
@@ -139,6 +162,78 @@ $ErrorActionPreference = 'Stop'
 if ($Version) {
     Write-Host "get-availability $ScriptVersion"
     return
+}
+
+# Validate paired ingestion parameters
+$sendToLogAnalytics = $false
+if ($DceEndpoint -and $DcrImmutableId) {
+    $sendToLogAnalytics = $true
+} elseif ($DceEndpoint -or $DcrImmutableId) {
+    throw '-DceEndpoint and -DcrImmutableId must both be provided together.'
+}
+
+# ── Log Analytics Ingestion ───────────────────────────────────────────────────
+
+## Sends an array of objects to a Log Analytics custom table via the Azure
+## Monitor Ingestion REST API. Handles gzip compression and batching for
+## the 1 MB per-call payload limit.
+function Send-ToLogAnalytics {
+    param(
+        [string]$Endpoint,
+        [string]$RuleId,
+        [string]$StreamName,
+        [string]$Token,
+        [object[]]$Payload
+    )
+
+    $uri = "$Endpoint/dataCollectionRules/$RuleId/streams/${StreamName}?api-version=2023-01-01"
+
+    # Split into batches if payload is large (target < 900 KB compressed)
+    $batchSize = $Payload.Count
+    $batches = @()
+    if ($Payload.Count -gt 0) {
+        # Start with a single batch; split only if the compressed size exceeds the limit
+        $json = $Payload | ConvertTo-Json -Depth 5 -Compress -AsArray
+        $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $ms = [System.IO.MemoryStream]::new()
+        $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal)
+        $gz.Write($jsonBytes, 0, $jsonBytes.Length)
+        $gz.Dispose()
+        $compressed = $ms.ToArray()
+        $ms.Dispose()
+
+        if ($compressed.Length -lt 900KB) {
+            $batches = @(, $compressed)
+        } else {
+            # Split into smaller chunks and compress each
+            $chunkSize = [math]::Max(1, [math]::Floor($Payload.Count / [math]::Ceiling($compressed.Length / 900KB)))
+            for ($i = 0; $i -lt $Payload.Count; $i += $chunkSize) {
+                $chunk = @($Payload[$i..([math]::Min($i + $chunkSize - 1, $Payload.Count - 1))])
+                $cJson = $chunk | ConvertTo-Json -Depth 5 -Compress -AsArray
+                $cBytes = [System.Text.Encoding]::UTF8.GetBytes($cJson)
+                $cMs = [System.IO.MemoryStream]::new()
+                $cGz = [System.IO.Compression.GZipStream]::new($cMs, [System.IO.Compression.CompressionLevel]::Optimal)
+                $cGz.Write($cBytes, 0, $cBytes.Length)
+                $cGz.Dispose()
+                $batches += , $cMs.ToArray()
+                $cMs.Dispose()
+            }
+        }
+    }
+
+    $batchNum = 0
+    foreach ($body in $batches) {
+        $batchNum++
+        $headers = @{
+            'Authorization'    = "Bearer $Token"
+            'Content-Type'     = 'application/json'
+            'Content-Encoding' = 'gzip'
+        }
+        $response = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $body -UseBasicParsing -ErrorAction Stop
+        if ($response.StatusCode -notin 200, 204) {
+            throw "Ingestion failed (batch $batchNum/$($batches.Count)): HTTP $($response.StatusCode) — $($response.Content)"
+        }
+    }
 }
 
 # ── Observation window ────────────────────────────────────────────────────────
@@ -2456,6 +2551,119 @@ $sorted = @($eligByRes.Values |
 
 Write-ResultsTable $sorted
 Write-SubscriptionSummaries $sorted
+
+# Step 9: Optional Log Analytics ingestion
+if ($sendToLogAnalytics) {
+    Write-Host -NoNewline 'Sending results to Log Analytics... '
+
+    # Acquire Azure Monitor ingestion token (same pattern as ARM token)
+    $rawMonitor = (Get-AzAccessToken -ResourceUrl 'https://monitor.azure.com').Token
+    $monitorToken = ($rawMonitor -is [securestring]) ? ($rawMonitor | ConvertFrom-SecureString -AsPlainText) : [string]$rawMonitor
+    $rawMonitor = $null
+
+    $runId = [guid]::NewGuid().ToString()
+    $normalizedMonth = $window.NormalizedMonth
+    $isMonthToDate = $window.IsMonthToDate
+    $periodStartIso = $utcStart.ToString('o')
+    $periodEndIso = $utcEnd.ToString('o')
+
+    # Build per-resource detail payload
+    $resourcePayload = @(foreach ($elig in $eligByRes.Values) {
+        @{
+            RunId                     = $runId
+            Month                     = $normalizedMonth
+            PeriodStart               = $periodStartIso
+            PeriodEnd                 = $periodEndIso
+            IsMonthToDate             = $isMonthToDate
+            SubscriptionName          = $elig.SubscriptionName
+            ResourceName              = $elig.Name
+            ResourceId                = $elig.ResourceId
+            ResourceGroup             = $elig.ResourceGroupName
+            Kind                      = $elig.Kind
+            Location                  = $elig.Location
+            EligibleMinutes           = $elig.EligibleMinutes
+            AvailableMinutes          = $elig.AvailableMinutes
+            SuspectMinutes            = $elig.SuspectMinutes
+            ConfirmedDowntimeMinutes  = $elig.ConfirmedDowntimeMinutes
+            ExcusedMinutes            = $elig.ExcusedMinutes
+            UnexplainedSuspectMinutes = $elig.UnexplainedSuspectMinutes
+            AvailabilityPct           = if ($elig.AvailabilityPct -eq 'N/A') { -1 } else { [double]$elig.AvailabilityPct }
+        }
+    })
+
+    Send-ToLogAnalytics -Endpoint $DceEndpoint -RuleId $DcrImmutableId `
+        -StreamName 'Custom-GetAvailResources_CL' -Token $monitorToken -Payload $resourcePayload
+
+    # Build summary payload
+    $eligible = @($sorted | Where-Object { $_.AvailabilityPct -ne 'N/A' })
+    $summaryPayload = [System.Collections.Generic.List[hashtable]]::new()
+
+    $commonSummary = @{
+        RunId         = $runId
+        Month         = $normalizedMonth
+        PeriodStart   = $periodStartIso
+        PeriodEnd     = $periodEndIso
+        IsMonthToDate = $isMonthToDate
+    }
+
+    foreach ($subGroup in ($eligible | Group-Object SubscriptionName | Sort-Object Name)) {
+        foreach ($g in ($subGroup.Group | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
+            $items = @($g.Group)
+            $a = ($items | Measure-Object AvailableMinutes -Sum).Sum
+            $e = ($items | Measure-Object EligibleMinutes -Sum).Sum
+            $pct = if ($e -gt 0) { [math]::Round($a / $e * 100, 5) } else { 0 }
+            $summaryPayload.Add(($commonSummary + @{
+                SummaryLevel     = 'KindLocation'
+                SubscriptionName = $subGroup.Name
+                Kind             = $items[0].Kind
+                Location         = $items[0].Location
+                ResourceCount    = $items.Count
+                EligibleMinutes  = [math]::Round($e, 2)
+                AvailableMinutes = [math]::Round($a, 2)
+                AvailabilityPct  = $pct
+            }))
+        }
+        $ta = ($subGroup.Group | Measure-Object AvailableMinutes -Sum).Sum
+        $te = ($subGroup.Group | Measure-Object EligibleMinutes -Sum).Sum
+        $tpct = if ($te -gt 0) { [math]::Round($ta / $te * 100, 5) } else { 0 }
+        $summaryPayload.Add(($commonSummary + @{
+            SummaryLevel     = 'SubscriptionTotal'
+            SubscriptionName = $subGroup.Name
+            Kind             = ''
+            Location         = ''
+            ResourceCount    = $subGroup.Count
+            EligibleMinutes  = [math]::Round($te, 2)
+            AvailableMinutes = [math]::Round($ta, 2)
+            AvailabilityPct  = $tpct
+        }))
+    }
+
+    # Cross-subscription overall (only if >1 subscription)
+    $subs = @($eligible | ForEach-Object { $_.SubscriptionName } | Select-Object -Unique)
+    if ($subs.Count -gt 1 -and $eligible.Count -gt 0) {
+        $oa = ($eligible | Measure-Object AvailableMinutes -Sum).Sum
+        $oe = ($eligible | Measure-Object EligibleMinutes -Sum).Sum
+        $opct = if ($oe -gt 0) { [math]::Round($oa / $oe * 100, 5) } else { 0 }
+        $summaryPayload.Add(($commonSummary + @{
+            SummaryLevel     = 'Overall'
+            SubscriptionName = ''
+            Kind             = ''
+            Location         = ''
+            ResourceCount    = $eligible.Count
+            EligibleMinutes  = [math]::Round($oe, 2)
+            AvailableMinutes = [math]::Round($oa, 2)
+            AvailabilityPct  = $opct
+        }))
+    }
+
+    if ($summaryPayload.Count -gt 0) {
+        Send-ToLogAnalytics -Endpoint $DceEndpoint -RuleId $DcrImmutableId `
+            -StreamName 'Custom-GetAvailSummary_CL' -Token $monitorToken -Payload $summaryPayload.ToArray()
+    }
+
+    $monitorToken = $null
+    Write-Host "OK (RunId: $runId, $($resourcePayload.Count) resource rows, $($summaryPayload.Count) summary rows)"
+}
 
 $sw.Stop()
 Write-Host "Completed in $($sw.Elapsed.ToString('hh\:mm\:ss\.ff'))"
