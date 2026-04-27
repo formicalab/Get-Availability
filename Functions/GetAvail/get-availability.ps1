@@ -197,24 +197,41 @@ function Send-ToLogAnalytics {
         'Content-Encoding' = 'gzip'
     }
 
-    # Gzip-compress a JSON array into a byte[]
-    $compressJson = {
-        param([object[]]$Items)
+    # Gzip-compress a JSON array into a byte[].
+    # Returns [byte[]] directly — NOT through the pipeline — to avoid PowerShell
+    # unrolling the array into individual System.Byte objects.
+    function Compress-JsonPayload([object[]]$Items) {
         $json = $Items | ConvertTo-Json -Depth 5 -Compress -AsArray
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $ms = [System.IO.MemoryStream]::new()
-        $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal)
-        $gz.Write($bytes, 0, $bytes.Length)
-        $gz.Dispose()
-        $result = $ms.ToArray()
-        $ms.Dispose()
-        $result
+        try {
+            $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+            $gz.Write($bytes, 0, $bytes.Length)
+            $gz.Dispose()
+            [byte[]]$ms.ToArray()
+        } finally { $ms.Dispose() }
+    }
+
+    # POST with retry (3 attempts, exponential backoff)
+    function Send-Chunk([byte[]]$Body) {
+        $maxAttempts = 3
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $Body -TimeoutSec 60 -StatusCodeVariable statusCode
+                return
+            } catch {
+                if ($attempt -eq $maxAttempts) { throw }
+                $delay = [math]::Pow(2, $attempt)
+                Write-Warning "Ingestion attempt $attempt to $StreamName failed (HTTP $statusCode): $($_.Exception.Message). Retrying in ${delay}s..."
+                Start-Sleep -Seconds $delay
+            }
+        }
     }
 
     # Try full payload as a single call; split only if compressed size exceeds 900 KB
-    $compressed = & $compressJson $Payload
+    [byte[]]$compressed = Compress-JsonPayload $Payload
     if ($compressed.Length -lt 900KB) {
-        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $compressed -UseBasicParsing -ProgressAction SilentlyContinue | Out-Null
+        Send-Chunk $compressed
         return
     }
 
@@ -222,8 +239,8 @@ function Send-ToLogAnalytics {
     $chunkSize = [math]::Max(1, [math]::Floor($Payload.Count / [math]::Ceiling($compressed.Length / 900KB)))
     for ($i = 0; $i -lt $Payload.Count; $i += $chunkSize) {
         $chunk = @($Payload[$i..([math]::Min($i + $chunkSize - 1, $Payload.Count - 1))])
-        $body = & $compressJson $chunk
-        Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -Body $body -UseBasicParsing -ProgressAction SilentlyContinue | Out-Null
+        [byte[]]$body = Compress-JsonPayload $chunk
+        Send-Chunk $body
     }
 }
 

@@ -185,6 +185,7 @@ resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023
 resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
   name: dataCollectionRuleName
   location: location
+  kind: 'Direct'
   properties: {
     dataCollectionEndpointId: dataCollectionEndpoint.id
 
@@ -194,8 +195,8 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' 
         columns: [
           { name: 'RunId', type: 'string' }
           { name: 'Month', type: 'string' }
-          { name: 'PeriodStart', type: 'string' }
-          { name: 'PeriodEnd', type: 'string' }
+          { name: 'PeriodStart', type: 'datetime' }
+          { name: 'PeriodEnd', type: 'datetime' }
           { name: 'IsMonthToDate', type: 'boolean' }
           { name: 'SubscriptionName', type: 'string' }
           { name: 'ResourceName', type: 'string' }
@@ -216,8 +217,8 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' 
         columns: [
           { name: 'RunId', type: 'string' }
           { name: 'Month', type: 'string' }
-          { name: 'PeriodStart', type: 'string' }
-          { name: 'PeriodEnd', type: 'string' }
+          { name: 'PeriodStart', type: 'datetime' }
+          { name: 'PeriodEnd', type: 'datetime' }
           { name: 'IsMonthToDate', type: 'boolean' }
           { name: 'SummaryLevel', type: 'string' }
           { name: 'SubscriptionName', type: 'string' }
@@ -244,13 +245,13 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' 
       {
         streams: [ 'Custom-GetAvailResources_CL' ]
         destinations: [ 'workspace' ]
-        transformKql: 'source | extend TimeGenerated = now(), PeriodStart = todatetime(PeriodStart), PeriodEnd = todatetime(PeriodEnd)'
+        transformKql: 'source | extend TimeGenerated = now()'
         outputStream: 'Custom-GetAvailResources_CL'
       }
       {
         streams: [ 'Custom-GetAvailSummary_CL' ]
         destinations: [ 'workspace' ]
-        transformKql: 'source | extend TimeGenerated = now(), PeriodStart = todatetime(PeriodStart), PeriodEnd = todatetime(PeriodEnd)'
+        transformKql: 'source | extend TimeGenerated = now()'
         outputStream: 'Custom-GetAvailSummary_CL'
       }
     ]
