@@ -344,6 +344,37 @@ az deployment group what-if --resource-group rg-getavail-itn-001 --parameters Bi
 az deployment group create --resource-group rg-getavail-itn-001 --parameters Bicep/parameters.dev.bicepparam
 ```
 
+### Post-deployment: cross-subscription Reader role
+
+The Bicep template creates RBAC assignments within the deployment resource group (Metrics Publisher, Storage Blob Data Owner). However, the function also needs **Reader** access on every subscription listed in `getavailSubscriptions` so that `Get-AzSubscription` and `Search-AzGraph` can enumerate and query resources there.
+
+After deployment, retrieve the managed identity principal ID and assign **Reader** on each target subscription:
+
+```powershell
+# Get the Function App managed identity principal ID
+$principalId = (az functionapp identity show `
+    --name fn-getavail-itn-001 `
+    --resource-group rg-getavail-itn-001 `
+    --query principalId -o tsv)
+
+# Assign Reader on each subscription in getavailSubscriptions
+$subscriptions = @('Flaz-Connectivity', 'Flaz-Management', 'Flaz-Identity', 'Flaz-Workloads')
+foreach ($sub in $subscriptions) {
+    $subId = az account show --subscription $sub --query id -o tsv
+    az role assignment create --assignee $principalId --role Reader --scope "/subscriptions/$subId"
+}
+```
+
+> **Note:** You only need to do this once per subscription (or when the managed identity is recreated). The Workloads subscription (where the Function App lives) may already have Reader via inheritance — include it for completeness.
+
+If `sourceWorkspaceId` points to a Log Analytics workspace (e.g. a Sentinel workspace for Activity Log / Resource Health queries), the managed identity also needs **Log Analytics Reader** on that workspace:
+
+```powershell
+# Assign Log Analytics Reader on the source workspace (if used)
+az role assignment create --assignee $principalId --role "Log Analytics Reader" `
+    --scope "<source-workspace-resource-id>"
+```
+
 ### Auto-wired app settings
 
 The Bicep template configures the Function App with all required settings — values are resolved from sibling resources at deploy time:
@@ -357,8 +388,6 @@ The Bicep template configures the Function App with all required settings — va
 | `GETAVAIL_KINDS` | `getavailKinds` parameter | `$env:GETAVAIL_KINDS` |
 | `TIMER_SCHEDULE` | `timerSchedule` parameter | *(timer trigger via `%TIMER_SCHEDULE%`)* |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | App Insights connection string | *(Functions runtime)* |
-
-No manual post-deployment configuration is required.
 
 The template also configures CORS to allow `https://portal.azure.com`, so you can test-run the function directly from the Azure Portal.
 
