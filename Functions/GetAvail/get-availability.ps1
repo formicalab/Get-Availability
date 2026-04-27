@@ -6,7 +6,7 @@
     Reports month-scoped availability for VMs, Azure SQL databases, Storage Accounts, and Web Apps.
 
 .DESCRIPTION
-    Mirrors the C# Get-Availability pipeline:
+    Availability pipeline:
       1. Resolve subscriptions
       2. Inventory via Resource Graph
       3. Fetch metrics (Azure Monitor, parallel)
@@ -30,15 +30,17 @@
     Remaining null minutes become metric issues (excluded from eligibility),
     while remaining 0% minutes are trusted as downtime.
 
-    When -Workspace is specified, Activity Log lifecycle events are fetched
-    from a Log Analytics workspace via a single bulk KQL query instead of
-    per-resource REST API calls. This is faster for large estates and uses
+    When -SourceWorkspaceId is specified, Activity Log lifecycle events are
+    fetched from a Log Analytics workspace via a single bulk KQL query instead
+    of per-resource REST API calls. This is faster for large estates and uses
     workspace retention (typically 365 days). Resource Health data uses a
     hybrid approach: Log Analytics transitions cover the period beyond the
     REST API's ~30-day retention, while REST API transitions (curated,
     synthetic, with retroactively corrected causes) are authoritative for
     the last ~30 days. The two sources are merged to produce complete
-    coverage. Without -Workspace, the REST APIs are used directly.
+    coverage. Without -SourceWorkspaceId, the REST APIs are used directly.
+    Note: this is NOT the workspace used for result ingestion (see
+    -DceEndpoint / -DcrImmutableId for that).
 
     The observation window is a UTC calendar month selected via -Month YYYYMM.
     Current month runs month-to-date; past months run full-month.
@@ -67,16 +69,28 @@
 .PARAMETER BatchSize
     Max resources per batch call (default: 10, max 50). Implies -Batch.
 
-.PARAMETER Workspace
-    Log Analytics workspace ID (GUID). When provided, Activity Log lifecycle
-    events are fetched from the AzureActivity table in this workspace via a
-    single bulk KQL query instead of per-resource REST API calls. Resource
-    Health uses a hybrid approach: Log Analytics transitions cover the period
-    beyond the REST API's ~30-day retention limit, while REST API transitions
-    (curated, with corrected causes) are authoritative for the last ~30 days.
-    Faster for large estates and provides complete Resource Health coverage
-    across the full observation window. Requires the workspace to receive
-    Activity Log diagnostic settings from the target subscriptions.
+.PARAMETER SourceWorkspaceId
+    Log Analytics workspace ID (GUID) used as a source for historical Activity
+    Log and Resource Health data. This is NOT the ingestion target — it is
+    an existing workspace that receives Activity Log diagnostic settings from
+    the target subscriptions. When provided, lifecycle events are fetched via
+    a single bulk KQL query (faster for large estates, uses workspace
+    retention). Resource Health uses a hybrid approach: Log Analytics
+    transitions cover the period beyond the REST API's ~30-day retention
+    limit, while REST API transitions (curated, with corrected causes) are
+    authoritative for the last ~30 days.
+
+.PARAMETER DceEndpoint
+    Data Collection Endpoint ingestion URL. When both -DceEndpoint and
+    -DcrImmutableId are provided, results are sent to Log Analytics custom
+    tables in addition to the normal console output. Obtain the URL from
+    the Bicep deployment output 'dceIngestionEndpoint'. Works in both
+    interactive (az login / Connect-AzAccount) and Azure Function
+    (managed identity) execution contexts.
+
+.PARAMETER DcrImmutableId
+    Data Collection Rule immutable ID. Required together with -DceEndpoint.
+    Obtain from the Bicep deployment output 'dataCollectionRuleImmutableId'.
 
 .EXAMPLE
     ./get-availability.ps1 -Subscriptions 'MySubscription' -Month 202506
@@ -88,7 +102,10 @@
     ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Batch -BatchSize 20
 
 .EXAMPLE
-    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -Workspace 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
+    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -SourceWorkspaceId 'b233a4b7-3c43-433c-ac60-1f6ff217ddd4'
+
+.EXAMPLE
+    ./get-availability.ps1 -Subscriptions 'MySub' -Month 202506 -DceEndpoint 'https://dce-getavail-itn-001.italynorth-1.ingest.monitor.azure.com' -DcrImmutableId 'dcr-00000000000000000000000000000000'
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Run')]
@@ -125,7 +142,15 @@ param(
 
     [Parameter(ParameterSetName = 'Run')]
     [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
-    [string]$Workspace,
+    [string]$SourceWorkspaceId,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateNotNullOrEmpty()]
+    [string]$DceEndpoint,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateNotNullOrEmpty()]
+    [string]$DcrImmutableId,
 
     [Parameter(Mandatory, ParameterSetName = 'ShowVersion')]
     [switch]$Version
@@ -141,8 +166,90 @@ if ($Version) {
     return
 }
 
+# Validate paired ingestion parameters
+$sendToLogAnalytics = $false
+if ($DceEndpoint -and $DcrImmutableId) {
+    $sendToLogAnalytics = $true
+} elseif ($DceEndpoint -or $DcrImmutableId) {
+    throw '-DceEndpoint and -DcrImmutableId must both be provided together.'
+}
+
+# ── Log Analytics Ingestion ───────────────────────────────────────────────────
+
+## Sends an array of objects to a Log Analytics custom table via the Azure
+## Monitor Ingestion REST API. Gzip-compresses the JSON payload and splits
+## into multiple calls if the compressed size exceeds 900 KB (API limit is 1 MB).
+function Send-ToLogAnalytics {
+    param(
+        [string]$Endpoint,
+        [string]$RuleId,
+        [string]$StreamName,
+        [string]$Token,
+        [object[]]$Payload
+    )
+
+    if ($Payload.Count -eq 0) { return }
+
+    $uri = "$Endpoint/dataCollectionRules/$RuleId/streams/${StreamName}?api-version=2023-01-01"
+    $headers = @{
+        'Authorization'    = "Bearer $Token"
+        'Content-Type'     = 'application/json'
+        'Content-Encoding' = 'gzip'
+    }
+
+    # Gzip-compress a JSON array into a byte[].
+    # Returns [byte[]] directly — NOT through the pipeline — to avoid PowerShell
+    # unrolling the array into individual System.Byte objects.
+    function Compress-JsonPayload([object[]]$Items) {
+        $json = $Items | ConvertTo-Json -Depth 5 -Compress -AsArray
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $ms = [System.IO.MemoryStream]::new()
+        try {
+            $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+            $gz.Write($bytes, 0, $bytes.Length)
+            $gz.Dispose()
+            [byte[]]$ms.ToArray()
+        } finally { $ms.Dispose() }
+    }
+
+    # POST with retry (3 attempts, exponential backoff)
+    function Send-Chunk([byte[]]$Body) {
+        $maxAttempts = 3
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $Body -TimeoutSec 60 -StatusCodeVariable statusCode
+                return
+            } catch {
+                if ($attempt -eq $maxAttempts) { throw }
+                $delay = [math]::Pow(2, $attempt)
+                Write-Warning "Ingestion attempt $attempt to $StreamName failed (HTTP $statusCode): $($_.Exception.Message). Retrying in ${delay}s..."
+                Start-Sleep -Seconds $delay
+            }
+        }
+    }
+
+    # Try full payload as a single call; split only if compressed size exceeds 900 KB
+    [byte[]]$compressed = Compress-JsonPayload $Payload
+    if ($compressed.Length -lt 900KB) {
+        Send-Chunk $compressed
+        return
+    }
+
+    # Estimate chunk size from compression ratio and send each chunk separately
+    $chunkSize = [math]::Max(1, [math]::Floor($Payload.Count / [math]::Ceiling($compressed.Length / 900KB)))
+    for ($i = 0; $i -lt $Payload.Count; $i += $chunkSize) {
+        $chunk = @($Payload[$i..([math]::Min($i + $chunkSize - 1, $Payload.Count - 1))])
+        [byte[]]$body = Compress-JsonPayload $chunk
+        Send-Chunk $body
+    }
+}
+
 # ── Observation window ────────────────────────────────────────────────────────
 
+## Parses a YYYYMM string into a start/end observation window, clamped to the
+## current UTC minute.  Returns Start, End, NormalizedMonth, IsMonthToDate, and
+## TotalMinutes.  Throws if the month is in the future, older than 90 days, or
+## produces an empty period.
 function Resolve-ObservationWindow([string]$MonthParam) {
     $parsed = [datetime]::new(1, 1, 1)
     if (-not [datetime]::TryParseExact($MonthParam, 'yyyyMM',
@@ -173,6 +280,9 @@ function Resolve-ObservationWindow([string]$MonthParam) {
 
 # ── Resource inventory via Azure Resource Graph ───────────────────────────────
 
+## Queries Azure Resource Graph for resources matching the requested -Kind and
+## optional -ResourceName filter across the supplied subscriptions.  Returns
+## an array of lightweight resource descriptors used by the metrics pipeline.
 function Get-ResourceInventory {
     param(
         [string[]]$SubscriptionIds,
@@ -263,9 +373,9 @@ function Get-ShortKind([string]$Kind) {
 
 ## Returns the effective start of the Resource Health coverage window, clamped
 ## to PeriodStart if coverage spans the full observation period.
-## When using Log Analytics (-Workspace), the hybrid approach (LA for older
-## transitions + REST API for the last ~30 days) provides coverage from
-## PeriodStart. Without -Workspace, coverage is limited to ~30 days.
+## When using Log Analytics (-SourceWorkspaceId), the hybrid approach (LA for
+## older transitions + REST API for the last ~30 days) provides coverage from
+## PeriodStart. Without -SourceWorkspaceId, coverage is limited to ~30 days.
 function Get-HealthCoverageStart([DateTimeOffset]$PeriodStart, [switch]$UseLogAnalytics) {
     if ($UseLogAnalytics) { return $PeriodStart }
     $now = [DateTimeOffset]::UtcNow
@@ -943,12 +1053,8 @@ function Test-BatchEndpoints {
         $body = '{"resourceids":[]}'
 
         try {
-            $oldPref = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-            try {
-                Invoke-WebRequest -Uri $testUri -Method POST -Body $body -ContentType 'application/json' `
-                    -Headers @{ Authorization = "Bearer $MetricsToken" } -UseBasicParsing -ErrorAction Stop | Out-Null
-            }
-            finally { $ProgressPreference = $oldPref }
+            Invoke-WebRequest -Uri $testUri -Method POST -Body $body -ContentType 'application/json' `
+                -Headers @{ Authorization = "Bearer $MetricsToken" } -ErrorAction Stop | Out-Null
             Write-Host "  $region`: OK"
         }
         catch {
@@ -1416,8 +1522,8 @@ function Invoke-SuspectGapInvestigation {
 
     # Shared HttpClient for REST API calls within the parallel block.
     # Always created: needed for Resource Health REST calls (sole source
-    # without -Workspace; hybrid supplement with -Workspace) and for
-    # Activity Log REST calls when -Workspace is not specified.
+    # without -SourceWorkspaceId; hybrid supplement with -SourceWorkspaceId)
+    # and for Activity Log REST calls when -SourceWorkspaceId is not specified.
     $gapHttpClient = [System.Net.Http.HttpClient]::new()
     $gapHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
     $gapHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
@@ -1830,12 +1936,12 @@ function Invoke-SuspectGapInvestigation {
         # ── Resource Health ───────────────────────────────────────────
         # Query Resource Health transitions to classify platform faults,
         # unknown states, and customer-initiated events.
-        # Hybrid mode (-Workspace): LA transitions older than the REST API
-        # ~30-day cutoff are merged with REST API transitions for the last
+        # Hybrid mode (-SourceWorkspaceId): LA transitions older than the REST
+        # API ~30-day cutoff are merged with REST API transitions for the last
         # ~30 days.  REST data is authoritative within its retention window:
         # it provides curated synthetic entries that fill coverage gaps
         # between incidents and retroactively corrects cause classification.
-        # REST-only mode (no -Workspace): REST API is the sole source.
+        # REST-only mode (no -SourceWorkspaceId): REST API is the sole source.
         $healthHistoryApplied = [DateTimeOffset]$hcStart -lt [DateTimeOffset]$pEnd
         $faultIntervals    = @()
         $unknownIntervals  = @()
@@ -1855,7 +1961,7 @@ function Invoke-SuspectGapInvestigation {
                 }
 
                 # Fetch REST API health transitions — sole source without
-                # -Workspace; covers last ~30 days with curated authoritative
+                # -SourceWorkspaceId; covers last ~30 days with curated authoritative
                 # data in hybrid mode.
                 $url = "https://management.azure.com$($c.ResourceId)" +
                        "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
@@ -2135,6 +2241,13 @@ function Write-SubscriptionSummaries([object[]]$Sorted) {
     }
 }
 
+## Acquires a plain-text bearer token via Az.Accounts.
+## Handles both SecureString (Az.Accounts ≥ 5.x) and legacy plain string returns.
+function Get-PlainToken([string]$ResourceUrl) {
+    $raw = (Get-AzAccessToken -ResourceUrl $ResourceUrl).Token
+    ($raw -is [securestring]) ? ($raw | ConvertFrom-SecureString -AsPlainText) : [string]$raw
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -2145,7 +2258,7 @@ $utcStart     = $window.Start
 $utcEnd       = $window.End
 $totalMinutes = $window.TotalMinutes
 
-$healthCoverageStart = if ($Workspace) {
+$healthCoverageStart = if ($SourceWorkspaceId) {
     Get-HealthCoverageStart $utcStart -UseLogAnalytics
 } else {
     Get-HealthCoverageStart $utcStart
@@ -2155,8 +2268,8 @@ $healthCoveredMinutes = $healthCoverageStart -lt $utcEnd ? [int]($utcEnd - $heal
 $periodLabel = $window.IsMonthToDate ? "month $($window.NormalizedMonth) (month-to-date)" : "month $($window.NormalizedMonth)"
 Write-Host "Period: $periodLabel ($($utcStart.ToString('u')) -> $($utcEnd.ToString('u')), $totalMinutes min)"
 
-if ($Workspace) {
-    Write-Host "Log Analytics workspace: $Workspace (Activity Log via KQL, Resource Health via KQL + REST API hybrid)"
+if ($SourceWorkspaceId) {
+    Write-Host "Log Analytics source workspace: $SourceWorkspaceId (Activity Log via KQL, Resource Health via KQL + REST API hybrid)"
 } elseif ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
     Write-Host "WARNING: Resource Health history covers only part of this period ($($healthCoverageStart.ToString('u')) -> $($utcEnd.ToString('u')), $healthCoveredMinutes of $totalMinutes min). Earlier minutes will use Activity Log and metric fallback rules."
 } elseif ($healthCoveredMinutes -eq 0) {
@@ -2179,10 +2292,7 @@ $resolvedSubs = @(foreach ($name in $Subscriptions) {
 $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
 
-# Acquire ARM token — Az.Accounts may return SecureString or plain string
-$rawToken = (Get-AzAccessToken -ResourceUrl 'https://management.azure.com').Token
-$armToken = ($rawToken -is [securestring]) ? ($rawToken | ConvertFrom-SecureString -AsPlainText) : [string]$rawToken
-$rawToken = $null
+$armToken = Get-PlainToken 'https://management.azure.com'
 
 Write-Host 'OK'
 Write-Host "Processing $($resolvedSubs.Count) subscription(s): $($resolvedSubs.Name -join ', ')"
@@ -2199,9 +2309,7 @@ Write-Host "Found $($resources.Count) resource(s) across $($resolvedSubs.Count) 
 if ($resources.Count -eq 0) { Write-Host 'No resources found.'; return }
 
 if ($Batch) {
-    $rawMetrics = (Get-AzAccessToken -ResourceUrl 'https://metrics.monitor.azure.com').Token
-    $metricsToken = ($rawMetrics -is [securestring]) ? ($rawMetrics | ConvertFrom-SecureString -AsPlainText) : [string]$rawMetrics
-    $rawMetrics = $null
+    $metricsToken = Get-PlainToken 'https://metrics.monitor.azure.com'
     Write-Host "Mode: Batch (batch-size=$BatchSize)"
 }
 
@@ -2237,6 +2345,39 @@ if ($Batch) {
         -EndDate $utcEnd -ThrottleLimit $Parallelism -ArmToken $armToken
 }
 
+# Step 5b: Detect perpetually-deallocated VMs
+# VMs that are currently deallocated/stopped AND had zero healthy minutes for the
+# entire period are excused — the VM was never running so availability is N/A.
+# This handles cases where the deallocate event fell outside Activity Log and
+# Resource Health retention windows.
+$perpetuallyDeallocated = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$vmCandidates = @($resources | Where-Object {
+    $_.Kind -eq 'VirtualMachine' -and
+    $metricResults.ContainsKey($_.ResourceId.ToLowerInvariant()) -and
+    $metricResults[$_.ResourceId.ToLowerInvariant()].SuspectMinutes -ge $totalMinutes
+})
+if ($vmCandidates.Count -gt 0) {
+    foreach ($vm in $vmCandidates) {
+        try {
+            $ivUrl = "https://management.azure.com$($vm.ResourceId)/instanceView?api-version=2024-07-01"
+            $ivResp = Invoke-RestMethod -Uri $ivUrl -Headers @{ Authorization = "Bearer $armToken" } -Method Get
+            $powerCode = ($ivResp.statuses | Where-Object { $_.code -like 'PowerState/*' } | Select-Object -First 1).code
+            if ($powerCode -eq 'PowerState/deallocated' -or $powerCode -eq 'PowerState/stopped') {
+                $perpetuallyDeallocated.Add($vm.ResourceId) | Out-Null
+                $elig = $eligByRes[$vm.ResourceId.ToLowerInvariant()]
+                $elig.EligibleMinutes = 0
+                $elig.ExcusedMinutes = $totalMinutes
+                $elig.SuspectMinutes = $totalMinutes
+                $elig.AvailabilityPct = 'N/A'
+                Write-Host "  [$($vm.Name)] Deallocated for entire period — excluded from availability counts"
+            }
+        }
+        catch {
+            Write-Warning "Instance View check failed for '$($vm.Name)': $_"
+        }
+    }
+}
+
 # Step 6: Build suspect candidates and investigate via Activity Log + Resource Health
 # Build the list of resources that have at least one suspect minute —
 # these need Activity Log + Resource Health investigation. Combine null
@@ -2244,6 +2385,7 @@ if ($Batch) {
 $suspectCandidates = [System.Collections.Generic.List[object]]::new()
 foreach ($res in $resources) {
     $key = $res.ResourceId.ToLowerInvariant()
+    if ($perpetuallyDeallocated.Contains($res.ResourceId)) { continue }
     $mr = $metricResults[$key]
     if ($mr -and $mr.SuspectMinutes -gt 0) {
         $allTicks = [System.Collections.Generic.List[long]]::new()
@@ -2269,12 +2411,10 @@ foreach ($res in $resources) {
 # complement REST API data in hybrid mode (LA covers pre-30-day, REST provides
 # curated authoritative data for the last ~30 days).
 $logAnalyticsData = $null
-if ($Workspace -and $suspectCandidates.Count -gt 0) {
+if ($SourceWorkspaceId -and $suspectCandidates.Count -gt 0) {
     Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
-    $laToken = (Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io').Token
-    $laTokenStr = ($laToken -is [securestring]) ? ($laToken | ConvertFrom-SecureString -AsPlainText) : [string]$laToken
-    $laToken = $null
-    $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $Workspace `
+    $laTokenStr = Get-PlainToken 'https://api.loganalytics.io'
+    $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId `
         -SubscriptionIds $subIds -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -ArmToken $laTokenStr
     $laTokenStr = $null
@@ -2312,6 +2452,9 @@ foreach ($res in $resources) {
         Write-Host "  [$($res.Name)] excluded from availability (no numeric availability datapoints in period)"
         continue
     }
+
+    # Skip perpetually-deallocated VMs — already handled in Step 5b
+    if ($perpetuallyDeallocated.Contains($res.ResourceId)) { continue }
 
     $activityLogExcludedGapMinutes = 0
     $healthExplainedGapMinutes = 0
@@ -2456,6 +2599,116 @@ $sorted = @($eligByRes.Values |
 
 Write-ResultsTable $sorted
 Write-SubscriptionSummaries $sorted
+
+# Step 9: Optional Log Analytics ingestion
+if ($sendToLogAnalytics) {
+    Write-Host -NoNewline 'Sending results to Log Analytics... '
+
+    $monitorToken = Get-PlainToken 'https://monitor.azure.com'
+
+    $runId = [guid]::NewGuid().ToString()
+    $normalizedMonth = $window.NormalizedMonth
+    $isMonthToDate = $window.IsMonthToDate
+    $periodStartIso = $utcStart.ToString('o')
+    $periodEndIso = $utcEnd.ToString('o')
+
+    # Build per-resource detail payload
+    $resourcePayload = @(foreach ($elig in $eligByRes.Values) {
+        @{
+            RunId                     = $runId
+            Month                     = $normalizedMonth
+            PeriodStart               = $periodStartIso
+            PeriodEnd                 = $periodEndIso
+            IsMonthToDate             = $isMonthToDate
+            SubscriptionName          = $elig.SubscriptionName
+            ResourceName              = $elig.Name
+            ResourceId                = $elig.ResourceId
+            ResourceGroup             = $elig.ResourceGroupName
+            Kind                      = $elig.Kind
+            Location                  = $elig.Location
+            EligibleMinutes           = $elig.EligibleMinutes
+            AvailableMinutes          = $elig.AvailableMinutes
+            SuspectMinutes            = $elig.SuspectMinutes
+            ConfirmedDowntimeMinutes  = $elig.ConfirmedDowntimeMinutes
+            ExcusedMinutes            = $elig.ExcusedMinutes
+            UnexplainedSuspectMinutes = $elig.UnexplainedSuspectMinutes
+            AvailabilityPct           = if ($elig.AvailabilityPct -eq 'N/A') { -1 } else { [double]$elig.AvailabilityPct }
+        }
+    })
+
+    Send-ToLogAnalytics -Endpoint $DceEndpoint -RuleId $DcrImmutableId `
+        -StreamName 'Custom-GetAvailResources_CL' -Token $monitorToken -Payload $resourcePayload
+
+    # Build summary payload
+    $eligible = @($sorted | Where-Object { $_.AvailabilityPct -ne 'N/A' })
+    $summaryPayload = [System.Collections.Generic.List[hashtable]]::new()
+
+    $commonSummary = @{
+        RunId         = $runId
+        Month         = $normalizedMonth
+        PeriodStart   = $periodStartIso
+        PeriodEnd     = $periodEndIso
+        IsMonthToDate = $isMonthToDate
+    }
+
+    foreach ($subGroup in ($eligible | Group-Object SubscriptionName | Sort-Object Name)) {
+        foreach ($g in ($subGroup.Group | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
+            $items = @($g.Group)
+            $a = ($items | Measure-Object AvailableMinutes -Sum).Sum
+            $e = ($items | Measure-Object EligibleMinutes -Sum).Sum
+            $pct = if ($e -gt 0) { [math]::Round($a / $e * 100, 5) } else { 0 }
+            $summaryPayload.Add(($commonSummary + @{
+                SummaryLevel     = 'KindLocation'
+                SubscriptionName = $subGroup.Name
+                Kind             = $items[0].Kind
+                Location         = $items[0].Location
+                ResourceCount    = $items.Count
+                EligibleMinutes  = [math]::Round($e, 2)
+                AvailableMinutes = [math]::Round($a, 2)
+                AvailabilityPct  = $pct
+            }))
+        }
+        $ta = ($subGroup.Group | Measure-Object AvailableMinutes -Sum).Sum
+        $te = ($subGroup.Group | Measure-Object EligibleMinutes -Sum).Sum
+        $tpct = if ($te -gt 0) { [math]::Round($ta / $te * 100, 5) } else { 0 }
+        $summaryPayload.Add(($commonSummary + @{
+            SummaryLevel     = 'SubscriptionTotal'
+            SubscriptionName = $subGroup.Name
+            Kind             = ''
+            Location         = ''
+            ResourceCount    = $subGroup.Count
+            EligibleMinutes  = [math]::Round($te, 2)
+            AvailableMinutes = [math]::Round($ta, 2)
+            AvailabilityPct  = $tpct
+        }))
+    }
+
+    # Cross-subscription overall (only if >1 subscription)
+    $subs = @($eligible | ForEach-Object { $_.SubscriptionName } | Select-Object -Unique)
+    if ($subs.Count -gt 1 -and $eligible.Count -gt 0) {
+        $oa = ($eligible | Measure-Object AvailableMinutes -Sum).Sum
+        $oe = ($eligible | Measure-Object EligibleMinutes -Sum).Sum
+        $opct = if ($oe -gt 0) { [math]::Round($oa / $oe * 100, 5) } else { 0 }
+        $summaryPayload.Add(($commonSummary + @{
+            SummaryLevel     = 'Overall'
+            SubscriptionName = ''
+            Kind             = ''
+            Location         = ''
+            ResourceCount    = $eligible.Count
+            EligibleMinutes  = [math]::Round($oe, 2)
+            AvailableMinutes = [math]::Round($oa, 2)
+            AvailabilityPct  = $opct
+        }))
+    }
+
+    if ($summaryPayload.Count -gt 0) {
+        Send-ToLogAnalytics -Endpoint $DceEndpoint -RuleId $DcrImmutableId `
+            -StreamName 'Custom-GetAvailSummary_CL' -Token $monitorToken -Payload $summaryPayload.ToArray()
+    }
+
+    $monitorToken = $null
+    Write-Host "OK (RunId: $runId, $($resourcePayload.Count) resource rows, $($summaryPayload.Count) summary rows)"
+}
 
 $sw.Stop()
 Write-Host "Completed in $($sw.Elapsed.ToString('hh\:mm\:ss\.ff'))"

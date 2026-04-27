@@ -9,14 +9,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
 
       - name: Extract version from tag
         id: version
@@ -25,22 +20,15 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart('v')
           echo "VERSION=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Publish AOT
-        run: dotnet publish csharp/GetAvailability/GetAvailability.csproj -c Release -r win-x64 -p:Version=${{ steps.version.outputs.VERSION }}
-
       - name: Prepare release assets
         shell: pwsh
         run: |
           $version = '${{ steps.version.outputs.VERSION }}'
-          $publishDir = 'csharp/GetAvailability/bin/Release/net10.0/win-x64/publish'
-          $stageDir   = 'release-assets'
+          $stageDir = 'release-assets'
           New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
-          # AOT executable
-          Copy-Item "$publishDir/GetAvailability.exe" "$stageDir/GetAvailability.exe"
-
           # PowerShell script — stamp version
-          (Get-Content 'get-availability.ps1' -Raw) -replace "0\.0\.0-dev", $version |
+          (Get-Content 'Functions/GetAvail/get-availability.ps1' -Raw) -replace "0\.0\.0-dev", $version |
             Set-Content "$stageDir/get-availability.ps1" -NoNewline
 
       - name: Create GitHub Release
@@ -48,5 +36,4 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            release-assets/GetAvailability.exe
             release-assets/get-availability.ps1
