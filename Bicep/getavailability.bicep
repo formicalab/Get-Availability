@@ -42,17 +42,20 @@ param functionAppName string
 @description('Name of the Application Insights instance for Function App monitoring.')
 param applicationInsightsName string
 
+@description('Create private endpoints for the Storage Account and Function App. When false, both resources remain publicly reachable.')
+param usePrivateEndpoints bool = true
+
 @description('Subnet resource ID for Function App VNet integration. Must be delegated to Microsoft.App/environments.')
 param fnSubnetId string
 
-@description('Subnet resource ID for Private Endpoints.')
-param peSubnetId string
+@description('Subnet resource ID for Private Endpoints. Required only when usePrivateEndpoints is true.')
+param peSubnetId string = ''
 
-@description('Subscription ID containing existing Private DNS Zones.')
-param dnsZonesSubscriptionId string
+@description('Subscription ID containing existing Private DNS Zones. Required only when usePrivateEndpoints is true.')
+param dnsZonesSubscriptionId string = ''
 
-@description('Resource group name containing existing Private DNS Zones.')
-param dnsZonesResourceGroupName string
+@description('Resource group name containing existing Private DNS Zones. Required only when usePrivateEndpoints is true.')
+param dnsZonesResourceGroupName string = ''
 
 @description('Comma-separated list of Azure subscription names or IDs to monitor (written to GETAVAIL_SUBSCRIPTIONS app setting).')
 param getavailSubscriptions string
@@ -78,14 +81,18 @@ var roleDefinitions = {
   storageBlobDataOwner: 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
 }
 
+var storagePublicNetworkAccess = usePrivateEndpoints ? 'Disabled' : 'Enabled'
+var storageDefaultAction = usePrivateEndpoints ? 'Deny' : 'Allow'
+var functionAppPublicNetworkAccess = usePrivateEndpoints ? 'Disabled' : 'Enabled'
+
 // ── Existing Private DNS Zones ───────────────────────────────────────────────
 
-resource blobDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+resource blobDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = if (usePrivateEndpoints) {
   name: 'privatelink.blob.${environment().suffixes.storage}'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
 
-resource webAppDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+resource webAppDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = if (usePrivateEndpoints) {
   name: 'privatelink.azurewebsites.net'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
@@ -281,9 +288,9 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
     supportsHttpsTrafficOnly: true
     networkAcls: {
       bypass: 'AzureServices'
-      defaultAction: 'Deny'
+      defaultAction: storageDefaultAction
     }
-    publicNetworkAccess: 'Disabled'
+    publicNetworkAccess: storagePublicNetworkAccess
     encryption: {
       services: {
         blob: {
@@ -294,17 +301,23 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
   }
   resource blobServices 'blobServices' = {
     name: 'default'
-    properties: {}
+    properties: {
+      deleteRetentionPolicy: {
+        enabled: false
+        allowPermanentDelete: false
+      }
+    }
   }
   tags: commonTags
 }
 
 // ── Private Endpoint: Storage Account (blob) ─────────────────────────────────
 
-resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
+resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = if (usePrivateEndpoints) {
   name: 'pe-blob-${storageAccountName}'
   location: location
-  properties: {
+  properties: any({
+    ipVersionType: 'IPv4'
     subnet: {
       id: peSubnetId
     }
@@ -320,7 +333,7 @@ resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2
       }
     ]
     customNetworkInterfaceName: 'nic-pe-${storageAccountName}'
-  }
+  })
   tags: commonTags
 
   resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
@@ -346,6 +359,8 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
   kind: 'web'
   properties: {
     Application_Type: 'web'
+    Flow_Type: 'Bluefield'
+    Request_Source: 'rest'
     WorkspaceResourceId: logAnalyticsWorkspace.id
     DisableLocalAuth: true
   }
@@ -384,7 +399,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
     serverFarmId: flexServicePlan.id
     httpsOnly: true
     virtualNetworkSubnetId: fnSubnetId
-    publicNetworkAccess: 'Disabled'
+    publicNetworkAccess: functionAppPublicNetworkAccess
     siteConfig: {
       minTlsVersion: '1.2'
       cors: {
@@ -431,18 +446,21 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
       TIMER_SCHEDULE: timerSchedule
     }
   }
-  dependsOn: [
-    storageAccountBlobPrivateEndpoint // Create function only after storage PE is ready
-  ]
+  dependsOn: usePrivateEndpoints
+    ? [
+        storageAccountBlobPrivateEndpoint // Create function only after storage PE is ready
+      ]
+    : []
   tags: commonTags
 }
 
 // ── Private Endpoint: Function App (sites) ───────────────────────────────────
 
-resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
+resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = if (usePrivateEndpoints) {
   name: 'pe-sites-${functionAppName}'
   location: location
-  properties: {
+  properties: any({
+    ipVersionType: 'IPv4'
     subnet: {
       id: peSubnetId
     }
@@ -458,7 +476,7 @@ resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-
       }
     ]
     customNetworkInterfaceName: 'nic-pe-${functionAppName}'
-  }
+  })
   tags: commonTags
 
   resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
