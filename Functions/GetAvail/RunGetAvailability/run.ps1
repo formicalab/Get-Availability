@@ -7,7 +7,7 @@
   Can also be started manually from the Azure Portal or via the Functions runtime API.
 
   Reads configuration from App Settings (environment variables):
-    GETAVAIL_SUBSCRIPTIONS  - Comma-separated list of subscription names or IDs (required)
+    GETAVAIL_SUBSCRIPTIONS  - Comma-separated list of subscription display names (required)
     GETAVAIL_KINDS          - Comma-separated resource kinds (default: vm,sql,storage,webapp)
     DCE_ENDPOINT            - Data Collection Endpoint URL (optional, enables ingestion)
     DCR_IMMUTABLE_ID        - Data Collection Rule immutable ID (optional, paired with DCE_ENDPOINT)

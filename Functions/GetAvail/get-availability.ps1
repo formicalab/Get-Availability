@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 #Requires -Modules Az.Accounts, Az.ResourceGraph
 
 <#
@@ -410,6 +410,7 @@ function Get-LogAnalyticsData {
     param(
         [string]$WorkspaceId,
         [string[]]$SubscriptionIds,
+        [string[]]$ResourceIds,
         [DateTimeOffset]$PeriodStart,
         [DateTimeOffset]$PeriodEnd,
         [string]$ArmToken
@@ -418,11 +419,18 @@ function Get-LogAnalyticsData {
     $startIso = $PeriodStart.ToString('O')
     $endIso   = $PeriodEnd.ToString('O')
     $subList  = ($SubscriptionIds | ForEach-Object { "'$_'" }) -join ', '
+    $normalizedResourceIds = @($ResourceIds |
+        ForEach-Object { $_.ToLowerInvariant() } |
+        Sort-Object -Unique)
+    $resourceList = ($normalizedResourceIds | ForEach-Object {
+        "'$($_.Replace("'", "''"))'"
+    }) -join ', '
 
     # Single KQL query that fetches both Activity Log operations and Resource
     # Health transitions, tagged with a Source column to distinguish them.
     $kql = @"
 let subs = dynamic([$subList]);
+let resourceIds = dynamic([$resourceList]);
 let actOps = dynamic([
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/START/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/DEALLOCATE/ACTION',
@@ -448,6 +456,7 @@ let actData = AzureActivity
     | where OperationNameValue in~ (actOps)
     | where ActivityStatusValue == 'Success'
     | where TimeGenerated >= datetime($startIso) and TimeGenerated <= datetime($endIso)
+    | where tolower(_ResourceId) in (resourceIds)
     | project TimeGenerated, ResourceId=tolower(_ResourceId),
               OperationName=OperationNameValue, CorrelationId,
               Source='Activity';
@@ -455,6 +464,7 @@ let healthData = AzureActivity
     | where SubscriptionId in (subs)
     | where CategoryValue == 'ResourceHealth'
     | where ResourceProviderValue in ('MICROSOFT.COMPUTE', 'MICROSOFT.SQL', 'MICROSOFT.STORAGE', 'MICROSOFT.WEB')
+    | where tolower(_ResourceId) in (resourceIds)
     | project TimeGenerated, ResourceId=tolower(_ResourceId),
               Source='Health', OperationName=OperationNameValue,
               Properties=todynamic(Properties);
@@ -469,6 +479,8 @@ actData | union healthData
     $httpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
     $httpClient.Timeout = [TimeSpan]::FromMinutes(5)
 
+    $content = $null
+    $response = $null
     try {
         $content = [System.Net.Http.StringContent]::new(
             $body, [System.Text.Encoding]::UTF8, 'application/json')
@@ -477,6 +489,8 @@ actData | union healthData
         $jsonStr = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
     }
     finally {
+        if ($response) { $response.Dispose() }
+        if ($content) { $content.Dispose() }
         $httpClient.Dispose()
     }
 
@@ -1221,6 +1235,7 @@ function Get-BatchAvailabilityMetrics {
                 [System.Net.Http.HttpMethod]::Post, $uri)
             $httpReq.Content = [System.Net.Http.StringContent]::new(
                 $bodyJson, [System.Text.Encoding]::UTF8, 'application/json')
+            $httpResp = $null
             try {
                 $httpResp = $client.SendAsync($httpReq,
                     [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
@@ -1230,11 +1245,11 @@ function Get-BatchAvailabilityMetrics {
                     $respStream = $httpResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                     try { $doc = [System.Text.Json.JsonDocument]::ParseAsync($respStream).GetAwaiter().GetResult() }
                     finally { $respStream.Dispose() }
-                    $httpResp.Dispose(); $httpReq.Dispose()
                     break
                 }
-                $httpResp.Dispose(); $httpReq.Dispose()
                 if (($sc -eq 429 -or $sc -ge 500) -and $attempt -lt 5) {
+                    $httpResp.Dispose()
+                    $httpResp = $null
                     Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
                     continue
                 }
@@ -1243,7 +1258,6 @@ function Get-BatchAvailabilityMetrics {
                 break
             }
             catch {
-                try { $httpReq.Dispose() } catch {}
                 $retryable = $_.ToString() -match 'transport|connection.*closed|reset by peer|timed?\s*out'
                 if ($retryable -and $attempt -lt 5) {
                     Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
@@ -1252,6 +1266,10 @@ function Get-BatchAvailabilityMetrics {
                 $names = ($resources | ForEach-Object { $_.Name }) -join ', '
                 Write-Warning "Batch metric query failed for [$names]: $_"
                 break
+            }
+            finally {
+                if ($httpResp) { $httpResp.Dispose() }
+                $httpReq.Dispose()
             }
         }
         $bodyJson = $null
@@ -1394,6 +1412,7 @@ function Get-AvailabilityMetrics {
         for ($attempt = 1; $attempt -le 5; $attempt++) {
             $httpReq = [System.Net.Http.HttpRequestMessage]::new(
                 [System.Net.Http.HttpMethod]::Get, $uri)
+            $httpResp = $null
             try {
                 $httpResp = $client.SendAsync($httpReq,
                     [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
@@ -1403,11 +1422,11 @@ function Get-AvailabilityMetrics {
                     $respStream = $httpResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                     try { $doc = [System.Text.Json.JsonDocument]::ParseAsync($respStream).GetAwaiter().GetResult() }
                     finally { $respStream.Dispose() }
-                    $httpResp.Dispose(); $httpReq.Dispose()
                     break
                 }
-                $httpResp.Dispose(); $httpReq.Dispose()
                 if (($sc -eq 429 -or $sc -ge 500) -and $attempt -lt 5) {
+                    $httpResp.Dispose()
+                    $httpResp = $null
                     Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
                     continue
                 }
@@ -1415,7 +1434,6 @@ function Get-AvailabilityMetrics {
                 break
             }
             catch {
-                try { $httpReq.Dispose() } catch {}
                 $retryable = $_.ToString() -match 'transport|connection.*closed|reset by peer|timed?\s*out'
                 if ($retryable -and $attempt -lt 5) {
                     Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
@@ -1423,6 +1441,10 @@ function Get-AvailabilityMetrics {
                 }
                 Write-Warning "Metric query failed for '$($resource.Name)': $_"
                 break
+            }
+            finally {
+                if ($httpResp) { $httpResp.Dispose() }
+                $httpReq.Dispose()
             }
         }
 
@@ -1553,6 +1575,7 @@ function Invoke-SuspectGapInvestigation {
             for ($a = 0; $a -lt 6; $a++) {
                 $httpReq = [System.Net.Http.HttpRequestMessage]::new(
                     [System.Net.Http.HttpMethod]::Get, $uri)
+                $httpResp = $null
                 try {
                     $httpResp = $httpClient.SendAsync($httpReq,
                         [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
@@ -1562,7 +1585,6 @@ function Invoke-SuspectGapInvestigation {
                         return $httpResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
                     }
                     if (($sc -eq 429 -or $sc -ge 500) -and $a -lt 5) {
-                        $httpResp.Dispose()
                         Start-Sleep -Seconds ([math]::Min(30, [math]::Pow(2, $a)))
                         continue
                     }
@@ -1577,6 +1599,7 @@ function Invoke-SuspectGapInvestigation {
                     }
                     throw
                 } finally {
+                    if ($httpResp) { $httpResp.Dispose() }
                     $httpReq.Dispose()
                 }
             }
@@ -1960,12 +1983,15 @@ function Invoke-SuspectGapInvestigation {
                     }
                 }
 
-                # Fetch REST API health transitions — sole source without
-                # -SourceWorkspaceId; covers last ~30 days with curated authoritative
-                # data in hybrid mode.
-                $url = "https://management.azure.com$($c.ResourceId)" +
-                       "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
-                       "?api-version=2025-05-01"
+                # Fetch REST health transitions when they can overlap the period.
+                # In hybrid mode, Log Analytics is sufficient when the period
+                # ends before the REST API's ~30-day retention window.
+                $useRestHealth = $null -eq $laData -or $pEnd -gt $restCutoff
+                $url = if ($useRestHealth) {
+                    "https://management.azure.com$($c.ResourceId)" +
+                    "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
+                    "?api-version=2025-05-01"
+                } else { $null }
 
                 while ($url) {
                     $json = ArmGet $url $client
@@ -2191,52 +2217,107 @@ function Write-ResultsTable([object[]]$Sorted) {
     Write-Host ''
 }
 
-## Prints per-subscription summaries grouped by Kind + Location, plus a cross-
-## subscription overall summary when multiple subscriptions are present.
-function Write-SubscriptionSummaries([object[]]$Sorted) {
+## Calculates summary records once for console output and optional ingestion.
+function Get-AvailabilitySummaries([object[]]$Sorted) {
     $eligible = @($Sorted | Where-Object { $_.AvailabilityPct -ne 'N/A' })
+    $summaries = [System.Collections.Generic.List[object]]::new()
+    $subscriptionGroups = @($eligible | Group-Object SubscriptionName | Sort-Object Name)
 
-    foreach ($subGroup in ($eligible | Group-Object SubscriptionName | Sort-Object Name)) {
-        Write-Host "--- $($subGroup.Name) Summary ---"
+    foreach ($subGroup in $subscriptionGroups) {
         foreach ($g in ($subGroup.Group | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
             $items = @($g.Group)
-            $n = $items.Count
             $a = ($items | Measure-Object AvailableMinutes -Sum).Sum
             $e = ($items | Measure-Object EligibleMinutes  -Sum).Sum
             $pct = if ($e -gt 0) { [math]::Round($a / $e * 100, 5) } else { 0 }
-            $kind = Get-ShortKind $items[0].Kind
-            $loc  = $items[0].Location
-            Write-Host "  $kind, $loc [$n res]: $pct% ($([math]::Round($a, 2)) / $([math]::Round($e, 2)) eligible min)"
+            $summaries.Add([PSCustomObject]@{
+                SummaryLevel     = 'KindLocation'
+                SubscriptionName = $subGroup.Name
+                Kind             = $items[0].Kind
+                Location         = $items[0].Location
+                ResourceCount    = $items.Count
+                AvailableMinutes = $a
+                EligibleMinutes  = $e
+                AvailabilityPct  = $pct
+            })
         }
-        $tn = $subGroup.Count
         $ta = ($subGroup.Group | Measure-Object AvailableMinutes -Sum).Sum
         $te = ($subGroup.Group | Measure-Object EligibleMinutes  -Sum).Sum
         $tpct = if ($te -gt 0) { [math]::Round($ta / $te * 100, 5) } else { 0 }
-        Write-Host "  TOTAL [$tn res]: $tpct% ($([math]::Round($ta, 2)) / $([math]::Round($te, 2)) eligible min)"
-        Write-Host ''
+        $summaries.Add([PSCustomObject]@{
+            SummaryLevel     = 'SubscriptionTotal'
+            SubscriptionName = $subGroup.Name
+            Kind             = ''
+            Location         = ''
+            ResourceCount    = $subGroup.Count
+            AvailableMinutes = $ta
+            EligibleMinutes  = $te
+            AvailabilityPct  = $tpct
+        })
     }
 
-    # Cross-subscription summary
-    $subs = @($eligible | ForEach-Object { $_.SubscriptionName } | Select-Object -Unique)
-    if ($subs.Count -gt 1 -and $eligible.Count -gt 0) {
-        Write-Host ([string]::new([char]0x2550, 62))
-        Write-Host '               OVERALL (all subscriptions)'
-        Write-Host ([string]::new([char]0x2550, 62))
+    if ($subscriptionGroups.Count -gt 1) {
         foreach ($g in ($eligible | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
             $items = @($g.Group)
-            $n = $items.Count
             $a = ($items | Measure-Object AvailableMinutes -Sum).Sum
             $e = ($items | Measure-Object EligibleMinutes  -Sum).Sum
             $pct = if ($e -gt 0) { [math]::Round($a / $e * 100, 5) } else { 0 }
-            $kind = Get-ShortKind $items[0].Kind
-            $loc  = $items[0].Location
-            Write-Host "  $kind, $loc [$n res]: $pct% ($([math]::Round($a, 2)) / $([math]::Round($e, 2)) eligible min)"
+            $summaries.Add([PSCustomObject]@{
+                SummaryLevel     = 'OverallKindLocation'
+                SubscriptionName = ''
+                Kind             = $items[0].Kind
+                Location         = $items[0].Location
+                ResourceCount    = $items.Count
+                AvailableMinutes = $a
+                EligibleMinutes  = $e
+                AvailabilityPct  = $pct
+            })
         }
-        $on = $eligible.Count
         $oa = ($eligible | Measure-Object AvailableMinutes -Sum).Sum
         $oe = ($eligible | Measure-Object EligibleMinutes  -Sum).Sum
         $opct = if ($oe -gt 0) { [math]::Round($oa / $oe * 100, 5) } else { 0 }
-        Write-Host "  OVERALL [$on res]: $opct% ($([math]::Round($oa, 2)) / $([math]::Round($oe, 2)) eligible min)"
+        $summaries.Add([PSCustomObject]@{
+            SummaryLevel     = 'Overall'
+            SubscriptionName = ''
+            Kind             = ''
+            Location         = ''
+            ResourceCount    = $eligible.Count
+            AvailableMinutes = $oa
+            EligibleMinutes  = $oe
+            AvailabilityPct  = $opct
+        })
+    }
+
+    $summaries.ToArray()
+}
+
+## Prints precomputed per-subscription and cross-subscription summaries.
+function Write-SubscriptionSummaries([object[]]$Summaries) {
+    $subscriptionTotals = @($Summaries |
+        Where-Object SummaryLevel -eq 'SubscriptionTotal' |
+        Sort-Object SubscriptionName)
+
+    foreach ($total in $subscriptionTotals) {
+        Write-Host "--- $($total.SubscriptionName) Summary ---"
+        foreach ($summary in ($Summaries |
+            Where-Object { $_.SummaryLevel -eq 'KindLocation' -and $_.SubscriptionName -eq $total.SubscriptionName } |
+            Sort-Object Kind, Location)) {
+            Write-Host "  $(Get-ShortKind $summary.Kind), $($summary.Location) [$($summary.ResourceCount) res]: $($summary.AvailabilityPct)% ($([math]::Round($summary.AvailableMinutes, 2)) / $([math]::Round($summary.EligibleMinutes, 2)) eligible min)"
+        }
+        Write-Host "  TOTAL [$($total.ResourceCount) res]: $($total.AvailabilityPct)% ($([math]::Round($total.AvailableMinutes, 2)) / $([math]::Round($total.EligibleMinutes, 2)) eligible min)"
+        Write-Host ''
+    }
+
+    $overall = $Summaries | Where-Object SummaryLevel -eq 'Overall' | Select-Object -First 1
+    if ($overall) {
+        Write-Host ([string]::new([char]0x2550, 62))
+        Write-Host '               OVERALL (all subscriptions)'
+        Write-Host ([string]::new([char]0x2550, 62))
+        foreach ($summary in ($Summaries |
+            Where-Object SummaryLevel -eq 'OverallKindLocation' |
+            Sort-Object Kind, Location)) {
+            Write-Host "  $(Get-ShortKind $summary.Kind), $($summary.Location) [$($summary.ResourceCount) res]: $($summary.AvailabilityPct)% ($([math]::Round($summary.AvailableMinutes, 2)) / $([math]::Round($summary.EligibleMinutes, 2)) eligible min)"
+        }
+        Write-Host "  OVERALL [$($overall.ResourceCount) res]: $($overall.AvailabilityPct)% ($([math]::Round($overall.AvailableMinutes, 2)) / $([math]::Round($overall.EligibleMinutes, 2)) eligible min)"
         Write-Host ''
     }
 }
@@ -2283,11 +2364,17 @@ if ($PSBoundParameters.ContainsKey('BatchSize') -and -not $Batch) { $Batch = [sw
 Write-Host -NoNewline 'Authenticating... '
 # Resolve subscription display names to objects, build ID→Name map
 $allAzSubs = @(Get-AzSubscription)
+$azSubsByName = @{}
+foreach ($subscription in $allAzSubs) {
+    if (-not $azSubsByName.ContainsKey($subscription.Name)) {
+        $azSubsByName[$subscription.Name] = [System.Collections.Generic.List[object]]::new()
+    }
+    $azSubsByName[$subscription.Name].Add($subscription)
+}
 $resolvedSubs = @(foreach ($name in $Subscriptions) {
-    $found = @($allAzSubs | Where-Object Name -eq $name)
-    if ($found.Count -eq 0) { throw "Subscription '$name' not found." }
-    if ($found.Count -gt 1) { throw "Multiple subscriptions named '$name'." }
-    $found[0]
+    if (-not $azSubsByName.ContainsKey($name)) { throw "Subscription '$name' not found." }
+    if ($azSubsByName[$name].Count -gt 1) { throw "Multiple subscriptions named '$name'." }
+    $azSubsByName[$name][0]
 })
 $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
@@ -2415,7 +2502,8 @@ if ($SourceWorkspaceId -and $suspectCandidates.Count -gt 0) {
     Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
     $laTokenStr = Get-PlainToken 'https://api.loganalytics.io'
     $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId `
-        -SubscriptionIds $subIds -PeriodStart $utcStart -PeriodEnd $utcEnd `
+        -SubscriptionIds $subIds -ResourceIds @($suspectCandidates.ResourceId) `
+        -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -ArmToken $laTokenStr
     $laTokenStr = $null
 }
@@ -2596,9 +2684,10 @@ foreach ($res in $resources) {
 # Step 8: Output — sort results and print table + per-subscription summaries
 $sorted = @($eligByRes.Values |
     Sort-Object SubscriptionName, Kind, Name)
+$summaries = @(Get-AvailabilitySummaries $sorted)
 
 Write-ResultsTable $sorted
-Write-SubscriptionSummaries $sorted
+Write-SubscriptionSummaries $summaries
 
 # Step 9: Optional Log Analytics ingestion
 if ($sendToLogAnalytics) {
@@ -2639,10 +2728,7 @@ if ($sendToLogAnalytics) {
     Send-ToLogAnalytics -Endpoint $DceEndpoint -RuleId $DcrImmutableId `
         -StreamName 'Custom-GetAvailResources_CL' -Token $monitorToken -Payload $resourcePayload
 
-    # Build summary payload
-    $eligible = @($sorted | Where-Object { $_.AvailabilityPct -ne 'N/A' })
-    $summaryPayload = [System.Collections.Generic.List[hashtable]]::new()
-
+    # Project precomputed summaries into the ingestion schema.
     $commonSummary = @{
         RunId         = $runId
         Month         = $normalizedMonth
@@ -2651,59 +2737,23 @@ if ($sendToLogAnalytics) {
         IsMonthToDate = $isMonthToDate
     }
 
-    foreach ($subGroup in ($eligible | Group-Object SubscriptionName | Sort-Object Name)) {
-        foreach ($g in ($subGroup.Group | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
-            $items = @($g.Group)
-            $a = ($items | Measure-Object AvailableMinutes -Sum).Sum
-            $e = ($items | Measure-Object EligibleMinutes -Sum).Sum
-            $pct = if ($e -gt 0) { [math]::Round($a / $e * 100, 5) } else { 0 }
-            $summaryPayload.Add(($commonSummary + @{
-                SummaryLevel     = 'KindLocation'
-                SubscriptionName = $subGroup.Name
-                Kind             = $items[0].Kind
-                Location         = $items[0].Location
-                ResourceCount    = $items.Count
-                EligibleMinutes  = [math]::Round($e, 2)
-                AvailableMinutes = [math]::Round($a, 2)
-                AvailabilityPct  = $pct
-            }))
+    $summaryPayload = @(foreach ($summary in ($summaries |
+        Where-Object SummaryLevel -ne 'OverallKindLocation')) {
+        $commonSummary + @{
+            SummaryLevel     = $summary.SummaryLevel
+            SubscriptionName = $summary.SubscriptionName
+            Kind             = $summary.Kind
+            Location         = $summary.Location
+            ResourceCount    = $summary.ResourceCount
+            EligibleMinutes  = [math]::Round($summary.EligibleMinutes, 2)
+            AvailableMinutes = [math]::Round($summary.AvailableMinutes, 2)
+            AvailabilityPct  = $summary.AvailabilityPct
         }
-        $ta = ($subGroup.Group | Measure-Object AvailableMinutes -Sum).Sum
-        $te = ($subGroup.Group | Measure-Object EligibleMinutes -Sum).Sum
-        $tpct = if ($te -gt 0) { [math]::Round($ta / $te * 100, 5) } else { 0 }
-        $summaryPayload.Add(($commonSummary + @{
-            SummaryLevel     = 'SubscriptionTotal'
-            SubscriptionName = $subGroup.Name
-            Kind             = ''
-            Location         = ''
-            ResourceCount    = $subGroup.Count
-            EligibleMinutes  = [math]::Round($te, 2)
-            AvailableMinutes = [math]::Round($ta, 2)
-            AvailabilityPct  = $tpct
-        }))
-    }
-
-    # Cross-subscription overall (only if >1 subscription)
-    $subs = @($eligible | ForEach-Object { $_.SubscriptionName } | Select-Object -Unique)
-    if ($subs.Count -gt 1 -and $eligible.Count -gt 0) {
-        $oa = ($eligible | Measure-Object AvailableMinutes -Sum).Sum
-        $oe = ($eligible | Measure-Object EligibleMinutes -Sum).Sum
-        $opct = if ($oe -gt 0) { [math]::Round($oa / $oe * 100, 5) } else { 0 }
-        $summaryPayload.Add(($commonSummary + @{
-            SummaryLevel     = 'Overall'
-            SubscriptionName = ''
-            Kind             = ''
-            Location         = ''
-            ResourceCount    = $eligible.Count
-            EligibleMinutes  = [math]::Round($oe, 2)
-            AvailableMinutes = [math]::Round($oa, 2)
-            AvailabilityPct  = $opct
-        }))
-    }
+    })
 
     if ($summaryPayload.Count -gt 0) {
         Send-ToLogAnalytics -Endpoint $DceEndpoint -RuleId $DcrImmutableId `
-            -StreamName 'Custom-GetAvailSummary_CL' -Token $monitorToken -Payload $summaryPayload.ToArray()
+            -StreamName 'Custom-GetAvailSummary_CL' -Token $monitorToken -Payload $summaryPayload
     }
 
     $monitorToken = $null

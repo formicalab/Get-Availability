@@ -57,11 +57,19 @@ param dnsZonesSubscriptionId string = ''
 @description('Resource group name containing existing Private DNS Zones. Required only when usePrivateEndpoints is true.')
 param dnsZonesResourceGroupName string = ''
 
-@description('Comma-separated list of Azure subscription names or IDs to monitor (written to GETAVAIL_SUBSCRIPTIONS app setting).')
+@description('Comma-separated list of Azure subscription display names to monitor (written to GETAVAIL_SUBSCRIPTIONS app setting).')
 param getavailSubscriptions string
 
 @description('Comma-separated resource kinds to monitor. Default: vm,sql,storage,webapp')
 param getavailKinds string = 'vm,sql,storage,webapp'
+
+@description('Use the regional Metrics Batch API for the scheduled availability run.')
+param getavailBatch bool = true
+
+@description('Maximum resources per Metrics Batch API request.')
+@minValue(1)
+@maxValue(50)
+param getavailBatchSize int = 10
 
 @description('Log Analytics workspace customer ID used as source for Activity Log and Resource Health queries (SOURCE_WORKSPACE_ID app setting). Leave empty to skip.')
 param sourceWorkspaceId string = ''
@@ -424,7 +432,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
       }
       runtime: {
         name: 'powerShell'
-        version: '7.4'
+        version: '7.6'
       }
     }
   }
@@ -440,6 +448,8 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
       // Get-Availability configuration — auto-wired from Bicep resources
       GETAVAIL_SUBSCRIPTIONS: getavailSubscriptions
       GETAVAIL_KINDS: getavailKinds
+      GETAVAIL_BATCH: getavailBatch ? 'true' : 'false'
+      GETAVAIL_BATCH_SIZE: string(getavailBatchSize)
       DCE_ENDPOINT: dataCollectionEndpoint.properties.logsIngestion.endpoint
       DCR_IMMUTABLE_ID: dataCollectionRule.properties.immutableId
       SOURCE_WORKSPACE_ID: sourceWorkspaceId

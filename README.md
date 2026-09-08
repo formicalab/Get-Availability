@@ -5,7 +5,7 @@
 
 Get-Availability reports month-scoped availability for Azure Virtual Machines, Azure SQL Databases, Azure Storage Accounts, and Azure Web Apps across one or more Azure subscriptions.
 
-It runs either as a standalone PowerShell 7 script or as a timer-triggered Azure Function. Log Analytics ingestion is optional. The legacy C# implementation is preserved in [Old/README.md](Old/README.md) and is not actively maintained.
+It runs either as a standalone PowerShell 7.6 script or as a timer-triggered Azure Function. Log Analytics ingestion is optional.
 
 For each resource, the tool reports:
 
@@ -23,7 +23,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
 | Requirement | Detail |
 |---|---|
-| PowerShell | 7.0 or later (`pwsh`) |
+| PowerShell | 7.6 or later (`pwsh`) |
 | Az.Accounts | `Install-Module Az.Accounts` |
 | Az.ResourceGraph | `Install-Module Az.ResourceGraph` |
 | Azure sign-in | `Connect-AzAccount` |
@@ -32,7 +32,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `-Subscriptions` | required | Azure subscription names or IDs to inspect |
+| `-Subscriptions` | required | Azure subscription display names to inspect |
 | `-Month` | required | Observation month in UTC, format `YYYYMM` |
 | `-Kinds` | `vm,sql,storage,webapp` | Resource kinds to include |
 | `-Resource` | all | Limit the run to one resource |
@@ -160,6 +160,8 @@ See [Bicep/parameters.dev.bicepparam](Bicep/parameters.dev.bicepparam) for a com
 | `dnsZonesResourceGroupName` | Resource group containing shared private DNS zones |
 | `getavailSubscriptions` | Comma-separated subscriptions to monitor |
 | `getavailKinds` | Resource kinds to monitor |
+| `getavailBatch` | Use regional Metrics Batch API requests (default: `true`) |
+| `getavailBatchSize` | Maximum resources per batch request (default: `10`) |
 | `sourceWorkspaceId` | Optional source workspace for Activity Log and Resource Health history |
 | `timerSchedule` | CRON expression for the timer trigger |
 
