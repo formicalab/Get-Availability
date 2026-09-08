@@ -37,5 +37,9 @@ param dnsZonesResourceGroupName = 'rg-alz-dns-hub-itn-001'
 // Comma-separated subscription names monitored by the Function App.
 param getavailSubscriptions = 'Flaz-Connectivity,Flaz-Management,Flaz-Identity,Flaz-Workloads'
 
+// Use regional batch metric requests, with up to 10 resources per request.
+param getavailBatch = true
+param getavailBatchSize = 10
+
 // Existing Log Analytics workspace used as the source for Activity Log and Resource Health KQL queries.
 param sourceWorkspaceId = 'f25755bb-9b46-4aac-bfae-6a10c4c18440'
