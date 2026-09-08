@@ -95,19 +95,19 @@ var functionAppPublicNetworkAccess = usePrivateEndpoints ? 'Disabled' : 'Enabled
 
 // ── Existing Private DNS Zones ───────────────────────────────────────────────
 
-resource blobDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = if (usePrivateEndpoints) {
+resource blobDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = if (usePrivateEndpoints) {
   name: 'privatelink.blob.${environment().suffixes.storage}'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
 
-resource webAppDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = if (usePrivateEndpoints) {
+resource webAppDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = if (usePrivateEndpoints) {
   name: 'privatelink.azurewebsites.net'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
 
 // ── Log Analytics Workspace ──────────────────────────────────────────────────
 
-resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2026-03-01' = {
   name: logAnalyticsWorkspaceName
   location: location
   properties: {
@@ -121,7 +121,7 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09
 
 // ── Custom Table: GetAvailResources_CL (per-resource detail) ─────────────────
 
-resource resourcesTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01' = {
+resource resourcesTable 'Microsoft.OperationalInsights/workspaces/tables@2026-03-01' = {
   name: 'GetAvailResources_CL'
   parent: logAnalyticsWorkspace
   properties: {
@@ -155,7 +155,7 @@ resource resourcesTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10
 
 // ── Custom Table: GetAvailSummary_CL (aggregated summaries) ──────────────────
 
-resource summaryTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01' = {
+resource summaryTable 'Microsoft.OperationalInsights/workspaces/tables@2026-03-01' = {
   name: 'GetAvailSummary_CL'
   parent: logAnalyticsWorkspace
   properties: {
@@ -184,7 +184,7 @@ resource summaryTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-0
 
 // ── Data Collection Endpoint ─────────────────────────────────────────────────
 
-resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
+resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2024-03-11' = {
   name: dataCollectionEndpointName
   location: location
   properties: {
@@ -197,7 +197,7 @@ resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023
 
 // ── Data Collection Rule (two streams, one per table) ────────────────────────
 
-resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
+resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2025-05-11' = {
   name: dataCollectionRuleName
   location: location
   kind: 'Direct'
@@ -280,7 +280,7 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' 
 
 // ── Storage Account ──────────────────────────────────────────────────────────
 
-resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
+resource storageAccount 'Microsoft.Storage/storageAccounts@2026-06-01' = {
   name: storageAccountName
   location: location
   sku: {
@@ -321,7 +321,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
 
 // ── Private Endpoint: Storage Account (blob) ─────────────────────────────────
 
-resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = if (usePrivateEndpoints) {
+resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2026-03-01' = if (usePrivateEndpoints) {
   name: 'pe-blob-${storageAccountName}'
   location: location
   properties: any({
@@ -380,7 +380,7 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
 
 // ── Flex Consumption Plan ────────────────────────────────────────────────────
 
-resource flexServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
+resource flexServicePlan 'Microsoft.Web/serverfarms@2026-07-15' = {
   name: 'asp-${functionAppName}'
   location: location
   kind: 'functionapp'
@@ -396,7 +396,7 @@ resource flexServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
 
 // ── Function App ─────────────────────────────────────────────────────────────
 
-resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
+resource functionApp 'Microsoft.Web/sites@2026-07-15' = {
   name: functionAppName
   location: location
   kind: 'functionapp,linux'
@@ -466,7 +466,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
 
 // ── Private Endpoint: Function App (sites) ───────────────────────────────────
 
-resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = if (usePrivateEndpoints) {
+resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2026-03-01' = if (usePrivateEndpoints) {
   name: 'pe-sites-${functionAppName}'
   location: location
   properties: any({

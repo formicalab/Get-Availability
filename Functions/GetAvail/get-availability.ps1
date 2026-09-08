@@ -18,9 +18,8 @@
     Contiguous suspect minutes form "suspect gaps" for narration.
 
     Suspect minutes are first checked against Activity Log events:
-      - Resource creation/deletion (all kinds): minutes when the resource
-        did not exist are excused (before creation, between delete/recreate
-        cycles, after final deletion).
+            - Resource creation/deletion: VM timeCreated establishes initial existence;
+                successful delete/write pairs establish later non-existence intervals.
       - Virtual Machines: start/deallocate/power off/restart
       - Azure SQL Databases: pause/resume
       - Web Apps: stop/start/restart
@@ -328,7 +327,8 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
     'Other'
 )
 | project id, name, displayName, type, subscriptionId, resourceGroup, location, resourceKind,
-          sqlServerName, databaseName
+          sqlServerName, databaseName,
+          creationTime=iff(type =~ 'microsoft.compute/virtualmachines', tostring(properties.timeCreated), '')
 "@
 
     $resources = [System.Collections.Generic.List[object]]::new()
@@ -342,6 +342,21 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
             $kind = [string]$row.resourceKind
             $subId = [string]$row.subscriptionId
             $name = if ($row.displayName) { [string]$row.displayName } else { [string]$row.name }
+            $creationTime = $null
+            if ($kind -eq 'VirtualMachine' -and $row.creationTime) {
+                if ($row.creationTime -is [datetime]) {
+                    $creationTime = ([DateTimeOffset][datetime]$row.creationTime).ToUniversalTime()
+                } else {
+                    $parsedCreationTime = [DateTimeOffset]::MinValue
+                    if ([DateTimeOffset]::TryParse(
+                            [string]$row.creationTime,
+                            [System.Globalization.CultureInfo]::InvariantCulture,
+                            [System.Globalization.DateTimeStyles]::AssumeUniversal,
+                            [ref]$parsedCreationTime)) {
+                        $creationTime = $parsedCreationTime.ToUniversalTime()
+                    }
+                }
+            }
             $resources.Add([PSCustomObject]@{
                 Name              = $name
                 Kind              = $kind
@@ -350,6 +365,7 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
                 SubscriptionName  = $SubIdToName.ContainsKey($subId) ? $SubIdToName[$subId] : $subId
                 ResourceGroupName = [string]$row.resourceGroup
                 Location          = [string]$row.location
+                CreationTime      = $creationTime
             })
         }
         $skipToken = [string]::IsNullOrWhiteSpace($response.SkipToken) ? $null : $response.SkipToken
@@ -1653,8 +1669,8 @@ function Invoke-SuspectGapInvestigation {
 
         # ── Activity Log ──────────────────────────────────────────────
         # Checks Activity Log for events that explain metric gaps:
-        #   a) Resource creation/deletion — excuses non-existence intervals
-        #      (before first write, between delete→write cycles, after final delete).
+        #   a) Resource creation/deletion — VM timeCreated establishes initial
+        #      existence; delete→write cycles establish later non-existence.
         #   b) Kind-specific lifecycle operations (VM start/deallocate/poweroff/restart,
         #      SQL pause/resume, WebApp stop/start/restart). Kinds with no known
         #      lifecycle ops (e.g. Storage) produce no matches here.
@@ -1698,6 +1714,15 @@ function Invoke-SuspectGapInvestigation {
                 $createToken = (($using:KindConfig)[$c.Kind].Namespace + '/write').ToLowerInvariant()
                 $deleteToken = (($using:KindConfig)[$c.Kind].Namespace + '/delete').ToLowerInvariant()
                 $existenceEvents = [System.Collections.Generic.List[object]]::new()
+
+                # Unlike the generic ARM write operation, a VM's timeCreated value
+                # is authoritative creation evidence for its current incarnation.
+                if ($c.Kind -eq 'VirtualMachine' -and $null -ne $c.CreationTime) {
+                    $existenceEvents.Add([PSCustomObject]@{
+                        Timestamp = [DateTimeOffset]$c.CreationTime
+                        Type      = 'Created'
+                    })
+                }
 
                 if ($resLaData -and $resLaData.ActivityEvents.Count -gt 0) {
                     # ── Log Analytics path: use pre-fetched events ────
@@ -1895,22 +1920,37 @@ function Invoke-SuspectGapInvestigation {
                 }
 
                 # Build non-existence intervals from resource creation/deletion
-                # events.  Walk write+delete events chronologically as a state machine:
-                #   Write  → resource comes into existence (non-existence ends)
+                # events. Walk events chronologically as a state machine:
+                #   Created → authoritative VM creation timestamp
+                #   Write   → recreation only after a confirmed Delete
                 #   Delete → resource destroyed (non-existence begins)
                 # Non-existence intervals cover:
-                #   - periodStart → first Write (resource created mid-period)
+                #   - periodStart → VM timeCreated (when no prior incarnation is seen)
                 #   - Delete → next Write (destroy/recreate cycle)
                 #   - last Delete → periodEnd (resource deleted, not recreated)
                 if ($existenceEvents.Count -gt 0) {
                     $sortedExEvts = $existenceEvents | Sort-Object Timestamp
                     $nonExistIntervals = [System.Collections.Generic.List[object]]::new()
-                    $exState = 'unknown'     # unknown | exists | not-exists
+                    $createdEvent = $sortedExEvts | Where-Object { $_.Type -eq 'Created' } | Select-Object -First 1
+                    $deleteBeforeCreation = $createdEvent -and ($sortedExEvts | Where-Object {
+                        $_.Type -eq 'Delete' -and $_.Timestamp -lt $createdEvent.Timestamp
+                    } | Select-Object -First 1)
+                    $exState = if ($createdEvent -and $createdEvent.Timestamp -le $pStart) {
+                        'exists'
+                    } elseif ($createdEvent -and -not $deleteBeforeCreation) {
+                        'not-exists'
+                    } else {
+                        'unknown'
+                    }
                     $nonExistStart = $null   # timestamp where non-existence began
+                    $absenceEstablishedByDelete = $false
+                    if ($exState -eq 'not-exists') { $nonExistStart = $pStart }
 
                     foreach ($exEvt in $sortedExEvts) {
-                        if ($exEvt.Type -eq 'Write') {
-                            if ($exState -ne 'exists') {
+                        if ($exEvt.Type -eq 'Created' -or $exEvt.Type -eq 'Write') {
+                            $isAuthoritativeCreation = $exEvt.Type -eq 'Created'
+                            if ($exState -eq 'not-exists' -and
+                                ($isAuthoritativeCreation -or $absenceEstablishedByDelete)) {
                                 # Resource came into existence — close non-existence interval
                                 $nFrom = if ($nonExistStart) { TruncMin $nonExistStart } else { $pStart }
                                 $nTo   = (TruncMin $exEvt.Timestamp).AddMinutes(1 + $graceMin)
@@ -1924,12 +1964,14 @@ function Invoke-SuspectGapInvestigation {
                                 }
                                 $exState = 'exists'
                                 $nonExistStart = $null
+                                $absenceEstablishedByDelete = $false
                             }
-                            # else: already exists, this is an update — ignore
+                            # A write while state is exists or unknown is only an update.
                         }
                         elseif ($exEvt.Type -eq 'Delete') {
                             $exState = 'not-exists'
                             $nonExistStart = $exEvt.Timestamp
+                            $absenceEstablishedByDelete = $true
                         }
                     }
 
@@ -2484,6 +2526,7 @@ foreach ($res in $resources) {
                 Kind           = $res.Kind
                 ResourceId     = $res.ResourceId
                 SubscriptionId = $res.SubscriptionId
+                CreationTime   = $res.CreationTime
                 AllGapTicks    = @($allTicks)
                 ZeroTicksArray = @($mr.ZeroAvailTicks)
                 DegradedTicks  = @($mr.DegradedTicks)
