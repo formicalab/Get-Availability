@@ -79,19 +79,19 @@ Resources with zero eligible minutes are shown as `N/A`.
 
 1. Resource inventory comes from Azure Resource Graph.
 2. Azure Monitor metrics are collected at one-minute granularity.
-3. Suspect minutes are classified using Activity Log lifecycle events, Resource Health, and metric fallback rules.
+3. Suspect minutes are classified. Virtual machines follow the algorithm described in [Algorithms](#algorithms); the other kinds follow the precedence below.
 4. Final availability is computed from eligible minutes and available minutes.
 
 Metric sources by resource type:
 
 | Resource type | Metrics |
 |---|---|
-| Virtual Machine | `VmAvailabilityMetric` |
+| Virtual Machine | `VmAvailabilityMetric` (see [Virtual machines](#virtual-machines)) |
 | Azure SQL Database | `Availability` |
 | Storage Account | `Availability`, `Transactions` |
 | Web App | `MemoryWorkingSet` |
 
-Classification precedence is strict:
+For Azure SQL Databases, Storage Accounts and Web Apps (until their dedicated algorithms are documented under [Algorithms](#algorithms)), classification precedence is strict:
 
 1. Platform faults from Resource Health remain eligible downtime.
 2. Matching lifecycle events are excused.
@@ -99,7 +99,7 @@ Classification precedence is strict:
 4. Remaining nulls are treated as metric issues and excused.
 5. Remaining zero or degraded values count against availability.
 
-When `-SourceWorkspaceId` is set, Activity Log data and older Resource Health transitions are queried from Log Analytics in bulk, while the most recent Resource Health interval still comes from the REST API and remains authoritative.
+When `-SourceWorkspaceId` is set, Activity Log data and older Resource Health history are queried from Log Analytics in bulk, while the most recent Resource Health history still comes from the REST API and remains authoritative.
 
 ## Log Analytics ingestion
 
