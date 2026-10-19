@@ -29,11 +29,14 @@
     Remaining null minutes become metric issues (excluded from eligibility),
     while remaining 0% minutes are trusted as downtime.
 
-    Virtual machines follow a different algorithm, described step by step in the
-    README ("Algorithms"): zero minutes are attributed with the metric's Context
+    Virtual machines and Azure SQL databases follow different algorithms, described step by step in the
+    README ("Algorithms"). For VMs, zero minutes are attributed with the metric's Context
     dimension (Platform / User / Unknown), Resource Health notes are classified by
     what they say, platform notes explain minutes only within -FaultWindowMinutes,
-    and a gap stays explained by what started it.
+    and a gap stays explained by what started it. For SQL databases, zero minutes are
+    excused when they fall inside a resume window of the Activity Log (auto-resume of a
+    paused serverless database), and the others are matched with Resource Health.
+    Storage accounts score the hourly server-failure rate instead (see README).
 
     When -SourceWorkspaceId is specified, Activity Log lifecycle events are
     fetched from a Log Analytics workspace via a single bulk KQL query instead
