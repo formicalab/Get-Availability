@@ -39,6 +39,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 | `-Parallelism` | auto | Max concurrent API calls |
 | `-ActivityGraceMinutes` | `10` | Grace window after lifecycle events |
 | `-FaultWindowMinutes` | `30` | VMs only: how long a platform health note can explain suspect minutes the metric does not attribute itself |
+| `-HealthLeadMinutes` | `5` | Storage accounts only: how many minutes before a platform health event its server failures are still attributed to it |
 | `-Batch` | off | Use the Metrics Batch API |
 | `-BatchSize` | `10` | Batch size when `-Batch` is enabled |
 | `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and older Resource Health history |
@@ -78,8 +79,8 @@ Resources with zero eligible minutes are shown as `N/A`.
 ## Classification model
 
 1. Resource inventory comes from Azure Resource Graph.
-2. Azure Monitor metrics are collected at one-minute granularity.
-3. Suspect minutes are classified. Virtual machines follow the algorithm described in [Algorithms](#algorithms); the other kinds follow the precedence below.
+2. Azure Monitor metrics are collected: one-minute granularity for VMs, Azure SQL databases and Web Apps; request counts by response type for storage accounts.
+3. Suspect minutes are classified. Virtual machines and storage accounts follow the algorithms described in [Algorithms](#algorithms); the other kinds follow the precedence below.
 4. Final availability is computed from eligible minutes and available minutes.
 
 Metric sources by resource type:
@@ -88,10 +89,10 @@ Metric sources by resource type:
 |---|---|
 | Virtual Machine | `VmAvailabilityMetric` (see [Virtual machines](#virtual-machines)) |
 | Azure SQL Database | `Availability` |
-| Storage Account | `Availability`, `Transactions` |
+| Storage Account | `Transactions` split by `ResponseType` (see [Storage accounts](#storage-accounts)) |
 | Web App | `MemoryWorkingSet` |
 
-For Azure SQL Databases, Storage Accounts and Web Apps (until their dedicated algorithms are documented under [Algorithms](#algorithms)), classification precedence is strict:
+For Azure SQL Databases and Web Apps (until their dedicated algorithms are documented under [Algorithms](#algorithms)), classification precedence is strict:
 
 1. Platform faults from Resource Health remain eligible downtime.
 2. Matching lifecycle events are excused.
@@ -304,4 +305,72 @@ Three details matter in practice:
 - `-FaultWindowMinutes` and `-ActivityGraceMinutes` are tunables; the defaults (30 and 10) were validated on a limited set of subscriptions.
 - Resource Health REST history covers about 30 days. Older periods rely on the metric's `Context` and on `-SourceWorkspaceId`.
 
-The algorithms for Storage accounts, Azure SQL databases and Web Apps will be added here.
+### Storage accounts
+
+#### What the signal means
+
+The portal's storage `Availability` metric is the share of billable requests that succeeded, but its `Minimum` aggregation is the *worst single series* of the minute (one `ApiName`, `Authentication` and `GeoType` combination), whatever its volume. A single failed request can therefore turn a whole minute into 0%, and a quiet account looks much worse than a busy one with the same failure count. The algorithm does not use it. It follows the definition of the [Azure Storage SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services): the **error rate of an hour** is failed requests ÷ counted requests, and availability is 100% minus the average error rate over the hours of the period. An hour with no traffic has a 0% error rate, so idle time counts as available.
+
+Requests are read from `Transactions` split by `ResponseType`, and only three response types are requested:
+
+| Response type | Role |
+|---|---|
+| `Success` | Counted |
+| `ServerOtherError`, `ServerTimeoutError` | Counted and **failed** |
+| `ServerBusyError`, client throttling errors | Not requested: throttling is excluded from the score, as in the SLA |
+| `NetworkError`, `ClientOtherError`, authentication and authorization errors | Not requested: caused by the client, excluded from the score |
+
+#### Step 1: hourly error rates (every account)
+
+One call per account returns the counted and failed requests of every hour of the period. This single series gives the score; the rest of the algorithm only explains it.
+
+#### Step 2: find the failing minutes (accounts with failures)
+
+For the accounts that had at least one failed request, read the per-minute counts of the periods that contain failures (one call per day when there are few, otherwise 10-day spans). A **failing minute** is a minute with at least one failed request. Its *share* is failed ÷ counted requests of that minute.
+
+#### Step 3: attribute each failing minute to Resource Health
+
+1. Read the Resource Health history: the REST API (about the last 30 days) and, with `-SourceWorkspaceId`, the workspace for the whole period. The two are combined because the REST history can omit short events that the Activity Log still holds.
+2. A **window** opens at a `Degraded` or `Unavailable` note and closes at the next `Available` note (an event that never resolves explains at most 30 minutes). Windows of notes caused by the customer, such as `Throttled`, are *customer windows*. Windows that touch are merged.
+3. Resource Health raises its event a few minutes after the first failed requests, so a window is widened: it starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
+4. Each failing minute is decided in this order:
+
+| # | Rule | Verdict |
+|---|---|---|
+| 1 | The account did not exist yet | Not eligible (hours before creation are left out) |
+| 2 | Inside a platform window | **Fault** |
+| 3 | Inside a customer window | Excused |
+| 4 | Anything else | **Unresolved** |
+
+Both Fault and Unresolved count against availability: a failed request is a failed request whether or not Azure reported it. The split tells an operator, or an SRE agent, which failures Azure already acknowledged. Excused requests leave both the failed and the counted totals of their hour.
+
+#### Step 4: compute the result
+
+- **Suspect** = failing minutes = Faults + Excused + Unresolved.
+- **Eligible minutes** = minutes in the period since the account was created.
+- **Availability %** = 100 − average hourly error rate over the eligible hours, after removing the excused requests. **Available minutes** = eligible minutes × availability %.
+- An account with no counted request in the period is reported as `N/A`.
+- An account with fewer than 10,000 counted requests in the period is flagged **low volume** in the narration: a handful of failed requests can then move the percentage a lot.
+
+The narration also lists the largest incidents (failing minutes less than six minutes apart): when it started, how many requests failed out of how many, the peak share of a minute, the verdict, and the Resource Health event and summary that explained it.
+
+#### Worked examples
+
+| Situation | What the evidence shows | Result |
+|---|---|---|
+| Storage backend incident | 1,312 server timeouts in one minute of a busy account; Resource Health raises `Degraded` two minutes later and resolves it after seven | Fault. The minutes before the event are included thanks to `-HealthLeadMinutes` |
+| Background noise | 1 to 10 timeouts among tens of thousands of requests, no health event | Unresolved, but each minute costs a few thousandths of a percent |
+| Busy account, one failed request | The `Availability` metric can read 0% for the minute; the request is one among tens of thousands | Hourly error rate of a few thousandths of a percent at most |
+| Throttling | `ServerBusyError` and client throttling in the thousands | Not part of the score |
+| Idle weekends | No requests for days | Hours count as available (SLA rule) |
+| Account with a handful of requests | Two requests, both failing, in some hours | Real error rate, flagged low volume |
+
+#### Limits
+
+- Failures that do not reach the `Server*` response types are not counted, including requests that time out on the client side.
+- Resource Health events that cause no failed request are not counted.
+- A failing minute is attributed by time only: a platform event and an unrelated failure in the same window are both Faults.
+- `-HealthLeadMinutes` (5) and the two-minute grace after resolution were validated on a limited set of subscriptions.
+- Resource Health REST history covers about 30 days; older periods need `-SourceWorkspaceId`, otherwise every failing minute is Unresolved.
+
+The algorithms for Azure SQL databases and Web Apps will be added here.
