@@ -22,21 +22,23 @@
                 successful delete/write pairs establish later non-existence intervals.
       - Virtual Machines: start/deallocate/power off/restart
       - Azure SQL Databases: resume of a paused serverless database (auto-resume)
-      - Web Apps: stop/start/restart
     Resource Health is then applied to classify remaining suspects:
       - platform fault confirmed (Unavailable/Degraded) -> counts as downtime
       - Unknown / customer-initiated -> valid explanation, excluded from eligibility
     Remaining null minutes become metric issues (excluded from eligibility),
     while remaining 0% minutes are trusted as downtime.
 
-    Virtual machines and Azure SQL databases follow different algorithms, described step by step in the
-    README ("Algorithms"). For VMs, zero minutes are attributed with the metric's Context
+    Every resource kind follows its own algorithm, described step by step in the README
+    ("Algorithms"). For VMs, zero minutes are attributed with the metric's Context
     dimension (Platform / User / Unknown), Resource Health notes are classified by
     what they say, platform notes explain minutes only within -FaultWindowMinutes,
     and a gap stays explained by what started it. For SQL databases, zero minutes are
     excused when they fall inside a resume window of the Activity Log (auto-resume of a
     paused serverless database), and the others are matched with Resource Health.
-    Storage accounts score the hourly server-failure rate instead (see README).
+    Storage accounts score the hourly server-failure rate instead. Web Apps have no
+    availability metric: a minute is down when every request failed with a 5xx, and the
+    down minutes are matched with the stop/start/restart operations of the Activity Log
+    and with Resource Health.
 
     When -SourceWorkspaceId is specified, Activity Log lifecycle events are
     fetched from a Log Analytics workspace via a single bulk KQL query instead
@@ -69,7 +71,8 @@
     Max concurrent metric/investigation calls (default: auto-scaled to CPU cores).
 
 .PARAMETER ActivityGraceMinutes
-    Post-operation grace window for Activity Log lifecycle events (default: 10).
+    Post-operation grace window for Activity Log lifecycle events (default: 10). For Web Apps
+    it is the time after a stop, start or restart during which down minutes are excused.
 
 .PARAMETER FaultWindowMinutes
     Virtual machines only: how long a platform Resource Health note (for example
@@ -77,8 +80,8 @@
     does not attribute itself (default: 30).
 
 .PARAMETER HealthLeadMinutes
-    Storage accounts only: how many minutes before a platform Resource Health event
-    (for example "Degraded") its server failures are still attributed to it, because
+    Storage accounts, SQL databases and Web Apps: how many minutes before a platform Resource
+    Health event (for example "Degraded") its failures are still attributed to it, because
     Resource Health raises the event after the first failed requests (default: 5).
 
 .PARAMETER Batch
@@ -387,8 +390,9 @@ function Resolve-ObservationWindow([string]$MonthParam) {
 .DESCRIPTION
     Queries Resource Graph for the requested resource kinds across the supplied subscriptions,
     optionally filtered by name, and returns lightweight descriptors for the metrics pipeline.
-    SQL system databases (master) and Function Apps are excluded. For virtual machines the
-    creation time is included, because it marks when the VM started to exist.
+    SQL system databases (master) and Function Apps are excluded. The creation time is included for
+    virtual machines, SQL databases, storage accounts and Web Apps, because it marks when the resource
+    started to exist; Web Apps also carry the pricing tier of their App Service plan.
 
 .PARAMETER SubscriptionIds
     Subscription IDs to query.
@@ -404,7 +408,8 @@ function Resolve-ObservationWindow([string]$MonthParam) {
 
 .OUTPUTS
     PSCustomObject[] with Name, Kind, ResourceId, SubscriptionId, SubscriptionName,
-    ResourceGroupName, Location and CreationTime, sorted by subscription, kind and name.
+    ResourceGroupName, Location, CreationTime and Tier (the App Service plan tier, Web Apps only),
+    sorted by subscription, kind and name.
 #>
 function Get-ResourceInventory {
     param(
@@ -443,6 +448,8 @@ resources
 | where not(type =~ 'microsoft.sql/servers/databases' and databaseName =~ 'master')
 | extend displayName = iff(type =~ 'microsoft.sql/servers/databases', strcat(sqlServerName, '/', databaseName), name)
 ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functionapp')
+| extend planId = tolower(tostring(properties.serverFarmId))
+| join kind=leftouter (resources | where type =~ 'microsoft.web/serverfarms' | project planId = tolower(id), planTier = tostring(sku.tier)) on planId
 | extend resourceKind = case(
     type =~ 'microsoft.compute/virtualmachines', 'VirtualMachine',
     type =~ 'microsoft.sql/servers/databases', 'AzureSqlDatabase',
@@ -451,11 +458,12 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
     'Other'
 )
 | project id, name, displayName, type, subscriptionId, resourceGroup, location, resourceKind,
-          sqlServerName, databaseName,
+          sqlServerName, databaseName, planTier,
           creationTime=case(
               type =~ 'microsoft.compute/virtualmachines', tostring(properties.timeCreated),
               type =~ 'microsoft.storage/storageaccounts', tostring(properties.creationTime),
               type =~ 'microsoft.sql/servers/databases', tostring(properties.creationDate),
+              type =~ 'microsoft.web/sites', tostring(properties.createdTimeUtc),
               '')
 "@
 
@@ -473,7 +481,7 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
             # Resource Graph returns the creation time either as a DateTime or as an
             # ISO string, depending on the Az.ResourceGraph version; normalise to UTC.
             $creationTime = $null
-            if ($kind -in 'VirtualMachine', 'StorageAccount', 'AzureSqlDatabase' -and $row.creationTime) {
+            if ($kind -in 'VirtualMachine', 'StorageAccount', 'AzureSqlDatabase', 'WebApp' -and $row.creationTime) {
                 if ($row.creationTime -is [datetime]) {
                     $creationTime = ([DateTimeOffset][datetime]$row.creationTime).ToUniversalTime()
                 } else {
@@ -496,6 +504,7 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
                 ResourceGroupName = [string]$row.resourceGroup
                 Location          = [string]$row.location
                 CreationTime      = $creationTime
+                Tier              = [string]$row.planTier
             })
         }
         $skipToken = [string]::IsNullOrWhiteSpace($response.SkipToken) ? $null : $response.SkipToken
@@ -1384,14 +1393,212 @@ public static class StorageParser
         => Accumulate(doc, startTicks, TimeSpan.TicksPerMinute, failed, counted);
 }
 
+/// <summary>A start, stop or restart of a Web App, from the Activity Log.</summary>
+public sealed class WebEvent
+{
+    public long   Ticks;
+    public string Op;      // "stop", "start" or "restart"
+    public WebEvent(long ticks, string op) { Ticks = ticks; Op = op; }
+}
+
+/// <summary>Consecutive minutes in which every request of a Web App failed.</summary>
+public sealed class WebIncident
+{
+    public int    StartMinute, EndMinute, Minutes;
+    public double Requests;
+    public string Class = "";           // Stopped, Recycle, Customer, Fault or Unresolved
+    public HealthWindow Window;         // Resource Health window that decided the class, if any
+}
+
+/// <summary>What the Web App algorithm found in the minutes of one app.</summary>
+public sealed class WebResult
+{
+    public int    Active;               // minutes with at least one request
+    public int    Down;                 // active minutes in which every request failed with a 5xx
+    public int    DownFewRequests;      // down minutes with fewer than 5 requests
+    public int    Partial;              // active minutes with some, but not all, requests failed
+    public int    Stopped, Recycle, Customer, Fault, Unresolved;   // the decision for each down minute
+    public int    StoppedMinutes;       // minutes the app was stopped by the customer
+    public double Requests, Errors;     // totals of the active minutes
+    public double PartialRequests, PartialErrors;
+    public List<WebIncident> Incidents = new List<WebIncident>();
+}
+
+/// <summary>Parsers for the Web App availability algorithm (README, "Algorithms").</summary>
+public static class WebParser
+{
+    private static long ParseTicks(string s)
+        => DateTime.Parse(s, System.Globalization.CultureInfo.InvariantCulture,
+               System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal).Ticks;
+
+    /// <summary>Adds the Requests and Http5xx totals of a response into per-slot arrays (slots are hours or minutes).</summary>
+    public static void AddCounts(JsonDocument doc, long startTicks, long slotTicks, double[] requests, double[] errors)
+    {
+        if (!doc.RootElement.TryGetProperty("value", out var value)) return;
+        foreach (var metric in value.EnumerateArray())
+        {
+            string name = metric.GetProperty("name").GetProperty("value").GetString() ?? "";
+            double[] target = name.Equals("Requests", StringComparison.OrdinalIgnoreCase) ? requests
+                            : name.Equals("Http5xx", StringComparison.OrdinalIgnoreCase) ? errors : null;
+            if (target == null) continue;
+            foreach (var series in metric.GetProperty("timeseries").EnumerateArray())
+            foreach (var dp in series.GetProperty("data").EnumerateArray())
+            {
+                if (!dp.TryGetProperty("total", out var tot) || tot.ValueKind != JsonValueKind.Number) continue;
+                long slot = (ParseTicks(dp.GetProperty("timeStamp").GetString()!) - startTicks) / slotTicks;
+                if (slot >= 0 && slot < target.Length) target[slot] += tot.GetDouble();
+            }
+        }
+    }
+
+    /// <summary>Maps an Activity Log operation name to "stop", "start" or "restart"; "" for any other operation.</summary>
+    public static string LifecycleKind(string operation)
+    {
+        string o = (operation ?? "").ToLowerInvariant();
+        if (o.Contains("/sites/stop/"))    return "stop";
+        if (o.Contains("/sites/start/"))   return "start";
+        if (o.Contains("/sites/restart/")) return "restart";
+        return "";
+    }
+
+    /// <summary>Reads one page of the Activity Log REST response (not-failed lifecycle operations only); returns the next page link, or "".</summary>
+    public static string ReadActivityPage(JsonDocument doc, List<WebEvent> events)
+    {
+        var root = doc.RootElement;
+        string next = root.TryGetProperty("nextLink", out var nl) && nl.ValueKind == JsonValueKind.String ? nl.GetString() ?? "" : "";
+        if (!root.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Array) return next;
+        foreach (var item in value.EnumerateArray())
+        {
+            string status = item.TryGetProperty("status", out var st) && st.TryGetProperty("value", out var sv) ? sv.GetString() ?? "" : "";
+            if (status.Equals("Failed", StringComparison.OrdinalIgnoreCase)) continue;
+            string op = item.TryGetProperty("operationName", out var on) && on.TryGetProperty("value", out var ov) ? ov.GetString() ?? "" : "";
+            string kind = LifecycleKind(op);
+            if (kind.Length == 0 || !item.TryGetProperty("eventTimestamp", out var ts) || ts.ValueKind != JsonValueKind.String) continue;
+            events.Add(new WebEvent(ParseTicks(ts.GetString()!), kind));
+        }
+        return next;
+    }
+}
+
+/// <summary>The minute-by-minute part of the Web App algorithm.</summary>
+public static class WebClassifier
+{
+    private const long OneMin = TimeSpan.TicksPerMinute;
+
+    /// <summary>
+    /// Builds, from the stop, start and restart operations, the periods the app was stopped by the customer
+    /// (a stop up to the next start or restart, or the end of the period) and the recycle windows (each
+    /// operation, plus the grace time). Events of one kind that are close together (at most 5 minutes apart,
+    /// 15 minutes in all) are one operation: the Activity Log records each operation several times.
+    /// </summary>
+    public static void BuildLifecycle(List<WebEvent> events, long periodEndTicks, long graceTicks,
+                                      List<long[]> stopped, List<long[]> recycle)
+    {
+        var sorted = new List<WebEvent>(events);
+        sorted.Sort((a, b) => a.Ticks.CompareTo(b.Ticks));
+        var operations = new List<(long start, long end, string kind)>();
+        foreach (string kind in new[] { "stop", "start", "restart" })
+        {
+            long first = -1, last = -1;
+            foreach (var e in sorted)
+            {
+                if (e.Op != kind) continue;
+                if (first >= 0 && (e.Ticks - last > 5 * OneMin || e.Ticks - first > 15 * OneMin))
+                { operations.Add((first, last, kind)); first = -1; }
+                if (first < 0) first = e.Ticks;
+                last = e.Ticks;
+            }
+            if (first >= 0) operations.Add((first, last, kind));
+        }
+        operations.Sort((a, b) => a.start.CompareTo(b.start));
+        long stopAt = -1;
+        foreach (var op in operations)
+        {
+            recycle.Add(new[] { op.start, op.end + graceTicks });
+            if (op.kind == "stop") { if (stopAt < 0) stopAt = op.start; }
+            else if (stopAt >= 0) { stopped.Add(new[] { stopAt, op.end }); stopAt = -1; }
+        }
+        if (stopAt >= 0) stopped.Add(new[] { stopAt, periodEndTicks });
+    }
+
+    /// <summary>
+    /// Finds the down minutes (every request failed with a 5xx) from the first minute the app existed and
+    /// decides each: stopped by the customer, inside a recycle window, inside a Resource Health window
+    /// (customer: excused, platform: Fault; a window starts leadTicks before the event and ends graceTicks
+    /// after it), otherwise Unresolved. Minutes without requests are not judged; minutes with only some
+    /// requests failed are counted as partial and not scored.
+    /// </summary>
+    public static WebResult Classify(double[] requests, double[] errors, int firstMinute, long startTicks,
+                                     List<long[]> stopped, List<long[]> recycle, List<HealthWindow> health,
+                                     long leadTicks, long graceTicks)
+    {
+        int n = requests.Length;
+        var isStopped = new bool[n];
+        foreach (var w in stopped)
+        {
+            int a = (int)Math.Max(0, Math.Floor((w[0] - startTicks) / (double)OneMin));
+            int b = (int)Math.Min(n, Math.Ceiling((w[1] - startTicks) / (double)OneMin));
+            for (int i = a; i < b; i++) isStopped[i] = true;
+        }
+
+        var r = new WebResult();
+        WebIncident cur = null;
+        for (int m = firstMinute; m < n; m++)
+        {
+            if (isStopped[m]) r.StoppedMinutes++;
+            double req = requests[m], err = errors[m];
+            if (req <= 0) continue;
+            r.Active++; r.Requests += req; r.Errors += err;
+            if (err <= 0) continue;
+            if (err < req) { r.Partial++; r.PartialRequests += req; r.PartialErrors += err; continue; }
+
+            r.Down++;
+            if (req < 5) r.DownFewRequests++;
+            long t = startTicks + m * OneMin;
+            string cls = "";
+            HealthWindow win = null;
+            if (isStopped[m]) cls = "Stopped";
+            if (cls.Length == 0)
+                foreach (var w in recycle)
+                    if (t + OneMin > w[0] && t <= w[1]) { cls = "Recycle"; break; }
+            if (cls.Length == 0)
+                foreach (var w in health)
+                    if (t >= w.Start - leadTicks && t <= w.End + graceTicks) { cls = w.Customer ? "Customer" : "Fault"; win = w; break; }
+            if (cls.Length == 0) cls = "Unresolved";
+            switch (cls)
+            {
+                case "Stopped":  r.Stopped++;  break;
+                case "Recycle":  r.Recycle++;  break;
+                case "Customer": r.Customer++; break;
+                case "Fault":    r.Fault++;    break;
+                default:         r.Unresolved++; break;
+            }
+
+            // Consecutive down minutes (gap of at most 5) form one incident for the evidence.
+            if (cur != null && m - cur.EndMinute <= 5)
+            {
+                cur.EndMinute = m; cur.Minutes++; cur.Requests += req;
+                if (cls != "Unresolved") { cur.Class = cls; cur.Window = win; }
+            }
+            else
+            {
+                if (cur != null) r.Incidents.Add(cur);
+                cur = new WebIncident { StartMinute = m, EndMinute = m, Minutes = 1, Requests = req, Class = cls, Window = win };
+            }
+        }
+        if (cur != null) r.Incidents.Add(cur);
+        return r;
+    }
+}
+
 public static class MetricProcessor
 {
     /// <summary>Per-resource response: root has "value" array.</summary>
-    public static MetricProcessorResult ProcessSingle(JsonDocument doc, bool isVm, bool isWebApp = false)
-        => ProcessMetricArray(doc.RootElement.GetProperty("value"), isVm, isWebApp);
+    public static MetricProcessorResult ProcessSingle(JsonDocument doc, bool isVm)
+        => ProcessMetricArray(doc.RootElement.GetProperty("value"), isVm);
 
     /// <summary>Batch response: root has "values" array, each with "resourceid" + "value".</summary>
-    public static BatchResourceResult[] ProcessBatch(JsonDocument doc, bool isVm, bool isWebApp = false)
+    public static BatchResourceResult[] ProcessBatch(JsonDocument doc, bool isVm)
     {
         var results = new List<BatchResourceResult>();
         foreach (var entry in doc.RootElement.GetProperty("values").EnumerateArray())
@@ -1401,15 +1608,14 @@ public static class MetricProcessor
             {
                 ResourceId      = resId,
                 ResourceIdLower = resId.ToLowerInvariant(),
-                Metrics         = ProcessMetricArray(entry.GetProperty("value"), isVm, isWebApp)
+                Metrics         = ProcessMetricArray(entry.GetProperty("value"), isVm)
             });
         }
         return results.ToArray();
     }
 
     // ── shared inner loop ────────────────────────────────────────────────────
-    private static MetricProcessorResult ProcessMetricArray(
-        JsonElement valueArr, bool isVm, bool isWebApp)
+    private static MetricProcessorResult ProcessMetricArray(JsonElement valueArr, bool isVm)
     {
         var r = new MetricProcessorResult();
         var nullTicks      = new List<long>();
@@ -1417,66 +1623,30 @@ public static class MetricProcessor
         var degradedTicks  = new List<long>();
         var degradedValues = new List<double>();
 
-        if (isWebApp)
+        foreach (var metricEl in valueArr.EnumerateArray())
         {
-            // Web App: MemoryWorkingSet as availability proxy.
-            // Average aggregation (bytes): value > 0 means the app process is alive (available 1.0),
-            // value == 0 means the app is stopped (suspect zero), null means platform could not
-            // collect metrics (suspect null). No degraded state — binary up/down model.
-            foreach (var metricEl in valueArr.EnumerateArray())
+            string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
+            if (!string.Equals(mName, "VmAvailabilityMetric", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(mName, "Availability", StringComparison.OrdinalIgnoreCase)) continue;
+
+            foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
+            foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
             {
-                string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
-                if (!string.Equals(mName, "MemoryWorkingSet", StringComparison.OrdinalIgnoreCase)) continue;
+                long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
+                                     .ToUniversalTime().Ticks;
+                double? minVal = null;
+                if (dp.TryGetProperty("minimum", out var minEl) && minEl.ValueKind == JsonValueKind.Number)
+                    minVal = minEl.GetDouble();
 
-                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
-                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
+                if (minVal.HasValue)
                 {
-                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
-                                         .ToUniversalTime().Ticks;
-                    double? avgVal = null;
-                    if (dp.TryGetProperty("average", out var avgEl) && avgEl.ValueKind == JsonValueKind.Number)
-                        avgVal = avgEl.GetDouble();
-
-                    if (avgVal.HasValue)
-                    {
-                        r.NumericPoints++;
-                        if (avgVal.Value > 0.0)
-                            r.AvailableSum += 1.0;   // process alive → fully available
-                        else
-                            zeroTicks.Add(ticks);     // process not running → suspect zero
-                    }
-                    else
-                        nullTicks.Add(ticks);         // no data from platform → suspect null
+                    r.NumericPoints++;
+                    double v = isVm ? minVal.Value : minVal.Value / 100.0;
+                    if (v == 0.0)      zeroTicks.Add(ticks);
+                    else { r.AvailableSum += v;
+                           if (v < 1.0) { degradedTicks.Add(ticks); degradedValues.Add(v); } }
                 }
-            }
-        }
-        else
-        {
-            foreach (var metricEl in valueArr.EnumerateArray())
-            {
-                string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
-                if (!string.Equals(mName, "VmAvailabilityMetric", StringComparison.OrdinalIgnoreCase) &&
-                    !string.Equals(mName, "Availability", StringComparison.OrdinalIgnoreCase)) continue;
-
-                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
-                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
-                {
-                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
-                                         .ToUniversalTime().Ticks;
-                    double? minVal = null;
-                    if (dp.TryGetProperty("minimum", out var minEl) && minEl.ValueKind == JsonValueKind.Number)
-                        minVal = minEl.GetDouble();
-
-                    if (minVal.HasValue)
-                    {
-                        r.NumericPoints++;
-                        double v = isVm ? minVal.Value : minVal.Value / 100.0;
-                        if (v == 0.0)      zeroTicks.Add(ticks);
-                        else { r.AvailableSum += v;
-                               if (v < 1.0) { degradedTicks.Add(ticks); degradedValues.Add(v); } }
-                    }
-                    else nullTicks.Add(ticks);
-                }
+                else nullTicks.Add(ticks);
             }
         }
 
@@ -1835,7 +2005,8 @@ public static class VmGapClassifier
 #region Kind configuration
 # Maps resource kind → metric namespace, metric names, and aggregation.
 # Used by both the per-resource ARM Metrics API and the regional Batch API.
-# Storage accounts are not listed: they use their own algorithm (see "Storage algorithm").
+# Storage accounts and Web Apps are not listed: they use their own algorithms (see "Storage algorithm"
+# and "Web App algorithm").
 
 $KindConfig = @{
     'VirtualMachine' = @{
@@ -1847,15 +2018,6 @@ $KindConfig = @{
         Namespace   = 'Microsoft.Sql/servers/databases'
         MetricNames = 'Availability'
         Aggregation = 'Minimum'
-    }
-    # Web App: MemoryWorkingSet as availability proxy — non-null value > 0 means
-    # the app process is alive (available); value = 0 means the app is stopped
-    # (suspect zero, like a deallocated VM); null means the platform could not
-    # collect metrics (suspect null). No degraded state — binary up/down model.
-    'WebApp' = @{
-        Namespace   = 'Microsoft.Web/sites'
-        MetricNames = 'MemoryWorkingSet'
-        Aggregation = 'Average'
     }
 }
 
@@ -2057,7 +2219,6 @@ function Get-BatchAvailabilityMetrics {
         $resources = $workItem.Resources
 
         $isVm      = $kind -eq 'VirtualMachine'
-        $isWebApp  = $kind -eq 'WebApp'
 
         $resourceIds = @($resources | ForEach-Object { $_.ResourceId })
 
@@ -2097,7 +2258,7 @@ function Get-BatchAvailabilityMetrics {
 
         # Parse the batch response and extract per-resource metric results.
         try {
-            $batchResults = [MetricProcessor]::ProcessBatch($doc, $isVm, $isWebApp)
+            $batchResults = [MetricProcessor]::ProcessBatch($doc, $isVm)
             foreach ($br in $batchResults) {
                 $resName = $resById[$br.ResourceIdLower]?.Name ?? $br.ResourceId
                 [MetricResult]::From($br.ResourceId, $resName, $br.Metrics)
@@ -2194,7 +2355,6 @@ function Get-AvailabilityMetrics {
         $endIso   = ($using:EndDate).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
         $isVm      = $resource.Kind -eq 'VirtualMachine'
-        $isWebApp   = $resource.Kind -eq 'WebApp'
 
         # Look up metric namespace, names, and aggregation for this resource kind
         $kindCfg = ($using:KindConfig)[$resource.Kind]
@@ -2217,7 +2377,7 @@ function Get-AvailabilityMetrics {
         # each per-minute datapoint as available, null, zero, or degraded.
         $m = $null
         if ($doc) {
-            try   { $m = [MetricProcessor]::ProcessSingle($doc, $isVm, $isWebApp) }
+            try   { $m = [MetricProcessor]::ProcessSingle($doc, $isVm) }
             catch { Write-Warning "Metric processing failed for '$($resource.Name)': $_" }
             finally { $doc.Dispose() }
         }
@@ -2622,17 +2782,9 @@ function Invoke-SuspectGapInvestigation {
                 $sqlRules = @(
                     @{ ApplyGrace = $false; Tokens = @('microsoft.sql/servers/databases/resume', 'resume sql database', 'resume database') }
                 )
-                # Web App lifecycle: stop applies grace (trailing zero metrics while process
-                # shuts down), start/restart apply grace for the brief recycle window.
-                $webAppRules = @(
-                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/stop/action', 'stop web app', 'stopwebsite') }
-                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/start/action', 'start web app', 'startwebsite') }
-                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/restart/action', 'restart web app', 'restartwebsite') }
-                )
                 $rules = switch ($c.Kind) {
                     'VirtualMachine'   { $vmRules }
                     'AzureSqlDatabase' { $sqlRules }
-                    'WebApp'           { $webAppRules }
                     default            { @() }
                 }
 
@@ -2791,47 +2943,6 @@ function Invoke-SuspectGapInvestigation {
                     # Merge overlapping/adjacent intervals so that overlapping
                     # lifecycle events don't double-count.
                     $activityIntervals = MergeIntervals $rawIntervals
-
-                    # Build paired stop→start intervals for web apps.  Unlike VMs
-                    # (where Resource Health reports "Unavailable – Customer Initiated"
-                    # for the entire deallocated period), stopped web apps show only
-                    # "Available" in Resource Health.  We must infer the full stopped
-                    # window from the Activity Log stop and start/restart events.
-                    if ($c.Kind -eq 'WebApp') {
-                        $stopTokens  = $webAppRules[0].Tokens          # stop
-                        $startTokens = $webAppRules[1].Tokens + $webAppRules[2].Tokens  # start + restart
-
-                        $stopTs  = [System.Collections.Generic.List[DateTimeOffset]]::new()
-                        $startTs = [System.Collections.Generic.List[DateTimeOffset]]::new()
-                        foreach ($evt in $events) {
-                            $norm = $evt.OperationKey.ToLowerInvariant()
-                            foreach ($t in $stopTokens)  { if ($norm.Contains($t)) { $stopTs.Add($evt.Timestamp); break } }
-                            foreach ($t in $startTokens) { if ($norm.Contains($t)) { $startTs.Add($evt.Timestamp); break } }
-                        }
-
-                        if ($stopTs.Count -gt 0) {
-                            $stopTs  = [System.Collections.Generic.List[DateTimeOffset]]($stopTs  | Sort-Object | Select-Object -Unique)
-                            $startTs = [System.Collections.Generic.List[DateTimeOffset]]($startTs | Sort-Object | Select-Object -Unique)
-
-                            $pairedIntervals = [System.Collections.Generic.List[object]]::new()
-                            foreach ($st in $stopTs) {
-                                $nextStart = $startTs | Where-Object { $_ -gt $st } | Select-Object -First 1
-                                $from = TruncMin $st
-                                $to   = if ($nextStart) { (TruncMin $nextStart).AddMinutes(1 + $graceMin) } else { $pEnd }
-                                if ($from -lt $pStart) { $from = $pStart }
-                                if ($to -gt $pEnd)     { $to = $pEnd }
-                                if ($to -gt $from) {
-                                    $pairedIntervals.Add([PSCustomObject]@{
-                                        From = $from;  To = $to
-                                        FromTicks = $from.UtcTicks; ToTicks = $to.UtcTicks
-                                    })
-                                }
-                            }
-                            if ($pairedIntervals.Count -gt 0) {
-                                $activityIntervals = MergeIntervals (@($activityIntervals) + @($pairedIntervals))
-                            }
-                        }
-                    }
                 }
 
                 # Build non-existence intervals from resource creation/deletion
@@ -3736,6 +3847,432 @@ function Set-StorageEligibility {
 
 #endregion
 
+#region Web App algorithm
+# Web Apps have no availability metric. The score follows what a customer sees: a minute is down when
+# every request of the minute failed with an HTTP 5xx. Only the minutes the app is set to running count
+# (the App Service SLA "Deployment Minutes"). Minutes without requests are not judged and count as
+# available (README, "Algorithms > Web Apps").
+
+# Apps with fewer requests than this in the period are flagged as low-volume when they have down minutes.
+$WebLowVolumeRequests = 10000
+
+# App Service plan tiers the App Service SLA does not cover.
+$WebNoSlaTiers = @('Free', 'Shared')
+
+<#
+.SYNOPSIS
+    Gets the hourly request and HTTP 5xx totals of Web Apps for the whole period.
+
+.DESCRIPTION
+    One Azure Monitor call per app (Requests and Http5xx, PT1H, Total). It tells which apps had traffic
+    and which had any 5xx, so that only the latter need the minute detail. A failed query yields a null
+    result, which excludes the app from availability.
+
+.PARAMETER Resources
+    Web App descriptors from Get-ResourceInventory.
+
+.PARAMETER PeriodStart
+    Start of the observation window (aligned to a whole hour).
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent calls.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID; each value has Requests and Errors (double[] per hour) or is $null.
+#>
+function Get-WebHourlyCounts {
+    param(
+        [object[]]$Resources,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$ThrottleLimit,
+        [string]$ArmToken
+    )
+
+    $hours      = [int][math]::Ceiling(($PeriodEnd - $PeriodStart).TotalHours)
+    $startTicks = $PeriodStart.UtcTicks
+    $timespan   = "$($PeriodStart.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($PeriodEnd.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $client.Timeout = [TimeSpan]::FromMinutes(5)
+
+    $byRes = @{}
+    $Resources | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        $res = $_
+        $uri = "https://management.azure.com$($res.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+               "&metricnamespace=Microsoft.Web%2Fsites&metricnames=Requests,Http5xx&aggregation=Total&interval=PT1H" +
+               "&timespan=$($using:timespan)"
+        $http = [AzHttp]::Get($using:client, $uri)
+        $counts = $null
+        if ($http.Doc) {
+            try {
+                $counts = [PSCustomObject]@{ Requests = [double[]]::new($using:hours); Errors = [double[]]::new($using:hours) }
+                [WebParser]::AddCounts($http.Doc, $using:startTicks, [TimeSpan]::TicksPerHour, $counts.Requests, $counts.Errors)
+            }
+            catch { $counts = $null; Write-Warning "Web App metric processing failed for '$($res.Name)': $_" }
+            finally { $http.Doc.Dispose() }
+        }
+        else { Write-Warning "Web App metric query failed for '$($res.Name)': $($http.Error)" }
+        [PSCustomObject]@{ Key = $res.ResourceId.ToLowerInvariant(); Counts = $counts }
+    } | ForEach-Object { $byRes[$_.Key] = $_.Counts }
+
+    $client.Dispose()
+    $byRes
+}
+
+<#
+.SYNOPSIS
+    Finds and classifies the down minutes of the given Web Apps.
+
+.DESCRIPTION
+    For each app: (1) builds the stopped periods and the recycle windows from the stop, start and restart
+    operations of the Activity Log (from Log Analytics when a workspace is used; otherwise read from the
+    REST API, only for the apps that had 5xx); (2) for an app that had 5xx, reads the PT1M Requests and
+    Http5xx counts (spans of 5 days, halved when the response is too large) and builds the Resource Health
+    windows from the REST history combined with Log Analytics (Get-HealthSources); (3) lets the compiled
+    WebClassifier decide each minute in which every request failed (see the README for the order of decisions).
+
+.PARAMETER Candidates
+    Objects with Resource, FirstMinute (first minute after the app was created) and Detail ($true when the
+    app had any 5xx in the period).
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent investigations.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.PARAMETER HealthLeadMinutes
+    Minutes before a Resource Health event that its down minutes are still attributed to it.
+
+.PARAMETER GraceMinutes
+    Minutes after a stop, start or restart that its down minutes are still excused.
+
+.PARAMETER LogAnalyticsData
+    Optional output of Get-LogAnalyticsData (Activity Log and Resource Health history in the workspace).
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID; each value has the WebResult of the app, whether the minute
+    detail was complete and the number of Resource Health windows.
+#>
+function Invoke-WebInvestigation {
+    param(
+        [object[]]$Candidates,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$ThrottleLimit,
+        [string]$ArmToken,
+        [int]$HealthLeadMinutes,
+        [int]$GraceMinutes,
+        [hashtable]$LogAnalyticsData
+    )
+
+    $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $client.Timeout = [TimeSpan]::FromMinutes(5)
+
+    $byRes = @{}
+    $Candidates | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        $c      = $_
+        $res    = $c.Resource
+        $client = $using:client
+        $pStart = ($using:PeriodStart).UtcDateTime
+        $pEnd   = ($using:PeriodEnd).UtcDateTime
+        $nMin   = [int]($pEnd - $pStart).TotalMinutes
+        $tpm    = [TimeSpan]::TicksPerMinute
+        $key    = $res.ResourceId.ToLowerInvariant()
+        $laData = $using:LogAnalyticsData
+        $healthSources = $using:healthSources
+
+        #region Stopped periods and recycle windows
+        $events = [System.Collections.Generic.List[WebEvent]]::new()
+        if ($laData) {
+            if ($laData.ContainsKey($key)) {
+                foreach ($e in $laData[$key].ActivityEvents) {
+                    $kind = [WebParser]::LifecycleKind([string]$e.OperationName)
+                    if ($kind) { $events.Add([WebEvent]::new($e.Timestamp.UtcTicks, $kind)) }
+                }
+            }
+        }
+        elseif ($c.Detail) {
+            # Without a workspace the Activity Log is read per app, and only for the apps that need it.
+            $filter = "eventTimestamp ge '$($pStart.ToString('O'))' and eventTimestamp le '$($pEnd.ToString('O'))' and resourceUri eq '$($res.ResourceId)'"
+            $url = "https://management.azure.com/subscriptions/$($res.SubscriptionId)/providers/microsoft.insights/eventtypes/management/values" +
+                   "?api-version=2015-04-01&`$filter=$([uri]::EscapeDataString($filter))&`$select=$([uri]::EscapeDataString('eventTimestamp,operationName,status'))"
+            while ($url) {
+                $http = [AzHttp]::Get($client, $url)
+                if (-not $http.Doc) { Write-Warning "Activity Log query failed for '$($res.Name)': $($http.Error)"; break }
+                try   { $url = [WebParser]::ReadActivityPage($http.Doc, $events) }
+                finally { $http.Doc.Dispose() }
+            }
+        }
+        $stopped = [System.Collections.Generic.List[long[]]]::new()
+        $recycle = [System.Collections.Generic.List[long[]]]::new()
+        [WebClassifier]::BuildLifecycle($events, $pEnd.Ticks, $using:GraceMinutes * $tpm, $stopped, $recycle)
+        #endregion
+
+        #region Minute detail and Resource Health windows (apps that had 5xx)
+        $requestsMin = [double[]]::new($nMin)
+        $errorsMin   = [double[]]::new($nMin)
+        $detailComplete = $true
+        $windows = [System.Collections.Generic.List[HealthWindow]]::new()
+        if ($c.Detail) {
+            # A response over the Azure Monitor size limit is answered with HTTP 400: halve the span and retry.
+            $queue = [System.Collections.Generic.Queue[datetime[]]]::new()
+            for ($d = 0; $d -lt $nMin; $d += 7200) {
+                $queue.Enqueue(@($pStart.AddMinutes($d), $pStart.AddMinutes([math]::Min($d + 7200, $nMin))))
+            }
+            while ($queue.Count -gt 0) {
+                $span = $queue.Dequeue()
+                $uri = "https://management.azure.com$($res.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+                       "&metricnamespace=Microsoft.Web%2Fsites&metricnames=Requests,Http5xx&aggregation=Total&interval=PT1M" +
+                       "&timespan=$($span[0].ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($span[1].ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+                $http = [AzHttp]::Get($client, $uri)
+                if ($http.Doc) {
+                    try   { [WebParser]::AddCounts($http.Doc, $pStart.Ticks, $tpm, $requestsMin, $errorsMin) }
+                    finally { $http.Doc.Dispose() }
+                }
+                elseif ($http.Status -eq 400 -and ($span[1] - $span[0]).TotalMinutes -gt 15) {
+                    $mid = $span[0].AddMinutes([math]::Ceiling(($span[1] - $span[0]).TotalMinutes / 2))
+                    $queue.Enqueue(@($span[0], $mid))
+                    $queue.Enqueue(@($mid, $span[1]))
+                }
+                else {
+                    $detailComplete = $false
+                    Write-Warning "Web App minute detail failed for '$($res.Name)': $($http.Error)"
+                }
+            }
+
+            # The same combined history and the same window rules as the VM, SQL and storage algorithms.
+            $fetch = [HealthHistory]::Collect($client, $res.ResourceId, $healthSources.WorkspaceNotes[$key], $healthSources.UseRest)
+            if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($res.Name)': $($fetch.Error)" }
+            $windows = [HealthHistory]::BuildWindows($fetch.Notes, 30 * $tpm, 2 * $tpm)
+        }
+        #endregion
+
+        $result = [WebClassifier]::Classify($requestsMin, $errorsMin, $c.FirstMinute, $pStart.Ticks, $stopped, $recycle,
+                                            $windows, $using:HealthLeadMinutes * $tpm, 2 * $tpm)
+        [PSCustomObject]@{ Key = $key; Result = $result; DetailComplete = $detailComplete; Windows = $windows.Count }
+    } | ForEach-Object { $byRes[$_.Key] = $_ }
+
+    $client.Dispose()
+    $byRes
+}
+
+<#
+.SYNOPSIS
+    Runs the Web App availability algorithm for all Web Apps and returns one result per app.
+
+.DESCRIPTION
+    1. Hourly request and 5xx totals for every app (Get-WebHourlyCounts). An app with no request in the
+       period cannot be judged and is excluded (N/A).
+    2. Every other app is investigated (Invoke-WebInvestigation): its stopped periods leave the eligible
+       minutes, and for an app that had 5xx each minute in which every request failed is decided.
+       With -SourceWorkspaceId the Activity Log comes from Log Analytics for all the apps; without it only
+       the apps that had 5xx read it, so the stopped minutes of the other apps are not removed from their
+       eligible minutes (their availability stays 100%).
+    3. Eligible minutes = minutes since the app was created, without the minutes it was stopped and the
+       down minutes excused by a recycle or a customer Resource Health window.
+       Availability % = (eligible - Fault - Unresolved down minutes) / eligible.
+
+.PARAMETER Resources
+    Web App descriptors from Get-ResourceInventory.
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER TotalMinutes
+    Length of the observation window in minutes.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent calls.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.PARAMETER HealthLeadMinutes
+    Minutes before a Resource Health event that its down minutes are still attributed to it.
+
+.PARAMETER GraceMinutes
+    Minutes after a stop, start or restart that its down minutes are still excused.
+
+.PARAMETER SourceWorkspaceId
+    Optional Log Analytics workspace with the Activity Log (lifecycle operations and Resource Health history).
+
+.PARAMETER SubscriptionIds
+    Subscription IDs queried in the workspace.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID with one result per app.
+#>
+function Invoke-WebAvailability {
+    param(
+        [object[]]$Resources,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$TotalMinutes,
+        [int]$ThrottleLimit,
+        [string]$ArmToken,
+        [int]$HealthLeadMinutes,
+        [int]$GraceMinutes,
+        [string]$SourceWorkspaceId,
+        [string[]]$SubscriptionIds
+    )
+    Write-Host "Querying hourly request counts for $($Resources.Count) web app(s) with parallelism $ThrottleLimit..."
+    $hourlyByRes = Get-WebHourlyCounts -Resources $Resources -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+        -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken
+
+    # Apps with traffic are investigated; the first minute is the first one in which the app existed.
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $totals = @{}
+    foreach ($res in $Resources) {
+        $key    = $res.ResourceId.ToLowerInvariant()
+        $hourly = $hourlyByRes[$key]
+        $requests = $hourly ? ($hourly.Requests | Measure-Object -Sum).Sum : 0
+        $errors   = $hourly ? ($hourly.Errors   | Measure-Object -Sum).Sum : 0
+        $first = 0
+        if ($res.CreationTime -and $res.CreationTime -gt $PeriodStart) {
+            $first = [math]::Min($TotalMinutes, [int][math]::Ceiling(($res.CreationTime - $PeriodStart).TotalMinutes))
+        }
+        $totals[$key] = [PSCustomObject]@{ Requests = $requests; Errors = $errors; FirstMinute = $first }
+        if ($requests -gt 0) {
+            $candidates.Add([PSCustomObject]@{ Resource = $res; FirstMinute = $first; Detail = $errors -gt 0 })
+        }
+    }
+
+    $investigation = @{}
+    if ($candidates.Count -gt 0) {
+        $detailCount = @($candidates | Where-Object Detail).Count
+        Write-Host "Investigating $($candidates.Count) web app(s) with traffic ($detailCount with HTTP 5xx)..."
+        $logAnalyticsData = $null
+        if ($SourceWorkspaceId) {
+            Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
+            $logAnalyticsToken = Get-PlainToken 'https://api.loganalytics.io'
+            $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId -SubscriptionIds $SubscriptionIds `
+                -ResourceIds @($candidates.Resource.ResourceId) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+                -ArmToken $logAnalyticsToken
+        }
+        $investigation = Invoke-WebInvestigation -Candidates @($candidates) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+            -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken -HealthLeadMinutes $HealthLeadMinutes -GraceMinutes $GraceMinutes `
+            -LogAnalyticsData $logAnalyticsData
+    }
+
+    # One result per app.
+    $results = @{}
+    foreach ($res in $Resources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        $t   = $totals[$key]
+        $inv = $investigation[$key]
+        $w   = $inv ? $inv.Result : $null
+        $stoppedMinutes = $w ? $w.StoppedMinutes : 0
+        $excused  = $w ? $w.Recycle + $w.Customer : 0
+        $lost     = $w ? $w.Fault + $w.Unresolved : 0
+        $eligible = $TotalMinutes - $t.FirstMinute - $stoppedMinutes - $excused
+        $results[$key] = [PSCustomObject]@{
+            Excluded        = $t.Requests -le 0 -or $eligible -le 0
+            EligibleMinutes = $eligible
+            Percent         = $eligible -gt 0 ? 100 * ($eligible - $lost) / $eligible : 0
+            Tier            = $res.Tier
+            Requests        = $t.Requests
+            Errors          = $t.Errors
+            Detail          = $w
+            DetailComplete  = $inv ? $inv.DetailComplete : $true
+            PeriodStart     = $PeriodStart.UtcDateTime
+            LowVolume       = $t.Requests -lt $WebLowVolumeRequests
+        }
+    }
+    $results
+}
+
+<#
+.SYNOPSIS
+    Writes the result of the Web App algorithm into an app's eligibility record and prints the narration.
+
+.DESCRIPTION
+    Suspect = down minutes (every request failed with a 5xx) = Faults + Excused + Unresolved, where Excused
+    counts the minutes the app was stopped, recycled or inside a customer Resource Health window.
+    AvailableMinutes is the eligible minutes minus the Fault and Unresolved down minutes.
+
+.PARAMETER Record
+    The eligibility record of the app (see Step 4).
+
+.PARAMETER Result
+    The app's result from Invoke-WebAvailability.
+
+.OUTPUTS
+    None. Updates Record and writes the narration lines to the host.
+#>
+function Set-WebEligibility {
+    param(
+        [PSCustomObject]$Record,
+        [PSCustomObject]$Result
+    )
+    $name = $Record.Name
+    if ($Result.Excluded) {
+        $Record.EligibleMinutes = 0
+        $Record.AvailableMinutes = 0
+        Write-Host "  [$name] excluded from availability (no requests in period)"
+        return
+    }
+
+    $w = $Result.Detail
+    $down = $w ? $w.Down : 0
+    $lost = $w ? $w.Fault + $w.Unresolved : 0
+    $Record.EligibleMinutes           = $Result.EligibleMinutes
+    $Record.SuspectMinutes            = $down
+    $Record.ConfirmedDowntimeMinutes  = $w ? $w.Fault : 0
+    $Record.ExcusedMinutes            = $w ? $w.Stopped + $w.Recycle + $w.Customer : 0
+    $Record.UnexplainedSuspectMinutes = $w ? $w.Unresolved : 0
+    $Record.AvailableMinutes          = [math]::Round($Result.EligibleMinutes - $lost, 2)
+    $Record.AvailabilityPct           = [math]::Round($Result.Percent, 5).ToString('F5')
+
+    if ($Result.Tier -in $WebNoSlaTiers) {
+        Write-Host "  [$name] tier $($Result.Tier): the App Service SLA does not cover this tier, the figure is informative only"
+    }
+    if ($down -gt 0) {
+        Write-Host ("  [$name] web: {0:N0} of {1:N0} min with traffic had every request fail with a 5xx ({2:P1}), {3:N0} request(s) in all: {4} confirmed by Resource Health + {5} excused ({6} stopped, {7} recycle, {8} customer) + {9} unresolved" -f
+            $down, $w.Active, ($down / $w.Active), $Result.Requests, $w.Fault, $Record.ExcusedMinutes, $w.Stopped, $w.Recycle, $w.Customer, $w.Unresolved)
+        $sorted = @($w.Incidents | Sort-Object Minutes -Descending)
+        foreach ($i in ($sorted | Select-Object -First 3)) {
+            $when = $Result.PeriodStart.AddMinutes($i.StartMinute).ToString('u')
+            $cause = $i.Window ? "Resource Health '$($i.Window.Title)'$($i.Window.Summary ? ': ' + $i.Window.Summary : '')" : 'no Resource Health event'
+            Write-Host ("  [$name]   incident {0}, {1} min, {2:N0} request(s) -> {3} -> {4}" -f $when, $i.Minutes, $i.Requests, $i.Class, $cause)
+        }
+        if ($sorted.Count -gt 3) { Write-Host "  [$name]   ... and $($sorted.Count - 3) smaller incident(s)" }
+        if ($w.DownFewRequests -gt 0) {
+            Write-Host "  [$name]   $($w.DownFewRequests) of the down minute(s) carried fewer than 5 requests"
+        }
+        if ($Result.LowVolume) {
+            Write-Host ("  [$name] low volume: only {0:N0} request(s) in the period, the percentage rests on very few requests" -f $Result.Requests)
+        }
+    }
+    if ($w -and $w.Partial -gt 0) {
+        Write-Host ("  [$name] {0:N0} min with traffic had some requests fail with a 5xx ({1:P1} of those requests); not scored" -f
+            $w.Partial, ($w.PartialErrors / $w.PartialRequests))
+    }
+    if ($w -and -not $Result.DetailComplete) { Write-Host "  [$name]   WARNING: minute detail incomplete, some down minutes are not classified" }
+}
+
+#endregion
+
 #region Output
 
 <#
@@ -4006,8 +4543,8 @@ foreach ($res in $resources) {
 #endregion
 
 #region Step 5: Fetch Azure Monitor metrics
-# Storage accounts use their own algorithm (Step 5c) and are not part of the PT1M metric fetch.
-$metricResources = @($resources | Where-Object { $_.Kind -ne 'StorageAccount' })
+# Storage accounts and Web Apps use their own algorithms (Steps 5c and 5d) and are not part of the PT1M metric fetch.
+$metricResources = @($resources | Where-Object { $_.Kind -notin 'StorageAccount', 'WebApp' })
 $metricResults = @{}
 if ($metricResources.Count -gt 0) {
     if ($Batch) {
@@ -4035,6 +4572,23 @@ if ($storageResources.Count -gt 0) {
     foreach ($res in $storageResources) {
         $key = $res.ResourceId.ToLowerInvariant()
         Set-StorageEligibility -Record $eligByRes[$key] -Result $storageResults[$key]
+    }
+}
+
+#endregion
+
+#region Step 5d: Web Apps
+# The Web App algorithm (README, "Algorithms > Web Apps") counts the minutes in which every request failed
+# with a 5xx and attributes them to the Activity Log and Resource Health. It fills the eligibility records directly.
+$webResources = @($resources | Where-Object { $_.Kind -eq 'WebApp' })
+if ($webResources.Count -gt 0) {
+    $webResults = Invoke-WebAvailability -Resources $webResources -PeriodStart $utcStart -PeriodEnd $utcEnd `
+        -TotalMinutes $totalMinutes -ThrottleLimit $Parallelism -ArmToken $armToken `
+        -HealthLeadMinutes $HealthLeadMinutes -GraceMinutes $ActivityGraceMinutes `
+        -SourceWorkspaceId $SourceWorkspaceId -SubscriptionIds $subIds
+    foreach ($res in $webResources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        Set-WebEligibility -Record $eligByRes[$key] -Result $webResults[$key]
     }
 }
 

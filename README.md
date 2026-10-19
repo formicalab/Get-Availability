@@ -39,7 +39,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 | `-Parallelism` | auto | Max concurrent API calls |
 | `-ActivityGraceMinutes` | `10` | Grace window after lifecycle events |
 | `-FaultWindowMinutes` | `30` | VMs only: how long a platform health note can explain suspect minutes the metric does not attribute itself |
-| `-HealthLeadMinutes` | `5` | Storage accounts and SQL databases: how many minutes before a platform health event its failures are still attributed to it |
+| `-HealthLeadMinutes` | `5` | Storage accounts, SQL databases and Web Apps: how many minutes before a platform health event its failures are still attributed to it |
 | `-Batch` | off | Use the Metrics Batch API |
 | `-BatchSize` | `10` | Batch size when `-Batch` is enabled |
 | `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and Resource Health history |
@@ -80,7 +80,7 @@ Resources with zero eligible minutes are shown as `N/A`.
 
 1. Resource inventory comes from Azure Resource Graph.
 2. Azure Monitor metrics are collected for every resource (granularity and aggregation depend on the kind, see [Algorithms](#algorithms)).
-3. Suspect minutes are classified. Virtual machines, storage accounts and Azure SQL databases follow the algorithms described in [Algorithms](#algorithms); Web Apps follow the precedence below.
+3. Suspect minutes are classified. Every resource kind follows its own algorithm, described in [Algorithms](#algorithms).
 4. Final availability is computed from eligible minutes and available minutes.
 
 Metric sources by resource type:
@@ -90,17 +90,9 @@ Metric sources by resource type:
 | Virtual Machine | `VmAvailabilityMetric` (see [Virtual machines](#virtual-machines)) |
 | Azure SQL Database | `availability`, plus the connection metrics as evidence (see [Azure SQL databases](#azure-sql-databases)) |
 | Storage Account | `Transactions` split by `ResponseType` (see [Storage accounts](#storage-accounts)) |
-| Web App | `MemoryWorkingSet` |
+| Web App | `Requests` and `Http5xx` (see [Web Apps](#web-apps)) |
 
-For Web Apps (until their dedicated algorithm is documented under [Algorithms](#algorithms)), classification precedence is strict:
-
-1. Platform faults from Resource Health remain eligible downtime.
-2. Matching lifecycle events are excused.
-3. Resource Health `Unknown` or customer-initiated periods are excused.
-4. Remaining nulls are treated as metric issues and excused.
-5. Remaining zero or degraded values count against availability.
-
-When `-SourceWorkspaceId` is set, Activity Log data is queried from Log Analytics in bulk. For virtual machines, storage accounts and Azure SQL databases, Resource Health history from the REST API and from the workspace is combined for the whole period (see [Resource Health history](#resource-health-history)). For Web Apps, workspace history covers the period before the REST retention, while the most recent Resource Health history still comes from the REST API and remains authoritative.
+When `-SourceWorkspaceId` is set, Activity Log data is queried from Log Analytics in bulk. For every resource kind, Resource Health history from the REST API and from the workspace is combined for the whole period (see [Resource Health history](#resource-health-history)).
 
 ## Log Analytics ingestion
 
@@ -226,14 +218,12 @@ This section describes, step by step, how each resource kind is turned into the 
 
 ### Resource Health history
 
-Virtual machines, storage accounts and Azure SQL databases read Resource Health history in exactly the same way. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
+Every resource kind reads Resource Health history in exactly the same way. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
 
 - The REST history can omit short events that the Activity Log still holds. The same account has returned a 22-entry history with its recent `Degraded` events and, hours later, a 9-entry history without them.
 - The workspace lags behind real time and reaches back only as far as its retention.
 
 The REST history is skipped only when a workspace is set and the whole period predates the REST retention. The two sources describe the same events, so duplicates are expected, and each algorithm is built to tolerate them. Without `-SourceWorkspaceId` only the REST history is available: short events can be missing, and periods older than about 30 days have no health evidence.
-
-Web Apps still use the older rule (workspace history for the period before the REST retention, REST authoritative for the last ~30 days) until their own algorithm is documented here.
 
 ### Virtual machines
 
@@ -455,4 +445,78 @@ The narration also counts the Resource Health platform events that produced **no
 - `-HealthLeadMinutes` (5) and the one-minute grace after a resume were validated on two subscriptions over two months.
 - Without `-SourceWorkspaceId` the Activity Log and Resource Health evidence cover only what the REST APIs retain (about 30 days).
 
-The algorithm for Web Apps will be added here.
+### Web Apps
+
+#### What the signal means
+
+A Web App has **no availability metric**. The App Service SLA (99.95% for the Basic, Standard, Premium and Isolated tiers; none for Free and Shared) measures the minutes the app is *set to running* ("Deployment Minutes": stopped time is excluded) and counts a minute as unavailable when the app has no connectivity to the Internet gateway. The closest signal a customer can observe is the HTTP traffic: the `Requests` and `Http5xx` metrics (aggregation `Total`, one-minute grain).
+
+A **down minute** is a minute with at least one request in which **every** request failed with a 5xx (`Http5xx >= Requests`). Three kinds of minutes are deliberately not down:
+
+- Minutes without requests cannot be judged and count as available.
+- Minutes in which some requests succeeded are *partial*: they are reported, not scored.
+- Minutes with only 4xx errors are client errors.
+
+Other signals were evaluated and rejected:
+
+| Signal | Why it is not used |
+|---|---|
+| `MemoryWorkingSet` (the previous signal) | It is `0` whenever the process is not running: stopped apps, Free tier, and Always On disabled after the idle timeout. In a September sample 99.95% of the 511,806 zero minutes had no request at all, so idle apps were reported as down (one subscription: 526,318 unresolved minutes, 11 of 154 apps below 50%) while real failures with the process up were invisible |
+| `HealthCheckStatus` | Needs a health-check path configured on the app and has a 5-minute grain; none of the 20 apps sampled had data |
+| Resource Health | In the sampled estate Web Apps had no health events since June and a REST history made of a single baseline row (`Available`, sometimes `Unknown`) |
+
+The failures this algorithm finds are therefore mostly **application** errors (an app answering 5xx while its process is up, which the sampled failing minutes confirmed). They are what the app's users experience, but they are not necessarily the platform's fault: that is what the Unresolved and Fault columns separate.
+
+#### Step 1: collect the evidence
+
+1. **Hourly totals.** Read `Requests` and `Http5xx` for the whole period at one-hour grain (one call per app). An app with no request in the period is `N/A`.
+2. **Minute detail.** For an app with any 5xx, read the same metrics at one-minute grain, in spans of 5 days (halved when Azure Monitor refuses a response as too large).
+3. **Stopped periods and recycle windows.** Collect the `stop`, `start` and `restart` operations of the Activity Log. Events of one kind at most 5 minutes apart belong to one operation (a window never exceeds 15 minutes), because the Activity Log records each operation several times. A *recycle window* covers an operation plus `-ActivityGraceMinutes`. A *stopped period* runs from a stop to the next start or restart, or to the end of the period. With `-SourceWorkspaceId` the Activity Log is read from the workspace for all apps; without it, only for the apps that had 5xx.
+4. **Creation time.** Minutes before the app was created are not eligible.
+5. **Resource Health.** For an app with 5xx, read the combined history described in [Resource Health history](#resource-health-history) and turn it into windows exactly as for storage accounts. A platform window starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
+
+#### Step 2: decide each down minute
+
+Rules are applied in order; the first match wins.
+
+| # | Rule | Verdict |
+|---|---|---|
+| 1 | The app is stopped by the customer | Excused (the minute is not eligible) |
+| 2 | Inside a recycle window of a stop, start or restart | Excused |
+| 3 | Inside a customer Resource Health window | Excused |
+| 4 | Inside a platform Resource Health window | **Fault** |
+| 5 | Nothing explains it | **Unresolved** (counts against availability) |
+
+#### Step 3: compute the result
+
+- **Suspect** = every down minute = Faults + Excused + Unresolved.
+- **Faults** = rule 4. **Excused** = rules 1, 2 and 3. **Unresolved** = rule 5.
+- **Eligible minutes** = minutes since the app was created − every minute it was stopped (with or without traffic) − the down minutes excused by rules 2 and 3.
+- **Availability %** = (eligible minutes − Faults − Unresolved) ÷ eligible minutes, or `N/A` when the app had no request or no eligible minute.
+- An app on the Free or Shared tier gets its figure with a note that the SLA does not cover it.
+
+#### Evidence for the minutes that count
+
+For an app with down minutes the narration shows how many of its minutes with traffic were down, the three longest incidents (consecutive down minutes, at most 5 minutes apart) with their requests, verdict and Resource Health event, how many down minutes carried fewer than 5 requests, and a low-volume warning for an app with fewer than 10,000 requests in the period. Partial minutes are reported with the share of their requests that failed.
+
+#### Worked examples
+
+| Situation | What the evidence shows | Result |
+|---|---|---|
+| Idle Free-tier app, Always On disabled | No requests in the period; `MemoryWorkingSet` reads `0` | `N/A` (the previous signal reported downtime) |
+| App stopped for a week by the customer | Stop and start operations in the Activity Log; no requests in between | Seven days leave the eligible minutes |
+| Restart during deployment | 3 minutes with every request failing at the time of a `restart` | Excused (recycle window) |
+| Always-failing internal app | 602 of 634 minutes with traffic down, 3,513 requests in the month, 573 of the down minutes with fewer than 5 requests | 98.6%, Unresolved, flagged low volume |
+| Chronic partial errors | 14.8% of the requests fail, never all the requests of a minute | No down minute; reported as partial |
+| Busy app, 5xx burst | 5,739 down minutes of 38,554 with traffic, no stop, no health event | 86.7%, Unresolved: the number to investigate |
+
+In a September sample of 154 apps in one subscription, 142 had traffic, 29 had at least one down minute, and five apps held 8,057 of the 10,104 down minutes (none excused by a health window; 3 stopped, 18 recycle).
+
+#### Limits
+
+- A 5xx is what the customer sees, not necessarily what the platform did: an application bug counts as down. The Fault class stays rare because Resource Health rarely reports Web App events.
+- A minute with a single failed request is down. Sparse apps swing widely; the low-volume warning and the count of down minutes with fewer than 5 requests show when this happens. Scoring such minutes partially was considered and rejected to keep the rule simple.
+- An outage that stops requests from reaching the app leaves silent minutes, which cannot be judged.
+- Only `stop`, `start` and `restart` excuse down minutes. Configuration changes and slot swaps also recycle an app, but no failing minute in the sampled data lined up with them.
+- A stop that happened before the observation month is not seen, and without `-SourceWorkspaceId` an app without 5xx does not read the Activity Log: their stopped minutes stay eligible. This does not change the percentage, because a stopped app has no traffic, but it overstates the eligible minutes.
+- Without `-SourceWorkspaceId` the Activity Log and Resource Health evidence cover only what the REST APIs retain (about 30 days).
