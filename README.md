@@ -39,7 +39,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 | `-Parallelism` | auto | Max concurrent API calls |
 | `-ActivityGraceMinutes` | `10` | Grace window after lifecycle events |
 | `-FaultWindowMinutes` | `30` | VMs only: how long a platform health note can explain suspect minutes the metric does not attribute itself |
-| `-HealthLeadMinutes` | `5` | Storage accounts only: how many minutes before a platform health event its server failures are still attributed to it |
+| `-HealthLeadMinutes` | `5` | Storage accounts and SQL databases: how many minutes before a platform health event its failures are still attributed to it |
 | `-Batch` | off | Use the Metrics Batch API |
 | `-BatchSize` | `10` | Batch size when `-Batch` is enabled |
 | `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and Resource Health history |
@@ -80,7 +80,7 @@ Resources with zero eligible minutes are shown as `N/A`.
 
 1. Resource inventory comes from Azure Resource Graph.
 2. Azure Monitor metrics are collected for every resource (granularity and aggregation depend on the kind, see [Algorithms](#algorithms)).
-3. Suspect minutes are classified. Virtual machines and storage accounts follow the algorithms described in [Algorithms](#algorithms); the other kinds follow the precedence below.
+3. Suspect minutes are classified. Virtual machines, storage accounts and Azure SQL databases follow the algorithms described in [Algorithms](#algorithms); Web Apps follow the precedence below.
 4. Final availability is computed from eligible minutes and available minutes.
 
 Metric sources by resource type:
@@ -88,11 +88,11 @@ Metric sources by resource type:
 | Resource type | Metrics |
 |---|---|
 | Virtual Machine | `VmAvailabilityMetric` (see [Virtual machines](#virtual-machines)) |
-| Azure SQL Database | `Availability` |
+| Azure SQL Database | `availability`, plus the connection metrics as evidence (see [Azure SQL databases](#azure-sql-databases)) |
 | Storage Account | `Transactions` split by `ResponseType` (see [Storage accounts](#storage-accounts)) |
 | Web App | `MemoryWorkingSet` |
 
-For Azure SQL Databases and Web Apps (until their dedicated algorithms are documented under [Algorithms](#algorithms)), classification precedence is strict:
+For Web Apps (until their dedicated algorithm is documented under [Algorithms](#algorithms)), classification precedence is strict:
 
 1. Platform faults from Resource Health remain eligible downtime.
 2. Matching lifecycle events are excused.
@@ -100,7 +100,7 @@ For Azure SQL Databases and Web Apps (until their dedicated algorithms are docum
 4. Remaining nulls are treated as metric issues and excused.
 5. Remaining zero or degraded values count against availability.
 
-When `-SourceWorkspaceId` is set, Activity Log data is queried from Log Analytics in bulk. For virtual machines and storage accounts, Resource Health history from the REST API and from the workspace is combined for the whole period (see [Resource Health history](#resource-health-history)). For the other kinds, workspace history covers the period before the REST retention, while the most recent Resource Health history still comes from the REST API and remains authoritative.
+When `-SourceWorkspaceId` is set, Activity Log data is queried from Log Analytics in bulk. For virtual machines, storage accounts and Azure SQL databases, Resource Health history from the REST API and from the workspace is combined for the whole period (see [Resource Health history](#resource-health-history)). For Web Apps, workspace history covers the period before the REST retention, while the most recent Resource Health history still comes from the REST API and remains authoritative.
 
 ## Log Analytics ingestion
 
@@ -226,14 +226,14 @@ This section describes, step by step, how each resource kind is turned into the 
 
 ### Resource Health history
 
-Virtual machines and storage accounts read Resource Health history in exactly the same way. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
+Virtual machines, storage accounts and Azure SQL databases read Resource Health history in exactly the same way. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
 
 - The REST history can omit short events that the Activity Log still holds. The same account has returned a 22-entry history with its recent `Degraded` events and, hours later, a 9-entry history without them.
 - The workspace lags behind real time and reaches back only as far as its retention.
 
 The REST history is skipped only when a workspace is set and the whole period predates the REST retention. The two sources describe the same events, so duplicates are expected, and each algorithm is built to tolerate them. Without `-SourceWorkspaceId` only the REST history is available: short events can be missing, and periods older than about 30 days have no health evidence.
 
-Azure SQL databases and Web Apps still use the older rule (workspace history for the period before the REST retention, REST authoritative for the last ~30 days) until their own algorithms are documented here.
+Web Apps still use the older rule (workspace history for the period before the REST retention, REST authoritative for the last ~30 days) until their own algorithm is documented here.
 
 ### Virtual machines
 
@@ -384,4 +384,75 @@ The narration also lists the largest incidents (failing minutes less than six mi
 - `-HealthLeadMinutes` (5) and the two-minute grace after resolution were validated on a limited set of subscriptions.
 - Without `-SourceWorkspaceId` the Resource Health evidence is the REST history only (see [Resource Health history](#resource-health-history)): short events can be missing, and for periods older than about 30 days every failing minute is Unresolved.
 
-The algorithms for Azure SQL databases and Web Apps will be added here.
+### Azure SQL databases
+
+#### What the signal means
+
+The signal is the `availability` metric (aggregation `Minimum`, one-minute grain). It is based on connections, not on probes of the database engine:
+
+| Value | Meaning |
+|---|---|
+| `100` | At least one connection attempt of the minute succeeded |
+| `0` | Every connection attempt of the minute failed with a **system** error. Errors caused by the user (wrong login, firewall, application errors) do not count |
+| null | No data. In practice the metric is never null: even a paused database reads `100` |
+
+Two properties of the metric shape the algorithm:
+
+- **A zero minute is the only downtime signal, and the metric hides partial failures.** If some connections of a minute succeed, the minute reads `100` even when others failed. Short platform events (Resource Health reports about two seconds of impact) therefore leave no trace in `availability`. The companion metrics `connection_failed` (with an `Error` dimension) and `connection_successful` show them.
+- **A serverless database with auto-pause produces zero minutes by design.** The first connection to a paused database resumes it and fails with error `40613` ("database not currently available") until the resume completes. The platform logs each resume in the Activity Log as `Microsoft.Sql/servers/databases/resume` (a `Started` and a `Succeeded` event, about a minute apart) with an **all-zero correlation ID**. The metric reads `0` for the first minute and can read `100` for the following minutes while connections keep failing, so it also under-reports the length of a resume.
+
+In a September sample of 181 databases, every one of the 375 zero minutes had error `40613` and no successful connection in the minute, and 97% of them sat inside a resume operation.
+
+#### Step 1: collect the evidence
+
+1. **Metric.** Read `availability` for the whole period. Count the zero and null minutes.
+2. **Resume windows.** Collect the `resume` operations of the Activity Log, including the ones the platform logs itself (`Microsoft.Sql/servers/databases/resume`) and the ones triggered by a user (`.../resume/action`). Group the events of one operation by proximity: consecutive events at most 5 minutes apart belong together, and a window never exceeds 15 minutes. A window runs from the minute of its first event to one minute after the minute of its last event. Grouping by correlation ID would join every resume of the period into one window, because the platform's own events share a zero ID. A failed operation leaves a lone `Started` event that explains a single minute. Pause operations are not used: no zero minute was ever explained by a pause alone.
+3. **Creation time.** Minutes before the creation time of the database are excused.
+4. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history) and turn it into windows, as for storage accounts: a window opens at an `Unavailable` or `Degraded` note and closes at the next `Available` note. Windows of customer-caused events are customer windows. A platform window starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
+
+#### Step 2: decide each suspect minute
+
+Rules are applied in order; the first match wins.
+
+| # | Rule | Verdict |
+|---|---|---|
+| 1 | The database did not exist yet | Excused |
+| 2 | Zero or null, inside a resume window | Excused (auto-resume is the customer-configured behaviour of the serverless tier) |
+| 3 | Zero, inside a customer Resource Health window | Excused |
+| 4 | Zero, inside a platform Resource Health window | **Fault** |
+| 5 | Null, and nothing explains it | Excused as a *metric gap* |
+| 6 | Zero, and nothing explains it | **Unresolved** (counts against availability) |
+
+Resume is decided before Resource Health on purpose: on serverless databases most `Unavailable` health events are a by-product of the resume itself.
+
+#### Step 3: compute the result
+
+- **Suspect** = every zero or null minute = Faults + Excused + Unresolved.
+- **Faults** = minutes decided by rule 4. **Excused** = rules 1, 2, 3 and 5. **Unresolved** = rule 6.
+- **Eligible minutes** = minutes in the period − Excused. Paused time stays eligible: it is not downtime, and the metric itself reads `100` there.
+- **Availability %** = available minutes ÷ eligible minutes, or `N/A` when no minute is eligible.
+
+#### Evidence for the minutes that count
+
+For the Fault and Unresolved minutes, the narration lists the first five: the error codes of `connection_failed` with their counts, the number of successful connections of the same minute, the verdict and the Resource Health event that explained it. This needs one pair of metric calls per day that has such minutes (at most six days).
+
+The narration also counts the Resource Health platform events that produced **no zero minute** and do not overlap a resume: brief failures that the metric does not count. With `-SourceWorkspaceId` every database is checked; without it, only the databases that already have suspect minutes can be.
+
+#### Worked examples
+
+| Situation | What the evidence shows | Result |
+|---|---|---|
+| Auto-resume of a paused serverless database | Resume `Started` 05:56:41 and `Succeeded` 05:57:11; the 05:57 minute reads `0` with three failed connections (`40613`); three successful connections follow in the next minute | Excused |
+| Provisioned database, one minute with every connection failing | The minute reads `0`, `40613` three times, no successful connection, no resume, no Resource Health event | Unresolved: downtime by the definition of the metric |
+| Failover with about two seconds of impact | Resource Health reports `Unavailable`; the metric stays at `100` because other connections succeeded | No suspect minute; counted as a brief platform event |
+| Health event raised by a resume | `Unavailable` note overlapping a resume operation | Excused; not counted as a platform event |
+
+#### Limits
+
+- Treating auto-resume as expected behaviour is a policy choice: the Microsoft documentation describes the `40613` behaviour, but the documentation reviewed does not state how the SLA counts it. The resume minutes are reported separately in the narration (`auto-resume N`) so that a stricter figure can be recomputed.
+- A real outage that starts in the same minutes as a resume is excused, because minutes are attributed by time only.
+- Partial failures are not downtime by the definition of the metric, so they are reported but not scored.
+- `-HealthLeadMinutes` (5) and the one-minute grace after a resume were validated on two subscriptions over two months.
+- Without `-SourceWorkspaceId` the Activity Log and Resource Health evidence cover only what the REST APIs retain (about 30 days).
+
+The algorithm for Web Apps will be added here.

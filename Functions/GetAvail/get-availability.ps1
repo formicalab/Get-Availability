@@ -21,7 +21,7 @@
             - Resource creation/deletion: VM timeCreated establishes initial existence;
                 successful delete/write pairs establish later non-existence intervals.
       - Virtual Machines: start/deallocate/power off/restart
-      - Azure SQL Databases: pause/resume
+      - Azure SQL Databases: resume of a paused serverless database (auto-resume)
       - Web Apps: stop/start/restart
     Resource Health is then applied to classify remaining suspects:
       - platform fault confirmed (Unavailable/Degraded) -> counts as downtime
@@ -452,6 +452,7 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
           creationTime=case(
               type =~ 'microsoft.compute/virtualmachines', tostring(properties.timeCreated),
               type =~ 'microsoft.storage/storageaccounts', tostring(properties.creationTime),
+              type =~ 'microsoft.sql/servers/databases', tostring(properties.creationDate),
               '')
 "@
 
@@ -469,7 +470,7 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
             # Resource Graph returns the creation time either as a DateTime or as an
             # ISO string, depending on the Az.ResourceGraph version; normalise to UTC.
             $creationTime = $null
-            if ($kind -in 'VirtualMachine', 'StorageAccount' -and $row.creationTime) {
+            if ($kind -in 'VirtualMachine', 'StorageAccount', 'AzureSqlDatabase' -and $row.creationTime) {
                 if ($row.creationTime -is [datetime]) {
                     $creationTime = ([DateTimeOffset][datetime]$row.creationTime).ToUniversalTime()
                 } else {
@@ -707,7 +708,7 @@ let actOps = dynamic([
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/DEALLOCATE/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/POWEROFF/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/RESTART/ACTION',
-  'MICROSOFT.SQL/SERVERS/DATABASES/PAUSE/ACTION',
+  'MICROSOFT.SQL/SERVERS/DATABASES/RESUME',
   'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION',
   'MICROSOFT.WEB/SITES/STOP/ACTION',
   'MICROSOFT.WEB/SITES/START/ACTION',
@@ -1234,10 +1235,7 @@ public static class HealthHistory
         return next;
     }
 
-    /// <summary>
-    /// Returns the workspace notes plus, when useRest is true, every page of the REST history.
-    /// useRest is false when the whole period predates the REST retention and a workspace is available.
-    /// </summary>
+    /// <summary>Returns the workspace notes plus, when useRest is true, every page of the REST history.</summary>
     public static HealthFetch Collect(HttpClient client, string resourceId, List<HealthNote> workspaceNotes, bool useRest)
     {
         var result = new HealthFetch();
@@ -1253,6 +1251,65 @@ public static class HealthHistory
         }
         return result;
     }
+
+    private static readonly Regex BadTitle = new Regex("Degraded|Throttl|Unavailable", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Turns health notes into impact windows. A window opens at a Degraded or Unavailable note (or a note with
+    /// no state whose title says so) and closes at the next Available note. Workspace "Updated" rows (Available
+    /// state, Degraded title) are progress updates of the open event: neither an opening nor a closing note.
+    /// An event that never resolves explains at most openCapTicks. The REST history and the workspace describe
+    /// the same events, so windows that touch (within mergeTicks) and have the same cause are merged.
+    /// A throttling note is customer-caused whatever its recorded reason.
+    /// </summary>
+    public static List<HealthWindow> BuildWindows(List<HealthNote> notes, long openCapTicks, long mergeTicks)
+    {
+        var sorted = new List<HealthNote>(notes);
+        sorted.Sort((a, b) => a.Ticks.CompareTo(b.Ticks));
+        var raw = new List<HealthWindow>();
+        HealthNote open = null;
+        foreach (var n in sorted)
+        {
+            bool bad = BadTitle.IsMatch(n.Title);
+            bool opener = n.State.Equals("Degraded", StringComparison.OrdinalIgnoreCase) ||
+                          n.State.Equals("Unavailable", StringComparison.OrdinalIgnoreCase) ||
+                          (n.State.Length == 0 && bad);
+            bool closer = n.State.Equals("Available", StringComparison.OrdinalIgnoreCase) && !bad;
+            if (opener && open == null) open = n;
+            else if (closer && open != null) { raw.Add(Make(open, n.Ticks)); open = null; }
+        }
+        if (open != null) raw.Add(Make(open, open.Ticks + openCapTicks));
+
+        raw.Sort((a, b) => a.Start.CompareTo(b.Start));
+        var windows = new List<HealthWindow>();
+        foreach (var w in raw)
+        {
+            var last = windows.Count > 0 ? windows[windows.Count - 1] : null;
+            if (last != null && w.Start <= last.End + mergeTicks && w.Customer == last.Customer)
+            {
+                if (w.End > last.End) last.End = w.End;
+                if (last.Summary.Length == 0) last.Summary = w.Summary;
+            }
+            else windows.Add(w);
+        }
+        return windows;
+    }
+
+    private static HealthWindow Make(HealthNote open, long end)
+        => new HealthWindow
+        {
+            Start = open.Ticks, End = end, Title = open.Title, Summary = open.Summary,
+            Customer = open.Customer || open.Title.IndexOf("Throttl", StringComparison.OrdinalIgnoreCase) >= 0
+        };
+}
+
+/// <summary>A period during which Resource Health reported the resource degraded or unavailable.</summary>
+public sealed class HealthWindow
+{
+    public long   Start, End;     // UTC ticks
+    public bool   Customer;       // caused by the customer
+    public string Title   = "";
+    public string Summary = "";
 }
 
 /// <summary>Hourly request counts of a storage account: server failures and counted requests.</summary>
@@ -2232,6 +2289,10 @@ function Get-AvailabilityMetrics {
     How long a platform Resource Health note can explain suspect minutes that the metric itself does
     not attribute (VM algorithm).
 
+.PARAMETER HealthLeadMinutes
+    Minutes before a platform Resource Health event that a SQL zero minute is still attributed to it
+    (SQL algorithm).
+
 .PARAMETER ArmToken
     Bearer token for Azure Resource Manager.
 
@@ -2252,6 +2313,7 @@ function Invoke-SuspectGapInvestigation {
         [int]$ThrottleLimit,
         [int]$GraceMinutes,
         [int]$FaultWindowMinutes = 30,
+        [int]$HealthLeadMinutes = 5,
         [string]$ArmToken,
         [DateTimeOffset]$HealthCoverageStart,
         [hashtable]$LogAnalyticsData
@@ -2282,6 +2344,7 @@ function Invoke-SuspectGapInvestigation {
         $pEnd        = $using:PeriodEnd
         $graceMin    = $using:GraceMinutes
         $faultWinMin = $using:FaultWindowMinutes
+        $leadMin     = $using:HealthLeadMinutes
         $hcStart     = $using:HealthCoverageStart
         $laData      = $using:LogAnalyticsData
         $restCutoff  = $using:restHealthCutoff
@@ -2425,6 +2488,45 @@ function Invoke-SuspectGapInvestigation {
 
         <#
         .SYNOPSIS
+            Builds the auto-resume windows of an Azure SQL database from its Activity Log resume events.
+        .DESCRIPTION
+            Events are grouped into one window per operation by proximity, not by correlation ID: the
+            platform logs the resume of a paused serverless database with an all-zero correlation ID, so
+            grouping by it would join every resume of the period into one window. Consecutive events
+            at most 5 minutes apart belong to the same operation (a window never exceeds 15 minutes), and
+            a failed operation leaves a lone Started event that explains a single minute. A window runs
+            from the minute of its first event to one minute after the minute of its last event, which
+            covers the first failed connections and the minute the resume completes.
+        .PARAMETER Events
+            Activity Log events (Timestamp) of the resume operation.
+        .OUTPUTS
+            PSCustomObject[] with From, To, FromTicks and ToTicks, merged and clamped to the period.
+        #>
+        function script:NewResumeIntervals($Events) {
+            $intervals = [System.Collections.Generic.List[object]]::new()
+            $first = $null; $last = $null
+            $close = {
+                $from = TruncMin $first
+                $to   = (TruncMin $last).AddMinutes(2)
+                if ($from -lt $pStart) { $from = $pStart }
+                if ($to -gt $pEnd)     { $to = $pEnd }
+                if ($to -gt $from) {
+                    $intervals.Add([PSCustomObject]@{ From = $from; To = $to; FromTicks = $from.UtcTicks; ToTicks = $to.UtcTicks })
+                }
+            }
+            foreach ($evt in ($Events | Sort-Object Timestamp)) {
+                if ($first -and (($evt.Timestamp - $last).TotalMinutes -gt 5 -or ($evt.Timestamp - $first).TotalMinutes -gt 15)) {
+                    & $close; $first = $null
+                }
+                if (-not $first) { $first = $evt.Timestamp }
+                $last = $evt.Timestamp
+            }
+            if ($first) { & $close }
+            MergeIntervals @($intervals)
+        }
+
+        <#
+        .SYNOPSIS
             Tells whether a Resource Health note was caused by the customer.
         .DESCRIPTION
             Several fields can say so: the REST API uses ReasonType, workspace history uses
@@ -2504,7 +2606,7 @@ function Invoke-SuspectGapInvestigation {
         $lifecycleIntervals    = @()
         $nonExistenceIntervals = @()
 
-        if ($c.AllGapTicks.Count -gt 0 -or $c.DegradedTicks.Count -gt 0) {
+        if ($c.AllGapTicks.Count -gt 0 -or $c.DegradedTicks.Count -gt 0 -or $c.Kind -eq 'AzureSqlDatabase') {
             try {
                 $vmRules = @(
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/start/action', 'start virtual machine') }
@@ -2512,9 +2614,10 @@ function Invoke-SuspectGapInvestigation {
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/poweroff/action', 'power off virtual machine') }
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/restart/action', 'restart virtual machine') }
                 )
+                # SQL lifecycle: only the resume of a paused serverless database explains failed connections.
+                # No zero minute was ever explained by a pause alone, so pause events are not used.
                 $sqlRules = @(
-                    @{ ApplyGrace = $true; Tokens = @('microsoft.sql/servers/databases/pause', 'pause sql database', 'pause database') }
-                    @{ ApplyGrace = $true; Tokens = @('microsoft.sql/servers/databases/resume', 'resume sql database', 'resume database') }
+                    @{ ApplyGrace = $false; Tokens = @('microsoft.sql/servers/databases/resume', 'resume sql database', 'resume database') }
                 )
                 # Web App lifecycle: stop applies grace (trailing zero metrics while process
                 # shuts down), start/restart apply grace for the brief recycle window.
@@ -2579,9 +2682,9 @@ function Invoke-SuspectGapInvestigation {
                     }
                 }
 
-                # Unlike the generic ARM write operation, a VM's timeCreated value
+                # Unlike the generic ARM write operation, the creation time of a VM or SQL database
                 # is authoritative creation evidence for its current incarnation.
-                if ($c.Kind -eq 'VirtualMachine' -and $null -ne $c.CreationTime) {
+                if ($c.Kind -in 'VirtualMachine', 'AzureSqlDatabase' -and $null -ne $c.CreationTime) {
                     $existenceEvents.Add([PSCustomObject]@{
                         Timestamp = [DateTimeOffset]$c.CreationTime
                         Type      = 'Created'
@@ -2639,11 +2742,15 @@ function Invoke-SuspectGapInvestigation {
                     }
                 }
 
-                # Build time intervals from events: group by operation+correlationId
-                # so that events belonging to the same action collapse into a single
-                # interval. Compute from/to per group, apply the grace window for
+                # Build time intervals from events. SQL resume events become one window per operation
+                # (see NewResumeIntervals). The other kinds group events by operation+correlationId
+                # so that events belonging to the same action collapse into a single interval.
+                # Compute from/to per group, apply the grace window for
                 # operations that have trailing transition time, then merge overlaps.
-                if ($events.Count -gt 0) {
+                if ($c.Kind -eq 'AzureSqlDatabase') {
+                    $activityIntervals = NewResumeIntervals $events
+                }
+                elseif ($events.Count -gt 0) {
                     # Group events by operation key + correlation ID.  Events without
                     # a correlation ID are grouped by their truncated timestamp.
                     $groups = @{}
@@ -2822,6 +2929,8 @@ function Invoke-SuspectGapInvestigation {
         $customerIntervals = @()
         # Classified Resource Health notes (UTC ticks + class) used by the VM algorithm.
         $vmEntries = [System.Collections.Generic.List[object]]::new()
+        # Impact windows built from the combined history, used by the SQL algorithm.
+        $healthWindows = @()
 
         if ($healthHistoryApplied) {
             try {
@@ -2837,6 +2946,13 @@ function Invoke-SuspectGapInvestigation {
                             Class = [VmHealthClassifier]::Classify($note.Title, $note.State, $note.Customer, $note.Reason)
                         })
                     }
+                }
+                elseif ($c.Kind -eq 'AzureSqlDatabase') {
+                    # SQL algorithm: the same combined history as VMs and storage, turned into impact windows.
+                    $fetch = [HealthHistory]::Collect($client, $c.ResourceId,
+                        $healthSources.WorkspaceNotes[$c.ResourceId.ToLowerInvariant()], $healthSources.UseRest)
+                    if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($c.Name)': $($fetch.Error)" }
+                    $healthWindows = @([HealthHistory]::BuildWindows($fetch.Notes, 30 * 600000000L, 2 * 600000000L))
                 }
                 else {
                     $transitions = [System.Collections.Generic.List[object]]::new()
@@ -2930,7 +3046,9 @@ function Invoke-SuspectGapInvestigation {
         #   4. Remaining null                          → metric issue, excluded
         #   5. Remaining 0%                            → downtime, stays eligible
         #   6. Remaining degraded (0% < v < 100%)     → trusted, stays eligible
-        $vmOutcomeText = $null
+        $outcomeText  = $null
+        $outcomeLabel = $null
+        $evidence     = [System.Collections.Generic.List[string]]::new()
 
         if ($c.Kind -eq 'VirtualMachine') {
             # Who caused each zero minute: a second metric call split by the Context
@@ -2990,10 +3108,135 @@ function Invoke-SuspectGapInvestigation {
             $outcomeNames = 'platform fault (metric Context)', 'platform fault (health note)', 'before creation',
                 'customer (metric Context)', 'lifecycle operation', 'customer (health note)', 'planned maintenance',
                 'spot eviction', 'health unknown', 'metric gap', 'unresolved 0%', 'continues customer stop'
-            $vmOutcomeText = (@(foreach ($k in 1..12) {
+            $outcomeLabel = 'VM algorithm'
+            $outcomeText = (@(foreach ($k in 1..12) {
                 $n = $gap[$k] + $deg[$k]
                 if ($n -gt 0) { "$($outcomeNames[$k - 1]) $n" }
             })) -join '; '
+        }
+        elseif ($c.Kind -eq 'AzureSqlDatabase') {
+            # SQL algorithm (README, "Algorithms > Azure SQL databases"). The metric is 0 when every connection of
+            # the minute failed with a system error and 100 otherwise (never null in practice), so a zero minute
+            # is the only downtime signal. Decision order for a zero minute:
+            #   before creation -> excused; inside a resume window -> excused (auto-resume is by design);
+            #   inside a customer health window -> excused; inside a platform health window -> Fault;
+            #   anything else -> Unresolved. A null minute is a metric gap unless creation or a resume explains it.
+            $tpm = 600000000L
+            $leadTicks  = $leadMin * $tpm
+            $graceTicks = 2 * $tpm
+            $inAny = {
+                param($list, [long]$t)
+                foreach ($w in $list) { if ($t -ge $w.FromTicks -and $t -lt $w.ToTicks) { return $true } }
+                $false
+            }
+            $lifecycle = @($lifecycleIntervals)
+            $nonExist  = @($nonExistenceIntervals)
+            $n = @{ NotExists = 0; Resume = 0; Customer = 0; Fault = 0; Unresolved = 0; Gap = 0 }
+            $badMinutes = [System.Collections.Generic.List[object]]::new()   # Fault and Unresolved minutes, for the evidence
+
+            foreach ($t in [long[]]@($c.ZeroTicksArray)) {
+                if (& $inAny $nonExist $t)  { $n.NotExists++; continue }
+                if (& $inAny $lifecycle $t) { $n.Resume++; continue }
+                $win = $null
+                foreach ($w in $healthWindows) {
+                    if ($t -ge $w.Start - $leadTicks -and $t -le $w.End + $graceTicks) { $win = $w; break }
+                }
+                if ($win -and $win.Customer) { $n.Customer++ }
+                elseif ($win) { $n.Fault++;      $badMinutes.Add([PSCustomObject]@{ Ticks = $t; Verdict = 'Fault'; Title = $win.Title }) }
+                else          { $n.Unresolved++; $badMinutes.Add([PSCustomObject]@{ Ticks = $t; Verdict = 'Unresolved'; Title = '' }) }
+            }
+            foreach ($t in [long[]]@($c.NullTicksArray)) {
+                if (& $inAny $nonExist $t)  { $n.NotExists++ }
+                elseif (& $inAny $lifecycle $t) { $n.Resume++ }
+                else { $n.Gap++ }
+            }
+
+            $cr = [PSCustomObject]@{
+                PlatformFaultGapMin          = $n.Fault
+                ActivityLogExcludedGapMin    = $n.NotExists + $n.Resume
+                HealthExplainedGapMin        = $n.Customer
+                MetricIssueNullMin           = $n.Gap
+                UnresolvedZeroDowntimeMin    = $n.Unresolved
+                HealthConfirmedDegradedMin   = 0
+                ActivityLogDegradedMin       = 0
+                CustomerExcusedDegradedMin   = 0
+                CustomerExcusedDegradedAvail = 0
+            }
+            $outcomeLabel = 'SQL algorithm'
+            $outcomeText = (@(
+                if ($n.NotExists   -gt 0) { "before creation $($n.NotExists)" }
+                if ($n.Resume      -gt 0) { "auto-resume $($n.Resume)" }
+                if ($n.Customer    -gt 0) { "customer (health note) $($n.Customer)" }
+                if ($n.Fault       -gt 0) { "platform fault (health note) $($n.Fault)" }
+                if ($n.Gap         -gt 0) { "metric gap $($n.Gap)" }
+                if ($n.Unresolved  -gt 0) { "unresolved 0% $($n.Unresolved)" }
+            )) -join '; '
+
+            #region SQL evidence
+            # What the failed connections were, for the minutes that count against availability: the error
+            # codes of connection_failed and the successful connections of the same minute. One pair of calls
+            # per day that has such minutes (at most 6 days).
+            if ($badMinutes.Count -gt 0) {
+                $detail = @{}
+                $days = @($badMinutes | ForEach-Object { [long][math]::Floor($_.Ticks / 864000000000L) } | Sort-Object -Unique | Select-Object -First 6)
+                foreach ($day in $days) {
+                    $dayStart = [DateTime]::new($day * 864000000000L, [DateTimeKind]::Utc)
+                    $base = "https://management.azure.com$($c.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+                            '&metricnamespace=Microsoft.Sql%2Fservers%2Fdatabases&aggregation=Total&interval=PT1M' +
+                            "&timespan=$($dayStart.ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($dayStart.AddDays(1).ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+                    try {
+                        $failedResp = ArmGet ($base + '&metricnames=connection_failed&$filter=' + [uri]::EscapeDataString("Error eq '*'")) $client | ConvertFrom-Json -DateKind String
+                        $okResp     = ArmGet ($base + '&metricnames=connection_successful') $client | ConvertFrom-Json -DateKind String
+                    }
+                    catch { Write-Warning "SQL connection metrics failed for '$($c.Name)': $_"; continue }
+                    foreach ($series in $failedResp.value[0].timeseries) {
+                        $code = ($series.metadatavalues | Where-Object { $_.name.value -eq 'error' }).value
+                        for ($i = 0; $i -lt $series.data.Count; $i++) {
+                            $v = $series.data[$i].PSObject.Properties['total']
+                            if ($v -and $v.Value -gt 0) {
+                                $key = $dayStart.Ticks + $i * $tpm
+                                if (-not $detail.ContainsKey($key)) { $detail[$key] = @{ Errors = @(); Ok = 0 } }
+                                $detail[$key].Errors += "$code x$($v.Value)"
+                            }
+                        }
+                    }
+                    $okData = $okResp.value[0].timeseries[0].data
+                    for ($i = 0; $i -lt $okData.Count; $i++) {
+                        $v = $okData[$i].PSObject.Properties['total']
+                        if ($v -and $v.Value -gt 0) {
+                            $key = $dayStart.Ticks + $i * $tpm
+                            if ($detail.ContainsKey($key)) { $detail[$key].Ok = $v.Value }
+                        }
+                    }
+                }
+                foreach ($b in ($badMinutes | Select-Object -First 5)) {
+                    $d = $detail[[long]$b.Ticks]
+                    $what = $d ? "$($d.Errors -join ', ') failed connection(s), $($d.Ok) successful" : 'no connection metric data for the minute'
+                    $why  = $b.Verdict -eq 'Fault' ? "Resource Health '$($b.Title)'" : 'no Resource Health event'
+                    $evidence.Add("minute $([DateTime]::new([long]$b.Ticks, [DateTimeKind]::Utc).ToString('u')): $what -> $($b.Verdict) ($why)")
+                }
+                if ($badMinutes.Count -gt 5) { $evidence.Add("... and $($badMinutes.Count - 5) more minute(s) counted against availability") }
+            }
+
+            # Resource Health platform events that produced no zero minute and are not an auto-resume: brief
+            # failures (Resource Health reports about two seconds) that the metric does not count, because
+            # at least one connection succeeded in the minute.
+            $briefEvents = 0
+            $zeroTicksAll = [long[]]@($c.ZeroTicksArray)
+            foreach ($w in $healthWindows) {
+                if ($w.Customer -or $w.End -lt $pStart.UtcTicks -or $w.Start -ge $pEnd.UtcTicks) { continue }
+                $from = $w.Start - $leadTicks; $to = $w.End + $graceTicks
+                $overlapsResume = $false
+                foreach ($r in $lifecycle) { if ($r.FromTicks -lt $to -and $r.ToTicks -gt $from) { $overlapsResume = $true; break } }
+                if ($overlapsResume) { continue }
+                $hasZero = $false
+                foreach ($t in $zeroTicksAll) { if ($t -ge $from -and $t -le $to) { $hasZero = $true; break } }
+                if (-not $hasZero) { $briefEvents++ }
+            }
+            if ($briefEvents -gt 0) {
+                $evidence.Add("$briefEvents Resource Health platform event(s) without a zero minute: brief failures that the metric does not count (some connections succeeded in the minute)")
+            }
+            #endregion
         }
         else {
             $aFrom = [long[]]@($activityIntervals | ForEach-Object { $_.FromTicks })
@@ -3035,7 +3278,9 @@ function Invoke-SuspectGapInvestigation {
             CustomerExcusedDegradedAvailableSum = $cr.CustomerExcusedDegradedAvail
             ActivityLogDegradedMinutes        = $cr.ActivityLogDegradedMin
             HealthConfirmedDegradedMinutes    = $cr.HealthConfirmedDegradedMin
-            VmOutcomeText                     = $vmOutcomeText
+            OutcomeText                       = $outcomeText
+            OutcomeLabel                      = $outcomeLabel
+            Evidence                          = @($evidence)
         }
         #endregion
     } | ForEach-Object {
@@ -3245,40 +3490,11 @@ function Invoke-StorageInvestigation {
         #endregion
 
         #region Resource Health windows
-        # Notes come from the same combined history as the VM algorithm (REST plus workspace, see
-        # Get-HealthSources). A window opens at a Degraded/Unavailable note and closes at the next
-        # Available note; Log Analytics "Updated" rows (Available state, Degraded title) are progress
-        # updates of the open event and are neither an opening nor a closing note. A throttling note
-        # is customer-caused whatever its recorded reason.
+        # The same combined history and the same window rules as the VM and SQL algorithms
+        # (Get-HealthSources, HealthHistory.BuildWindows).
         $fetch = [HealthHistory]::Collect($client, $res.ResourceId, $healthSources.WorkspaceNotes[$key], $healthSources.UseRest)
         if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($res.Name)': $($fetch.Error)" }
-        $notes = $fetch.Notes
-
-        $raws = [System.Collections.Generic.List[object]]::new()
-        $open = $null
-        foreach ($n in ($notes | Sort-Object Ticks)) {
-            $isOpener = $n.State -in 'Degraded', 'Unavailable' -or
-                        ([string]::IsNullOrEmpty($n.State) -and $n.Title -match 'Degraded|Throttl|Unavailable')
-            $isCloser = $n.State -eq 'Available' -and $n.Title -notmatch 'Degraded|Throttl|Unavailable'
-            if ($isOpener -and -not $open) { $open = $n }
-            elseif ($isCloser -and $open) {
-                $raws.Add([PSCustomObject]@{ Start = $open.Ticks; End = $n.Ticks; Customer = ($open.Customer -or $open.Title -match 'Throttl'); Title = $open.Title; Summary = $open.Summary })
-                $open = $null
-            }
-        }
-        # An event that never resolved explains at most 30 minutes.
-        if ($open) { $raws.Add([PSCustomObject]@{ Start = $open.Ticks; End = $open.Ticks + 30 * $tpm; Customer = ($open.Customer -or $open.Title -match 'Throttl'); Title = $open.Title; Summary = $open.Summary }) }
-
-        # The REST history and the workspace describe the same events: merge windows that touch.
-        $windows = [System.Collections.Generic.List[object]]::new()
-        foreach ($w in ($raws | Sort-Object Start)) {
-            $last = $windows.Count -gt 0 ? $windows[$windows.Count - 1] : $null
-            if ($last -and $w.Start -le $last.End + $graceTicks -and $w.Customer -eq $last.Customer) {
-                if ($w.End -gt $last.End) { $last.End = $w.End }
-                if (-not $last.Summary) { $last.Summary = $w.Summary }
-            }
-            else { $windows.Add([PSCustomObject]@{ Start = $w.Start; End = $w.End; Customer = $w.Customer; Title = $w.Title; Summary = $w.Summary }) }
-        }
+        $windows = [HealthHistory]::BuildWindows($fetch.Notes, 30 * $tpm, $graceTicks)
         #endregion
 
         #region Classify the failing minutes
@@ -3887,26 +4103,41 @@ foreach ($res in $resources) {
 #endregion
 
 #region Step 6b: Investigate the suspect minutes
-# With -SourceWorkspaceId, Activity Log events and older Resource Health history are fetched
-# in bulk from Log Analytics; Resource Health transitions complement the REST API data in
-# hybrid mode (the workspace covers the period before the ~30-day REST retention, REST is
-# authoritative for the last ~30 days).
+# With -SourceWorkspaceId, Activity Log events and Resource Health history are fetched
+# in bulk from Log Analytics and combined with the REST history (see "Resource Health history" in the README).
+# The workspace is also asked about every SQL database: one whose history shows a platform health event
+# is investigated even without a zero minute, to report the brief failures the metric does not count.
 $logAnalyticsData = $null
-if ($SourceWorkspaceId -and $suspectCandidates.Count -gt 0) {
+$sqlResources = @($resources | Where-Object { $_.Kind -eq 'AzureSqlDatabase' -and $metricResults.ContainsKey($_.ResourceId.ToLowerInvariant()) -and
+        -not $metricResults[$_.ResourceId.ToLowerInvariant()].ExcludeFromAvailability })
+if ($SourceWorkspaceId -and ($suspectCandidates.Count -gt 0 -or $sqlResources.Count -gt 0)) {
     Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
     $laTokenStr = Get-PlainToken 'https://api.loganalytics.io'
+    $laResourceIds = @(@($suspectCandidates | ForEach-Object { $_.ResourceId }) + @($sqlResources | ForEach-Object { $_.ResourceId }))
     $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId `
-        -SubscriptionIds $subIds -ResourceIds @($suspectCandidates.ResourceId) `
+        -SubscriptionIds $subIds -ResourceIds $laResourceIds `
         -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -ArmToken $laTokenStr
     $laTokenStr = $null
+
+    $investigated = [System.Collections.Generic.HashSet[string]]::new([string[]]@($suspectCandidates | ForEach-Object { $_.ResourceId.ToLowerInvariant() }))
+    foreach ($res in $sqlResources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        if ($investigated.Contains($key) -or -not $logAnalyticsData.ContainsKey($key)) { continue }
+        $platformEvent = @($logAnalyticsData[$key].HealthRaw | Where-Object { $_.State -in 'Unavailable', 'Degraded' -and $_.Cause -ne 'UserInitiated' })
+        if ($platformEvent.Count -eq 0) { continue }
+        $suspectCandidates.Add([PSCustomObject]@{
+            Name = $res.Name; Kind = $res.Kind; ResourceId = $res.ResourceId; SubscriptionId = $res.SubscriptionId
+            CreationTime = $res.CreationTime; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @(); DegradedTicks = @(); DegradedValues = @()
+        })
+    }
 }
 
 $suspectResults = $null
 if ($suspectCandidates.Count -gt 0) {
     $suspectResults = Invoke-SuspectGapInvestigation -Candidates @($suspectCandidates) `
         -PeriodStart $utcStart -PeriodEnd $utcEnd -ThrottleLimit $Parallelism `
-        -GraceMinutes $ActivityGraceMinutes -FaultWindowMinutes $FaultWindowMinutes -ArmToken $armToken `
+        -GraceMinutes $ActivityGraceMinutes -FaultWindowMinutes $FaultWindowMinutes -HealthLeadMinutes $HealthLeadMinutes -ArmToken $armToken `
         -HealthCoverageStart $healthCoverageStart `
         -LogAnalyticsData $logAnalyticsData
 }
@@ -3979,9 +4210,10 @@ foreach ($res in $resources) {
 
             $activityExplainedSuspectMinutes = $gc.ActivityLogExcludedGapMinutes + $gc.ActivityLogDegradedMinutes
             $remainingAfterActivity = $totalSuspectMinutes - $activityExplainedSuspectMinutes
-            if ($gc.VmOutcomeText) {
-                # VM algorithm: one line with what decided the suspect minutes.
-                Write-Host "  [$($res.Name)] VM algorithm classified suspect min: $($gc.VmOutcomeText)"
+            if ($gc.OutcomeText) {
+                # Algorithm kinds (VM, SQL): one line with what decided the suspect minutes, then the evidence.
+                Write-Host "  [$($res.Name)] $($gc.OutcomeLabel) classified suspect min: $($gc.OutcomeText)"
+                foreach ($line in $gc.Evidence) { Write-Host "  [$($res.Name)]   $line" }
             }
             elseif ($remainingAfterActivity -gt 0) {
                 Write-Host "  [$($res.Name)] checked against Activity Log: $activityExplainedSuspectMinutes suspect min explained by admin lifecycle events, $remainingAfterActivity remain for Health History / fallback rules"
@@ -3989,8 +4221,8 @@ foreach ($res in $resources) {
                 Write-Host "  [$($res.Name)] checked against Activity Log: $activityExplainedSuspectMinutes suspect min explained by admin lifecycle events"
             }
 
-            if ($gc.VmOutcomeText) {
-                # Already covered by the VM algorithm line above.
+            if ($gc.OutcomeText) {
+                # Already covered by the algorithm line above.
             }
             elseif ($remainingAfterActivity -gt 0 -and $gc.HealthHistoryApplied) {
                 $healthExplainedSuspectMinutes = $gc.HealthExplainedGapMinutes + ($gc.CustomerExcusedDegradedMinutes - $gc.ActivityLogDegradedMinutes)
@@ -3998,6 +4230,11 @@ foreach ($res in $resources) {
             } elseif ($remainingAfterActivity -gt 0) {
                 Write-Host "  [$($res.Name)] Health History skipped for remaining suspect min (outside current retention window); applying fallback rules directly"
             }
+        }
+
+        if ($totalSuspectMinutes -le 0 -and $gc.Evidence) {
+            # Investigated without any suspect minute (a SQL database with a platform health event): evidence only.
+            foreach ($line in $gc.Evidence) { Write-Host "  [$($res.Name)] $line" }
         }
 
         if ($gc.MetricIssueNullMinutes -gt 0) {
@@ -4014,12 +4251,12 @@ foreach ($res in $resources) {
             }
             Write-Host "  [$($res.Name)] $($gc.CustomerExcusedDegradedMinutes) degraded suspect min excluded from eligibility ($($degradedReasons -join ', '))"
         }
-        # The VM algorithm line above already says what decided each minute, and a VM fault can come from the
+        # The algorithm line above already says what decided each minute, and a VM fault can come from the
         # metric's Context rather than from Resource Health, so these Health History lines are for other kinds.
-        if ($gc.PlatformFaultGapMinutes -gt 0 -and -not $gc.VmOutcomeText) {
+        if ($gc.PlatformFaultGapMinutes -gt 0 -and -not $gc.OutcomeText) {
             Write-Host "  [$($res.Name)] $($gc.PlatformFaultGapMinutes) gap min confirmed as downtime (Health History platform issue)"
         }
-        if ($gc.HealthConfirmedDegradedMinutes -gt 0 -and -not $gc.VmOutcomeText) {
+        if ($gc.HealthConfirmedDegradedMinutes -gt 0 -and -not $gc.OutcomeText) {
             Write-Host "  [$($res.Name)] $($gc.HealthConfirmedDegradedMinutes) degraded suspect min confirmed as downtime (Health History platform issue)"
         }
         if ($gc.UnresolvedZeroDowntimeMinutes -gt 0) {
