@@ -536,6 +536,45 @@ function Get-RestHealthCutoff {
 
 <#
 .SYNOPSIS
+    Prepares the Resource Health history sources shared by the VM and storage algorithms.
+
+.DESCRIPTION
+    Both algorithms read Resource Health history the same way (see HealthHistory in the compiled code):
+    the REST history and, when a workspace is used, the Activity Log events of the whole period are
+    combined. This function converts the workspace rows to notes once, before the parallel work starts,
+    and decides whether the REST history is worth reading: it is skipped only when a workspace is
+    available and the whole period predates the REST retention.
+
+.PARAMETER LogAnalyticsData
+    Optional output of Get-LogAnalyticsData.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.OUTPUTS
+    PSCustomObject with UseRest (bool) and WorkspaceNotes (hashtable: lowercase resource ID -> list of HealthNote).
+#>
+function Get-HealthSources {
+    param(
+        [hashtable]$LogAnalyticsData,
+        [DateTimeOffset]$PeriodEnd
+    )
+    $workspaceNotes = @{}
+    foreach ($entry in ($LogAnalyticsData ?? @{}).GetEnumerator()) {
+        $list = [System.Collections.Generic.List[HealthNote]]::new()
+        foreach ($raw in $entry.Value.HealthRaw) {
+            $list.Add([HealthHistory]::FromWorkspace($raw.Timestamp.UtcTicks, $raw.State, $raw.Title, $raw.Cause))
+        }
+        $workspaceNotes[$entry.Key] = $list
+    }
+    [PSCustomObject]@{
+        UseRest        = (-not $LogAnalyticsData) -or $PeriodEnd -gt (Get-RestHealthCutoff)
+        WorkspaceNotes = $workspaceNotes
+    }
+}
+
+<#
+.SYNOPSIS
     Returns the start of the period covered by Resource Health history.
 
 .DESCRIPTION
@@ -1127,27 +1166,100 @@ public static class AzHttp
     }
 }
 
-/// <summary>Hourly request counts of a storage account: server failures and counted requests.</summary>
-public sealed class StorageHourly
-{
-    public double[] Failed;    // ServerOtherError + ServerTimeoutError per hour
-    public double[] Counted;   // Success + failed per hour
-}
-
-/// <summary>One Resource Health history entry of a storage account.</summary>
-public sealed class StorageHealthNote
+/// <summary>One Resource Health history entry, from the REST API or from the Activity Log in Log Analytics.</summary>
+public sealed class HealthNote
 {
     public long   Ticks;
     public string State   = "";
     public string Title   = "";
     public string Summary = "";
-    public bool   Customer;   // caused by the customer (user-initiated, or a throttling note)
+    public string Reason  = "";   // REST reasonType wording ("Unplanned", "Planned", "Customer Initiated", ...)
+    public bool   Customer;       // caused by the customer
 }
 
-public sealed class StorageHealthPage
+public sealed class HealthFetch
 {
-    public List<StorageHealthNote> Notes = new List<StorageHealthNote>();
-    public string NextLink = "";
+    public List<HealthNote> Notes = new List<HealthNote>();
+    public string Error = "";     // set when the REST history could not be read; Notes then hold the workspace notes only
+}
+
+/// <summary>
+/// The one way every algorithm reads Resource Health history: the REST availabilityStatuses history
+/// (about the last 30 days) and the Resource Health events of the Activity Log in a Log Analytics
+/// workspace are combined. Neither is complete on its own: the REST history can omit short events that
+/// the Activity Log still holds, and the workspace lags behind and only reaches back as far as its
+/// retention. The notes of both sources are simply returned together; the algorithms tolerate duplicates.
+/// </summary>
+public static class HealthHistory
+{
+    private static long ParseTicks(string s)
+        => DateTime.Parse(s, System.Globalization.CultureInfo.InvariantCulture,
+               System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal).Ticks;
+
+    /// <summary>Builds a note from an Activity Log row: UserInitiated is the customer, PlatformInitiated maps to "Unplanned".</summary>
+    public static HealthNote FromWorkspace(long ticks, string state, string title, string cause)
+        => new HealthNote
+        {
+            Ticks = ticks, State = state ?? "", Title = title ?? "",
+            Reason = string.Equals(cause, "PlatformInitiated", StringComparison.Ordinal) ? "Unplanned" : "",
+            Customer = string.Equals(cause, "UserInitiated", StringComparison.Ordinal)
+        };
+
+    /// <summary>Parses one page of the REST history; returns the next page link, or "".</summary>
+    private static string ParsePage(JsonDocument doc, List<HealthNote> notes)
+    {
+        var root = doc.RootElement;
+        string next = root.TryGetProperty("nextLink", out var nl) && nl.ValueKind == JsonValueKind.String ? nl.GetString() ?? "" : "";
+        if (!root.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Array) return next;
+        foreach (var item in value.EnumerateArray())
+        {
+            if (!item.TryGetProperty("properties", out var p)) continue;
+            string Str(string name) => p.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() ?? "" : "";
+            string occurred = Str("occuredTime");   // sic: the API spells it this way
+            if (occurred.Length == 0) continue;
+            string reason = Str("reasonType");
+            notes.Add(new HealthNote
+            {
+                Ticks   = ParseTicks(occurred),
+                State   = Str("availabilityState"),
+                Title   = Str("title"),
+                Summary = Str("summary"),
+                Reason  = reason,
+                Customer = reason.Equals("Customer Initiated", StringComparison.OrdinalIgnoreCase) ||
+                           reason.Equals("User Initiated", StringComparison.OrdinalIgnoreCase) ||
+                           Str("context").Equals("Customer Initiated", StringComparison.OrdinalIgnoreCase) ||
+                           Str("healthEventCause").Equals("UserInitiated", StringComparison.OrdinalIgnoreCase)
+            });
+        }
+        return next;
+    }
+
+    /// <summary>
+    /// Returns the workspace notes plus, when useRest is true, every page of the REST history.
+    /// useRest is false when the whole period predates the REST retention and a workspace is available.
+    /// </summary>
+    public static HealthFetch Collect(HttpClient client, string resourceId, List<HealthNote> workspaceNotes, bool useRest)
+    {
+        var result = new HealthFetch();
+        if (workspaceNotes != null) result.Notes.AddRange(workspaceNotes);
+        if (!useRest) return result;
+        string url = "https://management.azure.com" + resourceId +
+                     "/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2025-05-01";
+        while (url.Length > 0)
+        {
+            var http = AzHttp.Get(client, url);
+            if (http.Doc == null) { result.Error = http.Error; break; }
+            using (http.Doc) url = ParsePage(http.Doc, result.Notes);
+        }
+        return result;
+    }
+}
+
+/// <summary>Hourly request counts of a storage account: server failures and counted requests.</summary>
+public sealed class StorageHourly
+{
+    public double[] Failed;    // ServerOtherError + ServerTimeoutError per hour
+    public double[] Counted;   // Success + failed per hour
 }
 
 /// <summary>
@@ -1210,37 +1322,6 @@ public static class StorageParser
     /// <summary>Adds a minute (PT1M) response into the per-minute arrays of the period.</summary>
     public static void AddMinutes(JsonDocument doc, long startTicks, double[] failed, double[] counted)
         => Accumulate(doc, startTicks, TimeSpan.TicksPerMinute, failed, counted);
-
-    /// <summary>Parses one page of the Resource Health availabilityStatuses history.</summary>
-    public static StorageHealthPage ParseHealth(JsonDocument doc)
-    {
-        var page = new StorageHealthPage();
-        var root = doc.RootElement;
-        if (root.TryGetProperty("nextLink", out var next) && next.ValueKind == JsonValueKind.String)
-            page.NextLink = next.GetString() ?? "";
-        if (!root.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Array) return page;
-        foreach (var item in value.EnumerateArray())
-        {
-            if (!item.TryGetProperty("properties", out var p)) continue;
-            string Str(string name) => p.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() ?? "" : "";
-            string occurred = Str("occuredTime");
-            if (occurred.Length == 0) continue;
-            string title = Str("title"), reason = Str("reasonType");
-            page.Notes.Add(new StorageHealthNote
-            {
-                Ticks    = ParseTicks(occurred),
-                State    = Str("availabilityState"),
-                Title    = title,
-                Summary  = Str("summary"),
-                Customer = reason.IndexOf("Customer", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                           reason.IndexOf("User", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                           Str("context").IndexOf("Customer", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                           Str("healthEventCause").Equals("UserInitiated", StringComparison.OrdinalIgnoreCase) ||
-                           title.IndexOf("Throttl", StringComparison.OrdinalIgnoreCase) >= 0
-            });
-        }
-        return page;
-    }
 }
 
 public static class MetricProcessor
@@ -2116,6 +2197,8 @@ function Get-AvailabilityMetrics {
     Virtual machines use the VM algorithm (README, "Algorithms"): zero minutes are attributed with
     the metric's Context dimension, Resource Health notes are classified by what they say, platform
     notes explain minutes only within a bounded window, and a gap stays explained by what started it.
+    Their Resource Health notes come from the REST history and the workspace combined, exactly as
+    for storage accounts (see Get-HealthSources).
 
     Other kinds use the interval-based precedence:
       1. Platform fault (Resource Health)       -> stays eligible, counts as downtime
@@ -2125,9 +2208,10 @@ function Get-AvailabilityMetrics {
       5. Remaining 0%                            -> trusted as downtime
       6. Remaining degraded (0% < v < 100%)     -> trusted as degraded availability
 
-    When Log Analytics data is provided, Activity Log uses pre-fetched events; Resource Health uses a
-    hybrid approach: workspace history older than the REST API ~30-day retention cutoff is merged with
-    REST API history for the last ~30 days. Without Log Analytics, REST APIs are the sole data source.
+    When Log Analytics data is provided, Activity Log uses pre-fetched events. For the other kinds,
+    Resource Health uses a hybrid approach: workspace history older than the REST API ~30-day
+    retention cutoff is merged with REST API history for the last ~30 days. Without Log Analytics,
+    REST APIs are the sole data source.
 
 .PARAMETER Candidates
     Resources with at least one suspect minute, with their null, zero and degraded ticks.
@@ -2181,6 +2265,7 @@ function Invoke-SuspectGapInvestigation {
     # REST API Resource Health retention cutoff — in hybrid mode, LA transitions
     # older than this are kept and REST transitions cover the last ~30 days.
     $restHealthCutoff = Get-RestHealthCutoff
+    $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
 
     # Shared HttpClient for REST API calls within the parallel block.
     # Always created: needed for Resource Health REST calls (sole source
@@ -2200,6 +2285,7 @@ function Invoke-SuspectGapInvestigation {
         $hcStart     = $using:HealthCoverageStart
         $laData      = $using:LogAnalyticsData
         $restCutoff  = $using:restHealthCutoff
+        $healthSources = $using:healthSources
 
         # Pre-fetched Log Analytics data for this resource (if available)
         $resLaData = $null
@@ -2739,98 +2825,82 @@ function Invoke-SuspectGapInvestigation {
 
         if ($healthHistoryApplied) {
             try {
-                $transitions = [System.Collections.Generic.List[object]]::new()
-
-                # In hybrid mode, add LA transitions older than the REST cutoff
-                if ($laData -and $resLaData -and $resLaData.HealthTransitions.Count -gt 0) {
-                    foreach ($ht in $resLaData.HealthTransitions) {
-                        if ($ht.OccurredOn -lt $restCutoff) {
-                            $transitions.Add($ht)
-                        }
-                    }
-                }
-
-                # VM algorithm: the same older workspace history, as raw notes. A note is customer-
-                # caused when its cause is UserInitiated; PlatformInitiated maps to 'Unplanned'.
-                if ($c.Kind -eq 'VirtualMachine' -and $resLaData -and $resLaData.PSObject.Properties['HealthRaw']) {
-                    foreach ($raw in $resLaData.HealthRaw) {
-                        if ($raw.Timestamp -ge $restCutoff) { continue }
-                        $rawReason = if ($raw.Cause -eq 'PlatformInitiated') { 'Unplanned' } else { '' }
+                if ($c.Kind -eq 'VirtualMachine') {
+                    # VM algorithm: REST history and workspace notes combined (see Get-HealthSources),
+                    # each note classified by title, state and reason.
+                    $fetch = [HealthHistory]::Collect($client, $c.ResourceId,
+                        $healthSources.WorkspaceNotes[$c.ResourceId.ToLowerInvariant()], $healthSources.UseRest)
+                    if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($c.Name)': $($fetch.Error)" }
+                    foreach ($note in $fetch.Notes) {
                         $vmEntries.Add([PSCustomObject]@{
-                            Ticks = $raw.Timestamp.UtcTicks
-                            Class = [VmHealthClassifier]::Classify($raw.Title, $raw.State, ($raw.Cause -eq 'UserInitiated'), $rawReason)
+                            Ticks = $note.Ticks
+                            Class = [VmHealthClassifier]::Classify($note.Title, $note.State, $note.Customer, $note.Reason)
                         })
                     }
                 }
+                else {
+                    $transitions = [System.Collections.Generic.List[object]]::new()
 
-                # Fetch REST health transitions when they can overlap the period.
-                # In hybrid mode, Log Analytics is sufficient when the period
-                # ends before the REST API's ~30-day retention window.
-                $useRestHealth = $null -eq $laData -or $pEnd -gt $restCutoff
-                $url = if ($useRestHealth) {
-                    "https://management.azure.com$($c.ResourceId)" +
-                    "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
-                    "?api-version=2025-05-01"
-                } else { $null }
+                    # In hybrid mode, add LA transitions older than the REST cutoff
+                    if ($laData -and $resLaData -and $resLaData.HealthTransitions.Count -gt 0) {
+                        foreach ($ht in $resLaData.HealthTransitions) {
+                            if ($ht.OccurredOn -lt $restCutoff) {
+                                $transitions.Add($ht)
+                            }
+                        }
+                    }
 
-                while ($url) {
-                    $json = ArmGet $url $client
-                    $doc = [System.Text.Json.JsonDocument]::Parse($json)
-                    try {
-                        $valEl = [System.Text.Json.JsonElement]::new()
-                        if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
-                            $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
-                            foreach ($item in $valEl.EnumerateArray()) {
-                                $propsEl = [System.Text.Json.JsonElement]::new()
-                                if (-not $item.TryGetProperty('properties', [ref]$propsEl)) { continue }
+                    # Fetch REST health transitions when they can overlap the period.
+                    # In hybrid mode, Log Analytics is sufficient when the period
+                    # ends before the REST API's ~30-day retention window.
+                    $useRestHealth = $null -eq $laData -or $pEnd -gt $restCutoff
+                    $url = if ($useRestHealth) {
+                        "https://management.azure.com$($c.ResourceId)" +
+                        "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
+                        "?api-version=2025-05-01"
+                    } else { $null }
 
-                                $occurredStr = GetJsonStr $propsEl 'occuredTime'
-                                $occurred = ParseTimestamp $occurredStr
-                                if ($null -eq $occurred) { continue }
+                    while ($url) {
+                        $json = ArmGet $url $client
+                        $doc = [System.Text.Json.JsonDocument]::Parse($json)
+                        try {
+                            $valEl = [System.Text.Json.JsonElement]::new()
+                            if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
+                                $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                                foreach ($item in $valEl.EnumerateArray()) {
+                                    $propsEl = [System.Text.Json.JsonElement]::new()
+                                    if (-not $item.TryGetProperty('properties', [ref]$propsEl)) { continue }
 
-                                $transitions.Add([PSCustomObject]@{
-                                    OccurredOn       = [DateTimeOffset]$occurred
-                                    State            = GetJsonStr $propsEl 'availabilityState'
-                                    ReasonType       = GetJsonStr $propsEl 'reasonType'
-                                    Context          = GetJsonStr $propsEl 'context'
-                                    HealthEventCause = GetJsonStr $propsEl 'healthEventCause'
-                                })
+                                    $occurredStr = GetJsonStr $propsEl 'occuredTime'
+                                    $occurred = ParseTimestamp $occurredStr
+                                    if ($null -eq $occurred) { continue }
 
-                                # VM algorithm: classify the note by title, state and reason.
-                                if ($c.Kind -eq 'VirtualMachine') {
-                                    $noteReason  = GetJsonStr $propsEl 'reasonType'
-                                    $noteContext = GetJsonStr $propsEl 'context'
-                                    $noteCause   = GetJsonStr $propsEl 'healthEventCause'
-                                    $noteCust = $noteReason -in 'Customer Initiated', 'User Initiated' -or
-                                                $noteContext -eq 'Customer Initiated' -or
-                                                $noteCause -eq 'UserInitiated'
-                                    $vmEntries.Add([PSCustomObject]@{
-                                        Ticks = ([DateTimeOffset]$occurred).UtcTicks
-                                        Class = [VmHealthClassifier]::Classify(
-                                            (GetJsonStr $propsEl 'title'), (GetJsonStr $propsEl 'availabilityState'),
-                                            $noteCust, $noteReason)
+                                    $transitions.Add([PSCustomObject]@{
+                                        OccurredOn       = [DateTimeOffset]$occurred
+                                        State            = GetJsonStr $propsEl 'availabilityState'
+                                        ReasonType       = GetJsonStr $propsEl 'reasonType'
+                                        Context          = GetJsonStr $propsEl 'context'
+                                        HealthEventCause = GetJsonStr $propsEl 'healthEventCause'
                                     })
                                 }
                             }
+
+                            $nextEl = [System.Text.Json.JsonElement]::new()
+                            $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
+                                       $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                                $nextEl.GetString()
+                            } else { $null }
                         }
-
-                        $nextEl = [System.Text.Json.JsonElement]::new()
-                        $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
-                                   $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
-                            $nextEl.GetString()
-                        } else { $null }
+                        finally { $doc.Dispose() }
                     }
-                    finally { $doc.Dispose() }
-                }
 
-                # Sort transitions chronologically (REST API returns newest-
-                # first; LA data arrives in query order — sort to be safe)
-                $transArr = @($transitions | Sort-Object { $_.OccurredOn })
+                    # Sort transitions chronologically (REST API returns newest-
+                    # first; LA data arrives in query order — sort to be safe)
+                    $transArr = @($transitions | Sort-Object { $_.OccurredOn })
 
-                # Interval-based classification (every kind except VMs): the periods during which the
-                # resource was in a given health state. VMs classify each note individually instead
-                # (see $vmEntries), so the intervals are not built for them.
-                if ($c.Kind -ne 'VirtualMachine') {
+                    # Interval-based classification (every kind except VMs): the periods during which the
+                    # resource was in a given health state. VMs classify each note individually instead
+                    # (see $vmEntries), so the intervals are not built for them.
                     # Fault: unavailable or degraded for a reason that is neither unknown nor customer-initiated.
                     $faultIntervals = NewStateIntervals $transArr {
                         param($t) $t.State -ne 'Available' -and $t.State -ne 'Unknown' -and -not (IsCustomerNote $t)
@@ -3112,8 +3182,8 @@ function Invoke-StorageInvestigation {
         [hashtable]$LogAnalyticsData
     )
 
-    $restCutoff = Get-RestHealthCutoff
-    $filter     = [uri]::EscapeDataString($StorageResponseFilter)
+    $filter = [uri]::EscapeDataString($StorageResponseFilter)
+    $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
 
     $client = [System.Net.Http.HttpClient]::new()
     $client.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
@@ -3131,8 +3201,7 @@ function Invoke-StorageInvestigation {
         $hours  = $hourly.Counted.Length
         $tpm    = [TimeSpan]::TicksPerMinute
         $key    = $res.ResourceId.ToLowerInvariant()
-        $laData = $using:LogAnalyticsData
-        $cutoff = ($using:restCutoff).UtcDateTime
+        $healthSources = $using:healthSources
         $leadTicks  = $using:HealthLeadMinutes * $tpm
         $graceTicks = 2 * $tpm
 
@@ -3176,31 +3245,14 @@ function Invoke-StorageInvestigation {
         #endregion
 
         #region Resource Health windows
-        # Notes come from the REST history (about the last 30 days) and, when a workspace is used, from
-        # Log Analytics for the whole period. The two are combined because the REST history can omit
-        # short events that the Activity Log still holds. A window opens at a Degraded/Unavailable note
-        # and closes at the next Available note; Log Analytics "Updated" rows (Available state, Degraded
-        # title) are progress updates of the open event and are neither an opening nor a closing note.
-        $notes = [System.Collections.Generic.List[object]]::new()
-        if ($laData -and $laData.ContainsKey($key)) {
-            foreach ($raw in $laData[$key].HealthRaw) {
-                $notes.Add([PSCustomObject]@{
-                    Ticks = $raw.Timestamp.UtcTicks; State = $raw.State; Title = $raw.Title; Summary = ''
-                    Customer = ($raw.Cause -eq 'UserInitiated') -or ($raw.Title -match 'Throttl')
-                })
-            }
-        }
-        if ($null -eq $laData -or $pEnd -gt $cutoff) {
-            $url = "https://management.azure.com$($res.ResourceId)/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2025-05-01"
-            while ($url) {
-                $http = [AzHttp]::Get($client, $url)
-                if (-not $http.Doc) { Write-Warning "Resource Health query failed for '$($res.Name)': $($http.Error)"; break }
-                try   { $page = [StorageParser]::ParseHealth($http.Doc) }
-                finally { $http.Doc.Dispose() }
-                foreach ($n in $page.Notes) { $notes.Add($n) }
-                $url = $page.NextLink
-            }
-        }
+        # Notes come from the same combined history as the VM algorithm (REST plus workspace, see
+        # Get-HealthSources). A window opens at a Degraded/Unavailable note and closes at the next
+        # Available note; Log Analytics "Updated" rows (Available state, Degraded title) are progress
+        # updates of the open event and are neither an opening nor a closing note. A throttling note
+        # is customer-caused whatever its recorded reason.
+        $fetch = [HealthHistory]::Collect($client, $res.ResourceId, $healthSources.WorkspaceNotes[$key], $healthSources.UseRest)
+        if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($res.Name)': $($fetch.Error)" }
+        $notes = $fetch.Notes
 
         $raws = [System.Collections.Generic.List[object]]::new()
         $open = $null
@@ -3210,12 +3262,12 @@ function Invoke-StorageInvestigation {
             $isCloser = $n.State -eq 'Available' -and $n.Title -notmatch 'Degraded|Throttl|Unavailable'
             if ($isOpener -and -not $open) { $open = $n }
             elseif ($isCloser -and $open) {
-                $raws.Add([PSCustomObject]@{ Start = $open.Ticks; End = $n.Ticks; Customer = $open.Customer; Title = $open.Title; Summary = $open.Summary })
+                $raws.Add([PSCustomObject]@{ Start = $open.Ticks; End = $n.Ticks; Customer = ($open.Customer -or $open.Title -match 'Throttl'); Title = $open.Title; Summary = $open.Summary })
                 $open = $null
             }
         }
         # An event that never resolved explains at most 30 minutes.
-        if ($open) { $raws.Add([PSCustomObject]@{ Start = $open.Ticks; End = $open.Ticks + 30 * $tpm; Customer = $open.Customer; Title = $open.Title; Summary = $open.Summary }) }
+        if ($open) { $raws.Add([PSCustomObject]@{ Start = $open.Ticks; End = $open.Ticks + 30 * $tpm; Customer = ($open.Customer -or $open.Title -match 'Throttl'); Title = $open.Title; Summary = $open.Summary }) }
 
         # The REST history and the workspace describe the same events: merge windows that touch.
         $windows = [System.Collections.Generic.List[object]]::new()

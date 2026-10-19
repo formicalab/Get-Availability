@@ -42,7 +42,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 | `-HealthLeadMinutes` | `5` | Storage accounts only: how many minutes before a platform health event its server failures are still attributed to it |
 | `-Batch` | off | Use the Metrics Batch API |
 | `-BatchSize` | `10` | Batch size when `-Batch` is enabled |
-| `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and older Resource Health history |
+| `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and Resource Health history |
 | `-DceEndpoint` | none | Data Collection Endpoint for ingestion |
 | `-DcrImmutableId` | none | Data Collection Rule immutable ID for ingestion |
 | `-Version` | off | Print version and exit |
@@ -79,7 +79,7 @@ Resources with zero eligible minutes are shown as `N/A`.
 ## Classification model
 
 1. Resource inventory comes from Azure Resource Graph.
-2. Azure Monitor metrics are collected: one-minute granularity for VMs, Azure SQL databases and Web Apps; request counts by response type for storage accounts.
+2. Azure Monitor metrics are collected for every resource (granularity and aggregation depend on the kind, see [Algorithms](#algorithms)).
 3. Suspect minutes are classified. Virtual machines and storage accounts follow the algorithms described in [Algorithms](#algorithms); the other kinds follow the precedence below.
 4. Final availability is computed from eligible minutes and available minutes.
 
@@ -100,7 +100,7 @@ For Azure SQL Databases and Web Apps (until their dedicated algorithms are docum
 4. Remaining nulls are treated as metric issues and excused.
 5. Remaining zero or degraded values count against availability.
 
-When `-SourceWorkspaceId` is set, Activity Log data and older Resource Health history are queried from Log Analytics in bulk, while the most recent Resource Health history still comes from the REST API and remains authoritative.
+When `-SourceWorkspaceId` is set, Activity Log data is queried from Log Analytics in bulk. For virtual machines and storage accounts, Resource Health history from the REST API and from the workspace is combined for the whole period (see [Resource Health history](#resource-health-history)). For the other kinds, workspace history covers the period before the REST retention, while the most recent Resource Health history still comes from the REST API and remains authoritative.
 
 ## Log Analytics ingestion
 
@@ -224,6 +224,17 @@ func azure functionapp publish fn-getavail-itn-001 --powershell
 
 This section describes, step by step, how each resource kind is turned into the numbers in the results table. Every algorithm answers the same question for each suspect minute: *did this minute count against availability, and why?*
 
+### Resource Health history
+
+Virtual machines and storage accounts read Resource Health history in exactly the same way. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
+
+- The REST history can omit short events that the Activity Log still holds. The same account has returned a 22-entry history with its recent `Degraded` events and, hours later, a 9-entry history without them.
+- The workspace lags behind real time and reaches back only as far as its retention.
+
+The REST history is skipped only when a workspace is set and the whole period predates the REST retention. The two sources describe the same events, so duplicates are expected, and each algorithm is built to tolerate them. Without `-SourceWorkspaceId` only the REST history is available: short events can be missing, and periods older than about 30 days have no health evidence.
+
+Azure SQL databases and Web Apps still use the older rule (workspace history for the period before the REST retention, REST authoritative for the last ~30 days) until their own algorithms are documented here.
+
 ### Virtual machines
 
 #### What the signal means
@@ -246,7 +257,7 @@ A minute that is not `1` is a **suspect minute**. The algorithm decides, for eve
 2. **Context.** Only if the VM has zero minutes, read the metric again split by `Context` and tag each zero minute with the contexts that report zero (`Platform`, `User`, `Unknown`). A zero with no `Context` information is `Unknown`.
 3. **Power-state guard.** If every minute of the period is suspect and the VM is currently `stopped` or `deallocated`, the whole period is excused and the VM is reported as `N/A`.
 4. **Activity Log.** Collect start, deallocate, power-off and restart operations, with all non-failed statuses (`Start`, `Accept`, `Success`). The first event marks when the affected minutes begin, so none of the statuses can be dropped. Events are grouped by operation and correlation ID; each group becomes a lifecycle window from its first event to its last event plus one minute plus `-ActivityGraceMinutes`. Overlapping windows are merged. The period before the VM's creation time is a separate *did not exist* window.
-5. **Resource Health.** Read the REST history (about the last 30 days) and, when `-SourceWorkspaceId` is set, the workspace history for older periods. Classify every note by what it says, not by whether its state changed:
+5. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history). Classify every note by what it says, not by whether its state changed:
 
 | Class | Examples | Role |
 |---|---|---|
@@ -303,7 +314,7 @@ Three details matter in practice:
 - Faults are only as good as the evidence: a platform event that leaves the metric at `1` is not counted.
 - Rule 6 can count null minutes that happen to fall inside the window after a platform note.
 - `-FaultWindowMinutes` and `-ActivityGraceMinutes` are tunables; the defaults (30 and 10) were validated on a limited set of subscriptions.
-- Resource Health REST history covers about 30 days. Older periods rely on the metric's `Context` and on `-SourceWorkspaceId`.
+- Without `-SourceWorkspaceId` the Resource Health evidence is the REST history only (see [Resource Health history](#resource-health-history)): about 30 days, and short events can be missing. Older periods then rely on the metric's `Context`.
 
 ### Storage accounts
 
@@ -330,7 +341,7 @@ For the accounts that had at least one failed request, read the per-minute count
 
 #### Step 3: attribute each failing minute to Resource Health
 
-1. Read the Resource Health history: the REST API (about the last 30 days) and, with `-SourceWorkspaceId`, the workspace for the whole period. The two are combined because the REST history can omit short events that the Activity Log still holds.
+1. Read the Resource Health history described in [Resource Health history](#resource-health-history).
 2. A **window** opens at a `Degraded` or `Unavailable` note and closes at the next `Available` note (an event that never resolves explains at most 30 minutes). Windows of notes caused by the customer, such as `Throttled`, are *customer windows*. Windows that touch are merged.
 3. Resource Health raises its event a few minutes after the first failed requests, so a window is widened: it starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
 4. Each failing minute is decided in this order:
@@ -371,6 +382,6 @@ The narration also lists the largest incidents (failing minutes less than six mi
 - Resource Health events that cause no failed request are not counted.
 - A failing minute is attributed by time only: a platform event and an unrelated failure in the same window are both Faults.
 - `-HealthLeadMinutes` (5) and the two-minute grace after resolution were validated on a limited set of subscriptions.
-- Resource Health REST history covers about 30 days; older periods need `-SourceWorkspaceId`, otherwise every failing minute is Unresolved.
+- Without `-SourceWorkspaceId` the Resource Health evidence is the REST history only (see [Resource Health history](#resource-health-history)): short events can be missing, and for periods older than about 30 days every failing minute is Unresolved.
 
 The algorithms for Azure SQL databases and Web Apps will be added here.
