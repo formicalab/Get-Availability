@@ -9,36 +9,35 @@
     Availability pipeline:
       1. Resolve subscriptions
       2. Inventory via Resource Graph
-      3. Fetch metrics (Azure Monitor, parallel)
-      4. Investigate suspect gaps (Activity Log + Resource Health)
+      3. Measure every kind with its own signal (Azure Monitor, parallel)
+      4. Attribute the suspect minutes (Activity Log + Resource Health)
       5. Assemble results
       6. Print table + summaries
 
-    A suspect minute is any metric datapoint that is null or below 100%.
-    Contiguous suspect minutes form "suspect gaps" for narration.
+    A suspect minute is a minute that may count against availability. Every resource kind follows
+    its own algorithm, described step by step in the README ("Algorithms"):
+      - Virtual machines: the VmAvailabilityMetric. Zero minutes are attributed with the metric's
+        Context dimension (Platform / User / Unknown), Resource Health notes are classified by what
+        they say, platform notes explain minutes only within -FaultWindowMinutes, and a gap stays
+        explained by what started it. Activity Log: start/deallocate/power off/restart, creation.
+      - Azure SQL databases: the availability metric. A zero minute is excused inside a resume window
+        of the Activity Log (auto-resume of a paused serverless database), and the others are
+        matched with Resource Health.
+      - Storage accounts: the hourly server-failure rate, attributed to Resource Health.
+      - Web Apps (no availability metric): a minute is down when every request failed with a 5xx; the
+        down minutes are matched with the stop/start/restart operations of the Activity Log and with
+        Resource Health.
+    A suspect minute ends as a fault (platform), an excused minute (customer, lifecycle, not yet
+    created) or an unresolved minute; only faults and unresolved minutes count against availability.
 
-    Suspect minutes are first checked against Activity Log events:
-            - Resource creation/deletion: VM timeCreated establishes initial existence;
-                successful delete/write pairs establish later non-existence intervals.
-      - Virtual Machines: start/deallocate/power off/restart
-      - Azure SQL Databases: pause/resume
-      - Web Apps: stop/start/restart
-    Resource Health is then applied to classify remaining suspects:
-      - platform fault confirmed (Unavailable/Degraded) -> counts as downtime
-      - Unknown / customer-initiated -> valid explanation, excluded from eligibility
-    Remaining null minutes become metric issues (excluded from eligibility),
-    while remaining 0% minutes are trusted as downtime.
+    Resource Health history is read the same way for every kind: the REST history (about the last
+    30 days) and, with -SourceWorkspaceId, the Resource Health events of the Activity Log in a Log
+    Analytics workspace are combined for the whole period.
 
-    When -SourceWorkspaceId is specified, Activity Log lifecycle events are
-    fetched from a Log Analytics workspace via a single bulk KQL query instead
-    of per-resource REST API calls. This is faster for large estates and uses
-    workspace retention (typically 365 days). Resource Health data uses a
-    hybrid approach: Log Analytics transitions cover the period beyond the
-    REST API's ~30-day retention, while REST API transitions (curated,
-    synthetic, with retroactively corrected causes) are authoritative for
-    the last ~30 days. The two sources are merged to produce complete
-    coverage. Without -SourceWorkspaceId, the REST APIs are used directly.
-    Note: this is NOT the workspace used for result ingestion (see
+    When -SourceWorkspaceId is specified, Activity Log lifecycle events are fetched from the workspace
+    via a single bulk KQL query instead of per-resource REST API calls. This is faster for large
+    estates and uses workspace retention (typically 365 days). Without -SourceWorkspaceId, the REST
+    APIs are used directly. Note: this is NOT the workspace used for result ingestion (see
     -DceEndpoint / -DcrImmutableId for that).
 
     The observation window is a UTC calendar month selected via -Month YYYYMM.
@@ -60,7 +59,18 @@
     Max concurrent metric/investigation calls (default: auto-scaled to CPU cores).
 
 .PARAMETER ActivityGraceMinutes
-    Post-operation grace window for Activity Log lifecycle events (default: 10).
+    Post-operation grace window for Activity Log lifecycle events (default: 10). For Web Apps
+    it is the time after a stop, start or restart during which down minutes are excused.
+
+.PARAMETER FaultWindowMinutes
+    Virtual machines only: how long a platform Resource Health note (for example
+    "Redeploying due to host failure") can explain suspect minutes that the metric
+    does not attribute itself (default: 30).
+
+.PARAMETER HealthLeadMinutes
+    Storage accounts, SQL databases and Web Apps: how many minutes before a platform Resource
+    Health event (for example "Degraded") its failures are still attributed to it, because
+    Resource Health raises the event after the first failed requests (default: 5).
 
 .PARAMETER Batch
     Use the regional Metrics Batch API instead of per-resource metric calls.
@@ -74,10 +84,8 @@
     an existing workspace that receives Activity Log diagnostic settings from
     the target subscriptions. When provided, lifecycle events are fetched via
     a single bulk KQL query (faster for large estates, uses workspace
-    retention). Resource Health uses a hybrid approach: Log Analytics
-    transitions cover the period beyond the REST API's ~30-day retention
-    limit, while REST API transitions (curated, with corrected causes) are
-    authoritative for the last ~30 days.
+    retention). Its Resource Health events are combined with the REST
+    history for the whole period.
 
 .PARAMETER DceEndpoint
     Data Collection Endpoint ingestion URL. When both -DceEndpoint and
@@ -133,7 +141,16 @@ param(
     [int]$ActivityGraceMinutes = 10,
 
     [Parameter(ParameterSetName = 'Run')]
+    [ValidateRange(1, 240)]
+    [int]$FaultWindowMinutes = 30,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateRange(0, 60)]
+    [int]$HealthLeadMinutes = 5,
+
+    [Parameter(ParameterSetName = 'Run')]
     [switch]$Batch,
+
 
     [Parameter(ParameterSetName = 'Run')]
     [ValidateRange(1, 50)]
@@ -155,6 +172,8 @@ param(
     [switch]$Version
 )
 
+#region Script setup
+
 $ScriptVersion = '0.0.0-dev'
 
 Set-StrictMode -Version Latest
@@ -165,7 +184,7 @@ if ($Version) {
     return
 }
 
-# Validate paired ingestion parameters
+# Ingestion needs both the endpoint and the rule ID; supplying only one is a mistake.
 $sendToLogAnalytics = $false
 if ($DceEndpoint -and $DcrImmutableId) {
     $sendToLogAnalytics = $true
@@ -173,11 +192,37 @@ if ($DceEndpoint -and $DcrImmutableId) {
     throw '-DceEndpoint and -DcrImmutableId must both be provided together.'
 }
 
-# ── Log Analytics Ingestion ───────────────────────────────────────────────────
+#endregion
 
-## Sends an array of objects to a Log Analytics custom table via the Azure
-## Monitor Ingestion REST API. Gzip-compresses the JSON payload and splits
-## into multiple calls if the compressed size exceeds 900 KB (API limit is 1 MB).
+#region Log Analytics ingestion
+
+<#
+.SYNOPSIS
+    Sends objects to a Log Analytics custom table through the Azure Monitor Ingestion API.
+
+.DESCRIPTION
+    Gzip-compresses the JSON payload and sends it in one call. When the compressed size reaches
+    900 KB (the API limit is 1 MB) the payload is split into evenly sized chunks that are sent
+    one by one, each with retries.
+
+.PARAMETER Endpoint
+    Data Collection Endpoint ingestion URL.
+
+.PARAMETER RuleId
+    Data Collection Rule immutable ID.
+
+.PARAMETER StreamName
+    Stream (custom table) to send to, for example 'Custom-GetAvailResources_CL'.
+
+.PARAMETER Token
+    Bearer token for the Azure Monitor ingestion audience.
+
+.PARAMETER Payload
+    Objects to ingest. Nothing is sent when the array is empty.
+
+.OUTPUTS
+    None.
+#>
 function Send-ToLogAnalytics {
     param(
         [string]$Endpoint,
@@ -189,6 +234,7 @@ function Send-ToLogAnalytics {
 
     if ($Payload.Count -eq 0) { return }
 
+    # The API takes a gzip-compressed JSON array; the stream name selects the target table.
     $uri = "$Endpoint/dataCollectionRules/$RuleId/streams/${StreamName}?api-version=2023-01-01"
     $headers = @{
         'Authorization'    = "Bearer $Token"
@@ -196,14 +242,23 @@ function Send-ToLogAnalytics {
         'Content-Encoding' = 'gzip'
     }
 
-    # Gzip-compress a JSON array into a byte[].
-    # Returns [byte[]] directly — NOT through the pipeline — to avoid PowerShell
-    # unrolling the array into individual System.Byte objects.
+    <#
+    .SYNOPSIS
+        Gzip-compresses a JSON array.
+    .DESCRIPTION
+        Returns the byte[] directly, not through the pipeline, so PowerShell does not unroll
+        the array into individual System.Byte objects.
+    .PARAMETER Items
+        Objects serialized as one JSON array.
+    .OUTPUTS
+        System.Byte[] with the compressed JSON.
+    #>
     function Compress-JsonPayload([object[]]$Items) {
         $json = $Items | ConvertTo-Json -Depth 5 -Compress -AsArray
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $ms = [System.IO.MemoryStream]::new()
         try {
+            # The gzip stream is disposed before reading the buffer so that all compressed data is flushed.
             $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
             $gz.Write($bytes, 0, $bytes.Length)
             $gz.Dispose()
@@ -211,7 +266,16 @@ function Send-ToLogAnalytics {
         } finally { $ms.Dispose() }
     }
 
-    # POST with retry (3 attempts, exponential backoff)
+    <#
+    .SYNOPSIS
+        POSTs one compressed chunk with retries.
+    .DESCRIPTION
+        Three attempts with exponential backoff; the last failure is rethrown.
+    .PARAMETER Body
+        Gzip-compressed JSON.
+    .OUTPUTS
+        None.
+    #>
     function Send-Chunk([byte[]]$Body) {
         $maxAttempts = 3
         for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
@@ -219,6 +283,7 @@ function Send-ToLogAnalytics {
                 Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $Body -TimeoutSec 60 -StatusCodeVariable statusCode
                 return
             } catch {
+                # Backoff 2 s, then 4 s; after the last attempt the error propagates to the caller.
                 if ($attempt -eq $maxAttempts) { throw }
                 $delay = [math]::Pow(2, $attempt)
                 Write-Warning "Ingestion attempt $attempt to $StreamName failed (HTTP $statusCode): $($_.Exception.Message). Retrying in ${delay}s..."
@@ -227,14 +292,14 @@ function Send-ToLogAnalytics {
         }
     }
 
-    # Try full payload as a single call; split only if compressed size exceeds 900 KB
+    # Try the full payload as a single call; split only if the compressed size exceeds 900 KB.
     [byte[]]$compressed = Compress-JsonPayload $Payload
     if ($compressed.Length -lt 900KB) {
         Send-Chunk $compressed
         return
     }
 
-    # Estimate chunk size from compression ratio and send each chunk separately
+    # Estimate the chunk size from the compression ratio, then send each chunk separately.
     $chunkSize = [math]::Max(1, [math]::Floor($Payload.Count / [math]::Ceiling($compressed.Length / 900KB)))
     for ($i = 0; $i -lt $Payload.Count; $i += $chunkSize) {
         $chunk = @($Payload[$i..([math]::Min($i + $chunkSize - 1, $Payload.Count - 1))])
@@ -243,12 +308,40 @@ function Send-ToLogAnalytics {
     }
 }
 
-# ── Observation window ────────────────────────────────────────────────────────
+#endregion
 
-## Parses a YYYYMM string into a start/end observation window, clamped to the
-## current UTC minute.  Returns Start, End, NormalizedMonth, IsMonthToDate, and
-## TotalMinutes.  Throws if the month is in the future, older than 90 days, or
-## produces an empty period.
+#region Observation window
+
+<#
+.SYNOPSIS
+    Returns the current UTC time truncated to the minute.
+
+.DESCRIPTION
+    Metrics are one-minute data points, so every window boundary is aligned to a whole minute.
+
+.OUTPUTS
+    System.DateTimeOffset (UTC, seconds = 0).
+#>
+function Get-CurrentUtcMinute {
+    $now = [DateTimeOffset]::UtcNow
+    $now.AddTicks(-($now.Ticks % [TimeSpan]::TicksPerMinute))
+}
+
+<#
+.SYNOPSIS
+    Turns a YYYYMM string into the UTC observation window.
+
+.DESCRIPTION
+    Past months cover the whole month; the current month is month-to-date, clamped to the
+    current UTC minute. Throws when the month is in the future, started more than 90 days ago
+    (the metric retention), or would produce an empty period.
+
+.PARAMETER MonthParam
+    Month in YYYYMM format.
+
+.OUTPUTS
+    PSCustomObject with Start, End, NormalizedMonth, IsMonthToDate and TotalMinutes.
+#>
 function Resolve-ObservationWindow([string]$MonthParam) {
     $parsed = [datetime]::new(1, 1, 1)
     if (-not [datetime]::TryParseExact($MonthParam, 'yyyyMM',
@@ -256,18 +349,18 @@ function Resolve-ObservationWindow([string]$MonthParam) {
             [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
         throw '-Month must use format YYYYMM.'
     }
-    $now = [DateTimeOffset]::UtcNow
-    $currentMinute = [DateTimeOffset]::new($now.Year, $now.Month, $now.Day,
-        $now.Hour, $now.Minute, 0, [TimeSpan]::Zero)
+    $currentMinute = Get-CurrentUtcMinute
     $start = [DateTimeOffset]::new($parsed.Year, $parsed.Month, 1, 0, 0, 0, [TimeSpan]::Zero)
 
+    # Azure Monitor keeps one-minute metrics for 90 days; the current month is cut at "now".
     if ($start -ge $currentMinute) { throw '-Month must not be in the future.' }
     if ($start -lt $currentMinute.AddDays(-90)) { throw '-Month cannot start more than 90 days before now.' }
 
     $nextMonth = $start.AddMonths(1)
-    $end = if ($nextMonth -lt $currentMinute) { $nextMonth } else { $currentMinute }
+    $end = $nextMonth -lt $currentMinute ? $nextMonth : $currentMinute
     if ($end -le $start) { throw '-Month produced an empty observation period.' }
 
+    # IsMonthToDate tells whether the window was cut at "now" instead of the end of the month.
     [PSCustomObject]@{
         Start           = $start
         End             = $end
@@ -277,11 +370,38 @@ function Resolve-ObservationWindow([string]$MonthParam) {
     }
 }
 
-# ── Resource inventory via Azure Resource Graph ───────────────────────────────
+#endregion
 
-## Queries Azure Resource Graph for resources matching the requested -Kind and
-## optional -ResourceName filter across the supplied subscriptions.  Returns
-## an array of lightweight resource descriptors used by the metrics pipeline.
+#region Resource inventory (Azure Resource Graph)
+
+<#
+.SYNOPSIS
+    Lists the resources to measure through Azure Resource Graph.
+
+.DESCRIPTION
+    Queries Resource Graph for the requested resource kinds across the supplied subscriptions,
+    optionally filtered by name, and returns lightweight descriptors for the metrics pipeline.
+    SQL system databases (master) and Function Apps are excluded. The creation time is included for
+    virtual machines, SQL databases, storage accounts and Web Apps, because it marks when the resource
+    started to exist; Web Apps also carry the pricing tier of their App Service plan.
+
+.PARAMETER SubscriptionIds
+    Subscription IDs to query.
+
+.PARAMETER SubIdToName
+    Map of subscription ID to display name.
+
+.PARAMETER Kinds
+    Resource kinds: vm, sql, storage, webapp.
+
+.PARAMETER ResourceNameFilter
+    Optional resource name (or SQL 'server/database' name) to restrict the inventory to.
+
+.OUTPUTS
+    PSCustomObject[] with Name, Kind, ResourceId, SubscriptionId, SubscriptionName,
+    ResourceGroupName, Location, CreationTime and Tier (the App Service plan tier, Web Apps only),
+    sorted by subscription, kind and name.
+#>
 function Get-ResourceInventory {
     param(
         [string[]]$SubscriptionIds,
@@ -289,6 +409,7 @@ function Get-ResourceInventory {
         [string[]]$Kinds,
         [string]$ResourceNameFilter
     )
+    # Validate the requested kinds and map them to Resource Graph resource types.
     $kindToType = @{
         'vm'      = 'microsoft.compute/virtualmachines'
         'sql'     = 'microsoft.sql/servers/databases'
@@ -301,6 +422,7 @@ function Get-ResourceInventory {
     }
 
     $types = @($Kinds | ForEach-Object { $kindToType[$_] })
+    # One 'type =~' clause per requested kind.
     $typeFilter = if ($types.Count -eq 1) { "type =~ '$($types[0])'" }
                   else { ($types | ForEach-Object { "type =~ '$_'" }) -join ' or ' }
 
@@ -310,6 +432,8 @@ function Get-ResourceInventory {
         $nameFilter = "| where displayName =~ '$escaped' or name =~ '$escaped'`n"
     }
 
+    # The query drops SQL system databases and Function Apps, names SQL databases 'server/database',
+    # joins Web Apps to their App Service plan (for the tier) and picks the creation time of each kind.
     $query = @"
 resources
 | where $typeFilter
@@ -319,6 +443,8 @@ resources
 | where not(type =~ 'microsoft.sql/servers/databases' and databaseName =~ 'master')
 | extend displayName = iff(type =~ 'microsoft.sql/servers/databases', strcat(sqlServerName, '/', databaseName), name)
 ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functionapp')
+| extend planId = tolower(tostring(properties.serverFarmId))
+| join kind=leftouter (resources | where type =~ 'microsoft.web/serverfarms' | project planId = tolower(id), planTier = tostring(sku.tier)) on planId
 | extend resourceKind = case(
     type =~ 'microsoft.compute/virtualmachines', 'VirtualMachine',
     type =~ 'microsoft.sql/servers/databases', 'AzureSqlDatabase',
@@ -327,11 +453,17 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
     'Other'
 )
 | project id, name, displayName, type, subscriptionId, resourceGroup, location, resourceKind,
-          sqlServerName, databaseName,
-          creationTime=iff(type =~ 'microsoft.compute/virtualmachines', tostring(properties.timeCreated), '')
+          sqlServerName, databaseName, planTier,
+          creationTime=case(
+              type =~ 'microsoft.compute/virtualmachines', tostring(properties.timeCreated),
+              type =~ 'microsoft.storage/storageaccounts', tostring(properties.creationTime),
+              type =~ 'microsoft.sql/servers/databases', tostring(properties.creationDate),
+              type =~ 'microsoft.web/sites', tostring(properties.createdTimeUtc),
+              '')
 "@
 
     $resources = [System.Collections.Generic.List[object]]::new()
+    # Page through the Resource Graph results (1,000 rows per call) using the skip token.
     $skipToken = $null
     do {
         $params = @{ Query = $query; First = 1000; Subscription = $SubscriptionIds }
@@ -339,14 +471,19 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
         $response = Search-AzGraph @params
 
         foreach ($row in $response.Data) {
+            # Normalise each row into the descriptor used by the rest of the pipeline.
             $kind = [string]$row.resourceKind
             $subId = [string]$row.subscriptionId
             $name = if ($row.displayName) { [string]$row.displayName } else { [string]$row.name }
+            # Resource Graph returns the creation time either as a DateTime or as an
+            # ISO string, depending on the Az.ResourceGraph version; normalise to UTC.
             $creationTime = $null
-            if ($kind -eq 'VirtualMachine' -and $row.creationTime) {
+            # Only the kinds that carry a creation time are read; an empty value is skipped.
+            if ($kind -in 'VirtualMachine', 'StorageAccount', 'AzureSqlDatabase', 'WebApp' -and $row.creationTime) {
                 if ($row.creationTime -is [datetime]) {
                     $creationTime = ([DateTimeOffset][datetime]$row.creationTime).ToUniversalTime()
                 } else {
+                    # A string without an offset is taken as UTC.
                     $parsedCreationTime = [DateTimeOffset]::MinValue
                     if ([DateTimeOffset]::TryParse(
                             [string]$row.creationTime,
@@ -357,15 +494,17 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
                     }
                 }
             }
+            # Tier is only filled for Web Apps (it comes from their App Service plan).
             $resources.Add([PSCustomObject]@{
                 Name              = $name
                 Kind              = $kind
                 ResourceId        = [string]$row.id
                 SubscriptionId    = $subId
-                SubscriptionName  = $SubIdToName.ContainsKey($subId) ? $SubIdToName[$subId] : $subId
+                SubscriptionName  = $SubIdToName[$subId] ?? $subId
                 ResourceGroupName = [string]$row.resourceGroup
                 Location          = [string]$row.location
                 CreationTime      = $creationTime
+                Tier              = [string]$row.planTier
             })
         }
         $skipToken = [string]::IsNullOrWhiteSpace($response.SkipToken) ? $null : $response.SkipToken
@@ -374,54 +513,179 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
     @($resources | Sort-Object SubscriptionName, Kind, Name)
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+#endregion
 
-## Abbreviates a resource kind for compact table/summary display.
+#region Helpers
+
+<#
+.SYNOPSIS
+    Abbreviates a resource kind for compact table and summary output.
+
+.PARAMETER Kind
+    Resource kind (VirtualMachine, AzureSqlDatabase, StorageAccount, WebApp).
+
+.OUTPUTS
+    System.String - VM, SQL, Storage or Web; unknown kinds are returned unchanged.
+#>
 function Get-ShortKind([string]$Kind) {
-    switch ($Kind) {
-        'VirtualMachine'   { 'VM' }
-        'AzureSqlDatabase' { 'SQL' }
-        'StorageAccount'   { 'Storage' }
-        'WebApp'           { 'Web' }
-        default            { $Kind }
+    $short = @{ VirtualMachine = 'VM'; AzureSqlDatabase = 'SQL'; StorageAccount = 'Storage'; WebApp = 'Web' }
+    $short[$Kind] ?? $Kind
+}
+
+<#
+.SYNOPSIS
+    Returns the ~30-day Resource Health REST retention cutoff.
+
+.DESCRIPTION
+    The REST history only reaches back about 30 days. A period that ends before this cutoff can be
+    answered from the workspace alone, so the REST history is skipped then (see Get-HealthSources).
+
+.OUTPUTS
+    System.DateTimeOffset - the current UTC minute minus 30 days.
+#>
+function Get-RestHealthCutoff {
+    (Get-CurrentUtcMinute).AddDays(-30)
+}
+
+<#
+.SYNOPSIS
+    Prepares the Resource Health history sources shared by every algorithm.
+
+.DESCRIPTION
+    All algorithms read Resource Health history the same way (see HealthHistory in the compiled code):
+    the REST history and, when a workspace is used, the Activity Log events of the whole period are
+    combined. This function converts the workspace rows to notes once, before the parallel work starts,
+    and decides whether the REST history is worth reading: it is skipped only when a workspace is
+    available and the whole period predates the REST retention.
+
+.PARAMETER LogAnalyticsData
+    Optional output of Get-LogAnalyticsData.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.OUTPUTS
+    PSCustomObject with UseRest (bool) and WorkspaceNotes (hashtable: lowercase resource ID -> list of HealthNote).
+#>
+function Get-HealthSources {
+    param(
+        [hashtable]$LogAnalyticsData,
+        [DateTimeOffset]$PeriodEnd
+    )
+    $workspaceNotes = @{}
+    # Convert the workspace rows to HealthNote objects here, once, so the parallel runspaces share them.
+    foreach ($entry in ($LogAnalyticsData ?? @{}).GetEnumerator()) {
+        $list = [System.Collections.Generic.List[HealthNote]]::new()
+        foreach ($raw in $entry.Value.HealthRaw) {
+            $list.Add([HealthHistory]::FromWorkspace($raw.Timestamp.UtcTicks, $raw.State, $raw.Title, $raw.Cause))
+        }
+        $workspaceNotes[$entry.Key] = $list
+    }
+    [PSCustomObject]@{
+        UseRest        = (-not $LogAnalyticsData) -or $PeriodEnd -gt (Get-RestHealthCutoff)
+        WorkspaceNotes = $workspaceNotes
     }
 }
 
-## Returns the effective start of the Resource Health coverage window, clamped
-## to PeriodStart if coverage spans the full observation period.
-## When using Log Analytics (-SourceWorkspaceId), the hybrid approach (LA for
-## older transitions + REST API for the last ~30 days) provides coverage from
-## PeriodStart. Without -SourceWorkspaceId, coverage is limited to ~30 days.
+<#
+.SYNOPSIS
+    Returns the start of the period covered by Resource Health history.
+
+.DESCRIPTION
+    With -UseLogAnalytics the workspace (older history) and the REST history (last ~30 days) together
+    cover the whole period. Without it, coverage is limited to the REST retention.
+
+.PARAMETER PeriodStart
+    Start of the observation window; coverage never starts before it.
+
+.PARAMETER UseLogAnalytics
+    Set when a source workspace supplies the older history.
+
+.OUTPUTS
+    System.DateTimeOffset.
+#>
 function Get-HealthCoverageStart([DateTimeOffset]$PeriodStart, [switch]$UseLogAnalytics) {
     if ($UseLogAnalytics) { return $PeriodStart }
-    $now = [DateTimeOffset]::UtcNow
-    $cm = [DateTimeOffset]::new($now.Year, $now.Month, $now.Day,
-        $now.Hour, $now.Minute, 0, [TimeSpan]::Zero)
-    $ret = $cm.AddDays(-30)
-    $ret -gt $PeriodStart ? $ret : $PeriodStart
+    $cutoff = Get-RestHealthCutoff
+    $cutoff -gt $PeriodStart ? $cutoff : $PeriodStart
 }
 
-## Returns the REST API Resource Health retention cutoff (~30 days from now).
-## In hybrid mode, LA transitions older than this cutoff are kept and REST
-## transitions supplement the last ~30 days with authoritative curated data.
-function Get-RestHealthCutoff {
-    $now = [DateTimeOffset]::UtcNow
-    $cm = [DateTimeOffset]::new($now.Year, $now.Month, $now.Day,
-        $now.Hour, $now.Minute, 0, [TimeSpan]::Zero)
-    $cm.AddDays(-30)
+<#
+.SYNOPSIS
+    Truncates a string to a maximum length, ending with '...' when shortened.
+
+.PARAMETER s
+    Text to truncate.
+
+.PARAMETER max
+    Maximum length of the result.
+
+.OUTPUTS
+    System.String.
+#>
+function Get-TruncatedString([string]$s, [int]$max) {
+    $s.Length -le $max ? $s : ($s.Substring(0, $max - 3) + '...')
 }
 
-# ── Log Analytics bulk data fetch ─────────────────────────────────────────────
+<#
+.SYNOPSIS
+    Acquires a plain-text bearer token through Az.Accounts.
 
-## Fetches Activity Log events (lifecycle operations + creation/deletion) and
-## Resource Health transitions for the given subscriptions and resource types
-## from a Log Analytics workspace in a single KQL query.
-## Returns a hashtable keyed by lowercase resource ID, each value containing
-## ActivityEvents and HealthTransitions arrays.
-## ActivityEvents are used for lifecycle classification and existence tracking.
-## HealthTransitions are used only for transitions older than the REST API's
-## ~30-day retention cutoff; the investigation function merges them with REST
-## API transitions for the last ~30 days to form complete coverage.
+.DESCRIPTION
+    Handles both the SecureString returned by Az.Accounts 5.x and the plain string returned
+    by older versions.
+
+.PARAMETER ResourceUrl
+    Token audience, for example 'https://management.azure.com'.
+
+.OUTPUTS
+    System.String - the access token.
+#>
+function Get-PlainToken([string]$ResourceUrl) {
+    $raw = (Get-AzAccessToken -ResourceUrl $ResourceUrl).Token
+    ($raw -is [securestring]) ? ($raw | ConvertFrom-SecureString -AsPlainText) : [string]$raw
+}
+
+#endregion
+
+#region Log Analytics bulk data fetch
+
+<#
+.SYNOPSIS
+    Bulk-fetches Activity Log events and Resource Health history from a Log Analytics workspace.
+
+.DESCRIPTION
+    Runs a single KQL query that returns Activity Log events (lifecycle operations plus
+    creation/deletion) and Resource Health events for the given subscriptions and
+    resources. All non-failed Activity Log statuses are kept: a lifecycle operation is
+    logged as Start, Accept and Success, and the Start event marks when the minutes it
+    affects begin, so filtering on Success alone leaves those first minutes unexplained.
+
+    ActivityEvents drive lifecycle classification and existence tracking. HealthRaw keeps every
+    Resource Health event (state, cause, title); the algorithms turn it into notes and windows
+    (see Get-HealthSources and HealthHistory).
+
+.PARAMETER WorkspaceId
+    Log Analytics workspace ID (GUID) that receives the Activity Log of the subscriptions.
+
+.PARAMETER SubscriptionIds
+    Subscription IDs to query.
+
+.PARAMETER ResourceIds
+    Resource IDs of the resources under investigation.
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ArmToken
+    Bearer token for the Log Analytics API.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID; each value has ActivityEvents and HealthRaw lists.
+#>
 function Get-LogAnalyticsData {
     param(
         [string]$WorkspaceId,
@@ -432,8 +696,10 @@ function Get-LogAnalyticsData {
         [string]$ArmToken
     )
 
+    # Period bounds as ISO 8601 text for the KQL datetime() literals.
     $startIso = $PeriodStart.ToString('O')
     $endIso   = $PeriodEnd.ToString('O')
+    # Quote the subscription and resource lists as KQL string literals (resource IDs are compared in lower case).
     $subList  = ($SubscriptionIds | ForEach-Object { "'$_'" }) -join ', '
     $normalizedResourceIds = @($ResourceIds |
         ForEach-Object { $_.ToLowerInvariant() } |
@@ -442,8 +708,9 @@ function Get-LogAnalyticsData {
         "'$($_.Replace("'", "''"))'"
     }) -join ', '
 
+    #region Query the workspace
     # Single KQL query that fetches both Activity Log operations and Resource
-    # Health transitions, tagged with a Source column to distinguish them.
+    # Health events, tagged with a Source column to distinguish them.
     $kql = @"
 let subs = dynamic([$subList]);
 let resourceIds = dynamic([$resourceList]);
@@ -452,25 +719,22 @@ let actOps = dynamic([
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/DEALLOCATE/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/POWEROFF/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/RESTART/ACTION',
-  'MICROSOFT.SQL/SERVERS/DATABASES/PAUSE/ACTION',
+  'MICROSOFT.SQL/SERVERS/DATABASES/RESUME',
   'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION',
   'MICROSOFT.WEB/SITES/STOP/ACTION',
   'MICROSOFT.WEB/SITES/START/ACTION',
   'MICROSOFT.WEB/SITES/RESTART/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE',
   'MICROSOFT.SQL/SERVERS/DATABASES/WRITE',
-  'MICROSOFT.STORAGE/STORAGEACCOUNTS/WRITE',
-  'MICROSOFT.WEB/SITES/WRITE',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/DELETE',
-  'MICROSOFT.SQL/SERVERS/DATABASES/DELETE',
-  'MICROSOFT.STORAGE/STORAGEACCOUNTS/DELETE',
-  'MICROSOFT.WEB/SITES/DELETE'
+  'MICROSOFT.SQL/SERVERS/DATABASES/DELETE'
 ]);
 let actData = AzureActivity
     | where SubscriptionId in (subs)
     | where CategoryValue == 'Administrative'
     | where OperationNameValue in~ (actOps)
-    | where ActivityStatusValue == 'Success'
+    // Keep Start/Accept as well as Success: the first event marks when the affected minutes begin.
+    | where ActivityStatusValue in~ ('Start', 'Started', 'Accept', 'Accepted', 'Success', 'Succeeded')
     | where TimeGenerated >= datetime($startIso) and TimeGenerated <= datetime($endIso)
     | where tolower(_ResourceId) in (resourceIds)
     | project TimeGenerated, ResourceId=tolower(_ResourceId),
@@ -498,6 +762,7 @@ actData | union healthData
     $content = $null
     $response = $null
     try {
+        # A failed query must stop the run: without it the evidence would silently be missing.
         $content = [System.Net.Http.StringContent]::new(
             $body, [System.Text.Encoding]::UTF8, 'application/json')
         $response = $httpClient.PostAsync($laUrl, $content).GetAwaiter().GetResult()
@@ -510,11 +775,14 @@ actData | union healthData
         $httpClient.Dispose()
     }
 
+    # The response is one table; columns are looked up by name because their order is not guaranteed.
     $result = $jsonStr | ConvertFrom-Json
     $table = $result.tables[0]
     $columns = @($table.columns | ForEach-Object { $_.name })
     $rows = @($table.rows)
+    #endregion
 
+    #region Parse rows into per-resource data
     # Index columns
     $iTime     = [array]::IndexOf($columns, 'TimeGenerated')
     $iResId    = [array]::IndexOf($columns, 'ResourceId')
@@ -525,14 +793,13 @@ actData | union healthData
 
     # Build per-resource data
     $dataByRes = @{}
-    $rawHealthEvents = @{}
 
     foreach ($row in $rows) {
         $resId = [string]$row[$iResId]
         if (-not $dataByRes.ContainsKey($resId)) {
             $dataByRes[$resId] = [PSCustomObject]@{
-                ActivityEvents    = [System.Collections.Generic.List[object]]::new()
-                HealthTransitions = [System.Collections.Generic.List[object]]::new()
+                ActivityEvents = [System.Collections.Generic.List[object]]::new()
+                HealthRaw      = [System.Collections.Generic.List[object]]::new()
             }
         }
         $entry = $dataByRes[$resId]
@@ -548,6 +815,7 @@ actData | union healthData
                 [System.Globalization.CultureInfo]::InvariantCulture,
                 [System.Globalization.DateTimeStyles]::AssumeUniversal)
         }
+        # 'Activity' rows are lifecycle operations; 'Health' rows are Resource Health events.
         $source = [string]$row[$iSource]
 
         if ($source -eq 'Activity') {
@@ -558,6 +826,7 @@ actData | union healthData
             })
         }
         elseif ($source -eq 'Health') {
+            # Resource Health rows carry the event as a JSON string (or object) in Properties.
             $propsRaw = $row[$iProps]
             $props = if ($propsRaw -is [string] -and $propsRaw) {
                 $propsRaw | ConvertFrom-Json
@@ -581,191 +850,57 @@ actData | union healthData
                     $rawCause = [string]$props.cause
                 }
 
-                if ($state) {
-                    # Determine incident lifecycle phase from OperationNameValue
-                    # (e.g. 'Microsoft.Resourcehealth/healthevent/Activated/action')
-                    $opName = [string]$row[$iOp]
-                    $opType = if ($opName -match '/Activated/') { 'Activated' }
-                              elseif ($opName -match '/Resolved/')  { 'Resolved' }
-                              elseif ($opName -match '/InProgress/') { 'InProgress' }
-                              else { 'Updated' }
+                # Extract the health note title (e.g. 'Redeploying due to host failure').
+                $rawTitle = ''
+                if ($props.PSObject.Properties['title']) {
+                    $rawTitle = [string]$props.title
+                }
 
-                    # Collect raw events per resource for post-processing into
-                    # clean transitions (deduplication + cause consolidation)
-                    if (-not $rawHealthEvents.ContainsKey($resId)) {
-                        $rawHealthEvents[$resId] = [System.Collections.Generic.List[object]]::new()
-                    }
-                    $rawHealthEvents[$resId].Add([PSCustomObject]@{
-                        Timestamp     = $ts
-                        State         = $state
-                        RawCause      = $rawCause
-                        OperationType = $opType
+                if ($state) {
+                    $entry.HealthRaw.Add([PSCustomObject]@{
+                        Timestamp = $ts
+                        State     = $state
+                        Cause     = $rawCause
+                        Title     = $rawTitle
                     })
                 }
             }
         }
     }
 
-    # ── Post-process health events into clean, incident-based transitions ──
-    # AzureActivity ResourceHealth events include lifecycle events (Activated,
-    # Updated, InProgress, Resolved) for each health incident.  Multiple events
-    # per incident create spurious transitions and the initial Activated event
-    # always has cause=Unknown (cause is determined later via Updated events).
-    # The REST API retroactively applies the final cause to the entire incident.
-    # This post-processing replicates that behaviour:
-    # 1. Only create transitions when the health state actually changes.
-    # 2. Track incidents (Activated/InProgress → Resolved) and collect the
-    #    latest non-Unknown cause within each incident.
-    # 3. On Resolved, retroactively apply the final cause to all transitions
-    #    in that incident.
-    # 4. Skip orphan Updated events outside any incident (stale events).
-    foreach ($resId in $rawHealthEvents.Keys) {
-        if (-not $dataByRes.ContainsKey($resId)) { continue }
-        $entry = $dataByRes[$resId]
-        $sorted = $rawHealthEvents[$resId] | Sort-Object Timestamp
-
-        $trackedState = 'Available'
-        $lastTransition = $null
-        $inIncident = $false
-        $incidentTransitions = [System.Collections.Generic.List[object]]::new()
-        $incidentCause = ''
-
-        foreach ($evt in $sorted) {
-            $st   = $evt.State
-            $rc   = $evt.RawCause
-            $op   = $evt.OperationType
-
-            # Open incident on Activated or InProgress
-            if (($op -eq 'Activated' -or $op -eq 'InProgress') -and -not $inIncident) {
-                $inIncident = $true
-                $incidentTransitions = [System.Collections.Generic.List[object]]::new()
-                $incidentCause = ''
-            }
-
-            # Track the latest non-Unknown cause within the incident
-            if ($inIncident -and $rc -and $rc -ne 'Unknown') {
-                $incidentCause = $rc
-            }
-
-            # Skip orphan Updated events (stale / out-of-incident)
-            if ($op -ne 'Activated' -and $op -ne 'InProgress' -and
-                $op -ne 'Resolved' -and -not $inIncident) {
-                continue
-            }
-
-            # Only create a transition when the state actually changes
-            if ($st -ne $trackedState) {
-                # Map LA raw cause names to the REST API's reasonType format
-                $mapped = switch ($rc) {
-                    'UserInitiated'     { 'Customer Initiated' }
-                    'PlatformInitiated' { 'Platform Initiated' }
-                    default { '' }
-                }
-                # Build a transition object matching the REST API schema so the
-                # investigation function can process both sources identically
-                $transition = [PSCustomObject]@{
-                    OccurredOn       = $evt.Timestamp
-                    State            = $st
-                    ReasonType       = $mapped
-                    Context          = if ($rc -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
-                    HealthEventCause = if ($rc -eq 'UserInitiated') { 'UserInitiated' } else { '' }
-                }
-                $entry.HealthTransitions.Add($transition)
-                $trackedState = $st
-                $lastTransition = $transition
-
-                # Track non-Available transitions for retroactive cause fix on Resolved
-                if ($inIncident -and $st -ne 'Available') {
-                    $incidentTransitions.Add($transition)
-                }
-            }
-            else {
-                # Same state — update cause on last transition if a more specific
-                # cause arrived (e.g. Updated event reveals 'UserInitiated')
-                if ($lastTransition -and $rc -and $rc -ne 'Unknown' -and
-                    $lastTransition.ReasonType -in @('', 'Unknown')) {
-                    $mapped = switch ($rc) {
-                        'UserInitiated'     { 'Customer Initiated' }
-                        'PlatformInitiated' { 'Platform Initiated' }
-                        default { $rc }
-                    }
-                    $lastTransition.ReasonType       = $mapped
-                    $lastTransition.Context          = if ($rc -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
-                    $lastTransition.HealthEventCause = if ($rc -eq 'UserInitiated') { 'UserInitiated' } else { '' }
-                }
-            }
-
-            # Close incident on Resolved — retroactively apply the final
-            # determined cause to ALL transitions in this incident, replicating
-            # the REST API's behaviour of correcting causes after the fact
-            if ($op -eq 'Resolved') {
-                if ($incidentCause -and $incidentCause -ne 'Unknown' -and
-                    $incidentTransitions.Count -gt 0) {
-                    $mapped = switch ($incidentCause) {
-                        'UserInitiated'     { 'Customer Initiated' }
-                        'PlatformInitiated' { 'Platform Initiated' }
-                        default { $incidentCause }
-                    }
-                    foreach ($t in $incidentTransitions) {
-                        $t.ReasonType       = $mapped
-                        $t.Context          = if ($incidentCause -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
-                        $t.HealthEventCause = if ($incidentCause -eq 'UserInitiated') { 'UserInitiated' } else { '' }
-                    }
-                }
-                # Reset incident tracking for next incident
-                $inIncident = $false
-                $incidentTransitions = [System.Collections.Generic.List[object]]::new()
-                $incidentCause = ''
-            }
-        }
-
-        # Handle open incident at end of event stream — incident was never
-        # Resolved (e.g. still ongoing or data truncated). Apply the best
-        # known cause retroactively to any transitions in the open incident.
-        if ($inIncident -and $incidentTransitions.Count -gt 0 -and
-            $incidentCause -and $incidentCause -ne 'Unknown') {
-            $mapped = switch ($incidentCause) {
-                'UserInitiated'     { 'Customer Initiated' }
-                'PlatformInitiated' { 'Platform Initiated' }
-                default { $incidentCause }
-            }
-            foreach ($t in $incidentTransitions) {
-                $t.ReasonType       = $mapped
-                $t.Context          = if ($incidentCause -eq 'UserInitiated') { 'Customer Initiated' } else { '' }
-                $t.HealthEventCause = if ($incidentCause -eq 'UserInitiated') { 'UserInitiated' } else { '' }
-            }
-        }
-    }
+    #endregion
 
     Write-Host "Log Analytics: fetched $($rows.Count) events for $($dataByRes.Count) resource(s)"
     $dataByRes
 }
 
-## Truncates a string to max length with '...' suffix.
-function Get-TruncatedString([string]$s, [int]$max) {
-    $s.Length -le $max ? $s : ($s.Substring(0, $max - 3) + '...')
-}
+#endregion
 
-# ── Compiled metric processor ─────────────────────────────────────────────────
-# The JSON processing loop iterates ~44 K data-points per resource (PT1M × 1
-# month).  In interpreted PowerShell that is the dominant bottleneck; compiling
-# the identical logic as C# via Add-Type makes it run at native .NET speed.
+#region Compiled helpers (C#)
+# Everything that loops over the ~44 K one-minute data points of a month per resource (metric parsing, the
+# VM, storage and Web App algorithms, HTTP with retries, Resource Health history) is compiled C#: in
+# interpreted PowerShell these loops would dominate the run time. It is one Add-Type because an assembly
+# compiled by Add-Type cannot reference another one.
 
 if (-not ([System.Management.Automation.PSTypeName]'MetricProcessor').Type) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
+using System.Net.Http;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
 
+/// <summary>What the metric processor found in the minutes of one resource's availability metric.</summary>
 public sealed class MetricProcessorResult
 {
-    public double AvailableSum;
-    public int    NumericPoints;
-    public int    ZeroTxMin;
-    public long[]   NullTicks     = Array.Empty<long>();
-    public long[]   ZeroTicks     = Array.Empty<long>();
-    public long[]   DegradedTicks = Array.Empty<long>();
-    public double[] DegradedValues = Array.Empty<double>();
+    public double AvailableSum;      // sum of the availability of the numeric minutes (1.0 = fully available)
+    public int    NumericPoints;     // minutes that carried a value
+    public long[]   NullTicks     = Array.Empty<long>();   // minutes without a value
+    public long[]   ZeroTicks     = Array.Empty<long>();   // minutes at 0%
+    public long[]   DegradedTicks = Array.Empty<long>();   // minutes between 0% and 100%
+    public double[] DegradedValues = Array.Empty<double>();  // availability of each degraded minute (0..1)
 
     public int  GapMinutes              => NullTicks.Length + ZeroTicks.Length;
     public int  DegradedMinutes         => DegradedTicks.Length;
@@ -774,6 +909,7 @@ public sealed class MetricProcessorResult
     public int  SuspectMinutes          => GapMinutes + DegradedMinutes;
 }
 
+/// <summary>One resource's metric result inside a Metrics Batch response.</summary>
 public sealed class BatchResourceResult
 {
     public string ResourceId      = "";
@@ -781,14 +917,633 @@ public sealed class BatchResourceResult
     public MetricProcessorResult Metrics = new();
 }
 
+/// <summary>
+/// The per-resource metric result consumed by the rest of the pipeline. Both the per-resource
+/// and the batch fetchers return this type, and failed queries yield an "excluded" placeholder.
+/// </summary>
+public sealed class MetricResult
+{
+    public string   ResourceId      = "";
+    public string   ResourceIdLower = "";
+    public string   Name            = "";
+    public double   AvailableSum;
+    public int      GapMinutes;
+    public bool     ExcludeFromAvailability;
+    public long[]   GapTicks        = Array.Empty<long>();
+    public long[]   ZeroAvailTicks  = Array.Empty<long>();
+    public int      DegradedMinutes;
+    public long[]   DegradedTicks   = Array.Empty<long>();
+    public double[] DegradedValues  = Array.Empty<double>();
+    public int      SuspectMinutes;
+
+    /// <summary>Builds the result of a resource whose metric response was processed.</summary>
+    public static MetricResult From(string resourceId, string name, MetricProcessorResult m)
+    {
+        return new MetricResult
+        {
+            ResourceId = resourceId, ResourceIdLower = resourceId.ToLowerInvariant(), Name = name,
+            AvailableSum = m.AvailableSum, GapMinutes = m.GapMinutes,
+            ExcludeFromAvailability = m.ExcludeFromAvailability,
+            GapTicks = m.NullTicks, ZeroAvailTicks = m.ZeroTicks,
+            DegradedMinutes = m.DegradedMinutes, DegradedTicks = m.DegradedTicks,
+            DegradedValues = m.DegradedValues, SuspectMinutes = m.SuspectMinutes
+        };
+    }
+
+    /// <summary>Builds the placeholder of a resource whose metric query or processing failed.</summary>
+    public static MetricResult Excluded(string resourceId, string name)
+    {
+        return new MetricResult
+        {
+            ResourceId = resourceId, ResourceIdLower = resourceId.ToLowerInvariant(), Name = name,
+            ExcludeFromAvailability = true
+        };
+    }
+}
+
+/// <summary>Result of an AzHttp call: the parsed JSON body, or the reason it failed.</summary>
+public sealed class HttpJsonResult
+{
+    public JsonDocument Doc;      // null when the call failed
+    public int          Status;   // last HTTP status, 0 for transport failures
+    public string       Error = "";
+}
+
+/// <summary>The one way timestamps of Azure responses are read: invariant culture, always UTC.</summary>
+public static class AzTime
+{
+    /// <summary>Parses an ISO 8601 timestamp (assumed UTC when it carries no offset) into UTC ticks.</summary>
+    public static long Ticks(string s)
+        => DateTime.Parse(s, System.Globalization.CultureInfo.InvariantCulture,
+               System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal).Ticks;
+}
+
+/// <summary>
+/// HTTP helper for Azure Monitor calls that return JSON. Retries throttling (429), server errors
+/// (5xx) and transient transport failures up to five attempts with exponential backoff (max 30 s).
+/// </summary>
+public static class AzHttp
+{
+    private const int MaxAttempts = 5;
+    private static readonly Regex Transient = new Regex(
+        @"transport|connection.*closed|reset by peer|timed?\s*out", RegexOptions.IgnoreCase);
+
+    /// <summary>Waits before the next attempt: 2, 4, 8, 16 s, then 30 s at most.</summary>
+    private static void Backoff(int attempt)
+    {
+        Thread.Sleep(TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt))));
+    }
+
+    /// <summary>Sends the request built by makeRequest (a request cannot be sent twice), retrying where it makes sense.</summary>
+    private static HttpJsonResult Send(HttpClient client, Func<HttpRequestMessage> makeRequest)
+    {
+        for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+        {
+            HttpResponseMessage resp = null;
+            try
+            {
+                using (var req = makeRequest())
+                {
+                    resp = client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+                    int sc = (int)resp.StatusCode;
+                    // Success: stream the body straight into the JSON parser (no intermediate string).
+                    if (sc >= 200 && sc < 300)
+                    {
+                        using (var stream = resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+                            return new HttpJsonResult { Doc = JsonDocument.ParseAsync(stream).GetAwaiter().GetResult(), Status = sc };
+                    }
+                    // Throttling and server errors are worth another attempt; other statuses are final.
+                    if ((sc == 429 || sc >= 500) && attempt < MaxAttempts) { Backoff(attempt); continue; }
+                    return new HttpJsonResult { Status = sc, Error = "HTTP " + sc };
+                }
+            }
+            catch (Exception ex)
+            {
+                // Transport failures (resets, timeouts) are retried too.
+                string text = ex.Message + " " + ex.GetBaseException().Message;
+                if (Transient.IsMatch(text) && attempt < MaxAttempts) { Backoff(attempt); continue; }
+                return new HttpJsonResult { Error = text };
+            }
+            finally { if (resp != null) resp.Dispose(); }
+        }
+        return new HttpJsonResult { Error = "retries exhausted" };
+    }
+
+    /// <summary>GET a URI and parse the JSON response.</summary>
+    public static HttpJsonResult Get(HttpClient client, string uri)
+    {
+        return Send(client, () => new HttpRequestMessage(HttpMethod.Get, uri));
+    }
+
+    /// <summary>POST a JSON body to a URI and parse the JSON response.</summary>
+    public static HttpJsonResult Post(HttpClient client, string uri, string json)
+    {
+        return Send(client, () => new HttpRequestMessage(HttpMethod.Post, uri)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        });
+    }
+}
+
+/// <summary>
+/// Reads a metric over a list of time spans. Azure Monitor refuses a response that would be too large with
+/// HTTP 400: such a span is then split in two halves and read again, down to 15 minutes.
+/// </summary>
+public static class MetricSpans
+{
+    private const long OneMin = TimeSpan.TicksPerMinute;
+
+    /// <summary>Formats UTC ticks as the timestamp Azure Monitor expects in the timespan parameter.</summary>
+    private static string Iso(long ticks)
+        => new DateTime(ticks, DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Reads the spans given as UTC tick pairs (start, end, start, end, ...), calling parse with each response.
+    /// uri is the full query without the timespan parameter. Returns "" when every span was read, otherwise
+    /// the error of the first span that could not be.
+    /// </summary>
+    public static string Read(HttpClient client, string uri, long[] bounds, Action<JsonDocument> parse)
+    {
+        var queue = new Queue<long[]>();
+        for (int i = 0; i + 1 < bounds.Length; i += 2) queue.Enqueue(new[] { bounds[i], bounds[i + 1] });
+        string error = "";
+        while (queue.Count > 0)
+        {
+            var span = queue.Dequeue();
+            var http = AzHttp.Get(client, uri + "&timespan=" + Iso(span[0]) + "/" + Iso(span[1]));
+            if (http.Doc != null)
+            {
+                using (http.Doc) parse(http.Doc);
+            }
+            else if (http.Status == 400 && span[1] - span[0] > 15 * OneMin)
+            {
+                // Split at the middle, rounded up to a whole minute.
+                long mid = span[0] + ((span[1] - span[0]) / OneMin + 1) / 2 * OneMin;
+                queue.Enqueue(new[] { span[0], mid });
+                queue.Enqueue(new[] { mid, span[1] });
+            }
+            else if (error.Length == 0) error = http.Error;
+        }
+        return error;
+    }
+}
+
+/// <summary>One Resource Health history entry, from the REST API or from the Activity Log in Log Analytics.</summary>
+public sealed class HealthNote
+{
+    public long   Ticks;
+    public string State   = "";
+    public string Title   = "";
+    public string Summary = "";
+    public string Reason  = "";   // REST reasonType wording ("Unplanned", "Planned", "Customer Initiated", ...)
+    public bool   Customer;       // caused by the customer
+}
+
+/// <summary>Resource Health history of one resource as read by HealthHistory.Collect.</summary>
+public sealed class HealthFetch
+{
+    public List<HealthNote> Notes = new List<HealthNote>();
+    public string Error = "";     // set when the REST history could not be read; Notes then hold the workspace notes only
+}
+
+/// <summary>
+/// The one way every algorithm reads Resource Health history: the REST availabilityStatuses history
+/// (about the last 30 days) and the Resource Health events of the Activity Log in a Log Analytics
+/// workspace are combined. Neither is complete on its own: the REST history can omit short events that
+/// the Activity Log still holds, and the workspace lags behind and only reaches back as far as its
+/// retention. The notes of both sources are simply returned together; the algorithms tolerate duplicates.
+/// </summary>
+public static class HealthHistory
+{
+    /// <summary>Builds a note from an Activity Log row: UserInitiated is the customer, PlatformInitiated maps to "Unplanned".</summary>
+    public static HealthNote FromWorkspace(long ticks, string state, string title, string cause)
+        => new HealthNote
+        {
+            Ticks = ticks, State = state ?? "", Title = title ?? "",
+            Reason = string.Equals(cause, "PlatformInitiated", StringComparison.Ordinal) ? "Unplanned" : "",
+            Customer = string.Equals(cause, "UserInitiated", StringComparison.Ordinal)
+        };
+
+    /// <summary>Parses one page of the REST history; returns the next page link, or "".</summary>
+    private static string ParsePage(JsonDocument doc, List<HealthNote> notes)
+    {
+        var root = doc.RootElement;
+        string next = root.TryGetProperty("nextLink", out var nl) && nl.ValueKind == JsonValueKind.String ? nl.GetString() ?? "" : "";
+        if (!root.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Array) return next;
+        foreach (var item in value.EnumerateArray())
+        {
+            if (!item.TryGetProperty("properties", out var p)) continue;
+            string Str(string name) => p.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() ?? "" : "";
+            string occurred = Str("occuredTime");   // sic: the API spells it this way
+            if (occurred.Length == 0) continue;
+            string reason = Str("reasonType");
+            // The customer is named in several fields depending on the source of the note.
+            notes.Add(new HealthNote
+            {
+                Ticks   = AzTime.Ticks(occurred),
+                State   = Str("availabilityState"),
+                Title   = Str("title"),
+                Summary = Str("summary"),
+                Reason  = reason,
+                // Customer-caused when any of the four fields says so.
+                Customer = reason.Equals("Customer Initiated", StringComparison.OrdinalIgnoreCase) ||
+                           reason.Equals("User Initiated", StringComparison.OrdinalIgnoreCase) ||
+                           Str("context").Equals("Customer Initiated", StringComparison.OrdinalIgnoreCase) ||
+                           Str("healthEventCause").Equals("UserInitiated", StringComparison.OrdinalIgnoreCase)
+            });
+        }
+        return next;
+    }
+
+    /// <summary>Returns the workspace notes plus, when useRest is true, every page of the REST history.</summary>
+    public static HealthFetch Collect(HttpClient client, string resourceId, List<HealthNote> workspaceNotes, bool useRest)
+    {
+        var result = new HealthFetch();
+        if (workspaceNotes != null) result.Notes.AddRange(workspaceNotes);
+        if (!useRest) return result;
+        string url = "https://management.azure.com" + resourceId +
+                     "/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2025-05-01";
+        // Follow the pagination links; after an error the notes read so far are kept and Error says why.
+        while (url.Length > 0)
+        {
+            var http = AzHttp.Get(client, url);
+            if (http.Doc == null) { result.Error = http.Error; break; }
+            using (http.Doc) url = ParsePage(http.Doc, result.Notes);
+        }
+        return result;
+    }
+
+    /// <summary>Titles that say the resource was hurt, even when the state field is missing or "Available".</summary>
+    private static readonly Regex BadTitle = new Regex("Degraded|Throttl|Unavailable", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Turns health notes into impact windows. A window opens at a Degraded or Unavailable note (or a note with
+    /// no state whose title says so) and closes at the next Available note. Workspace "Updated" rows (Available
+    /// state, Degraded title) are progress updates of the open event: neither an opening nor a closing note.
+    /// An event that never resolves explains at most openCapTicks. The REST history and the workspace describe
+    /// the same events, so windows that touch (within mergeTicks) and have the same cause are merged.
+    /// A throttling note is customer-caused whatever its recorded reason.
+    /// </summary>
+    public static List<HealthWindow> BuildWindows(List<HealthNote> notes, long openCapTicks, long mergeTicks)
+    {
+        var sorted = new List<HealthNote>(notes);
+        sorted.Sort((a, b) => a.Ticks.CompareTo(b.Ticks));
+        var raw = new List<HealthWindow>();
+        HealthNote open = null;
+        // Pair each opening note with the next closing note.
+        foreach (var n in sorted)
+        {
+            bool bad = BadTitle.IsMatch(n.Title);
+            bool opener = n.State.Equals("Degraded", StringComparison.OrdinalIgnoreCase) ||
+                          n.State.Equals("Unavailable", StringComparison.OrdinalIgnoreCase) ||
+                          (n.State.Length == 0 && bad);
+            bool closer = n.State.Equals("Available", StringComparison.OrdinalIgnoreCase) && !bad;
+            // An opener starts a window only when none is open; a closer ends the open one.
+            if (opener && open == null) open = n;
+            else if (closer && open != null) { raw.Add(Make(open, n.Ticks)); open = null; }
+        }
+        // An event that never resolves explains at most openCapTicks.
+        if (open != null) raw.Add(Make(open, open.Ticks + openCapTicks));
+
+        raw.Sort((a, b) => a.Start.CompareTo(b.Start));
+        var windows = new List<HealthWindow>();
+        // The two sources repeat the same event: extend the previous window instead of adding a duplicate.
+        foreach (var w in raw)
+        {
+            var last = windows.Count > 0 ? windows[windows.Count - 1] : null;
+            if (last != null && w.Start <= last.End + mergeTicks && w.Customer == last.Customer)
+            {
+                if (w.End > last.End) last.End = w.End;
+                if (last.Summary.Length == 0) last.Summary = w.Summary;
+            }
+            else windows.Add(w);
+        }
+        return windows;
+    }
+
+    /// <summary>Builds the window of an event that opened with the given note and ended at end.</summary>
+    private static HealthWindow Make(HealthNote open, long end)
+        => new HealthWindow
+        {
+            Start = open.Ticks, End = end, Title = open.Title, Summary = open.Summary,
+            Customer = open.Customer || open.Title.IndexOf("Throttl", StringComparison.OrdinalIgnoreCase) >= 0
+        };
+}
+
+/// <summary>A period during which Resource Health reported the resource degraded or unavailable.</summary>
+public sealed class HealthWindow
+{
+    public long   Start, End;     // UTC ticks
+    public bool   Customer;       // caused by the customer
+    public string Title   = "";
+    public string Summary = "";
+}
+
+/// <summary>Hourly request counts of a storage account: server failures and counted requests.</summary>
+public sealed class StorageHourly
+{
+    public double[] Failed;    // ServerOtherError + ServerTimeoutError per hour
+    public double[] Counted;   // Success + failed per hour
+}
+
+/// <summary>
+/// Parsers for the Azure Storage availability algorithm (README, "Algorithms"). Requests are
+/// counted per ResponseType: Success and the server failures (ServerOtherError, ServerTimeoutError)
+/// make up the counted requests; every other response type is not requested at all, so throttling,
+/// network, client and authentication errors never reach the score.
+/// </summary>
+public static class StorageParser
+{
+    /// <summary>Returns 1 for Success, 2 for a server failure, 0 for anything else.</summary>
+    private static int Classify(JsonElement series)
+    {
+        if (!series.TryGetProperty("metadatavalues", out var mv)) return 0;
+        // The ResponseType dimension says whether the series holds successes or server failures.
+        foreach (var m in mv.EnumerateArray())
+        {
+            if (!string.Equals(m.GetProperty("name").GetProperty("value").GetString(), "responsetype", StringComparison.OrdinalIgnoreCase)) continue;
+            string v = m.GetProperty("value").GetString() ?? "";
+            if (v.Equals("Success", StringComparison.OrdinalIgnoreCase)) return 1;
+            if (v.Equals("ServerOtherError", StringComparison.OrdinalIgnoreCase) ||
+                v.Equals("ServerTimeoutError", StringComparison.OrdinalIgnoreCase)) return 2;
+        }
+        return 0;
+    }
+
+    /// <summary>Accumulates a Transactions response split by ResponseType into per-slot arrays.</summary>
+    /// <param name="slotTicks">Length of one array slot (one hour or one minute) in ticks.</param>
+    private static void Accumulate(JsonDocument doc, long startTicks, long slotTicks, double[] failed, double[] counted)
+    {
+        if (!doc.RootElement.TryGetProperty("value", out var value) || value.GetArrayLength() == 0) return;
+        foreach (var series in value[0].GetProperty("timeseries").EnumerateArray())
+        {
+            int kind = Classify(series);
+            if (kind == 0) continue;
+            // Each data point is the total of one slot; points outside the period are ignored.
+            foreach (var dp in series.GetProperty("data").EnumerateArray())
+            {
+                if (!dp.TryGetProperty("total", out var tot) || tot.ValueKind != JsonValueKind.Number) continue;
+                double n = tot.GetDouble();
+                if (n <= 0) continue;
+                long slot = (AzTime.Ticks(dp.GetProperty("timeStamp").GetString()!) - startTicks) / slotTicks;
+                if (slot < 0 || slot >= counted.Length) continue;
+                counted[slot] += n;
+                if (kind == 2) failed[slot] += n;
+            }
+        }
+    }
+
+    /// <summary>Parses an hourly (PT1H) response covering the whole period.</summary>
+    public static StorageHourly ParseHourly(JsonDocument doc, long startTicks, int hours)
+    {
+        var h = new StorageHourly { Failed = new double[hours], Counted = new double[hours] };
+        Accumulate(doc, startTicks, TimeSpan.TicksPerHour, h.Failed, h.Counted);
+        return h;
+    }
+
+    /// <summary>Adds a minute (PT1M) response into the per-minute arrays of the period.</summary>
+    public static void AddMinutes(JsonDocument doc, long startTicks, double[] failed, double[] counted)
+        => Accumulate(doc, startTicks, TimeSpan.TicksPerMinute, failed, counted);
+}
+
+/// <summary>A start, stop or restart of a Web App, from the Activity Log.</summary>
+public sealed class WebEvent
+{
+    public long   Ticks;
+    public string Op;      // "stop", "start" or "restart"
+    public WebEvent(long ticks, string op) { Ticks = ticks; Op = op; }
+}
+
+/// <summary>Consecutive minutes in which every request of a Web App failed.</summary>
+public sealed class WebIncident
+{
+    public int    StartMinute, EndMinute, Minutes;
+    public double Requests;
+    public string Class = "";           // Stopped, Recycle, Customer, Fault or Unresolved
+    public HealthWindow Window;         // Resource Health window that decided the class, if any
+}
+
+/// <summary>What the Web App algorithm found in the minutes of one app.</summary>
+public sealed class WebResult
+{
+    public int    Active;               // minutes with at least one request
+    public int    Down;                 // active minutes in which every request failed with a 5xx
+    public int    DownFewRequests;      // down minutes with fewer than 5 requests
+    public int    Partial;              // active minutes with some, but not all, requests failed
+    public int    Stopped, Recycle, Customer, Fault, Unresolved;   // the decision for each down minute
+    public int    StoppedMinutes;       // minutes the app was stopped by the customer
+    public double Requests, Errors;     // totals of the active minutes
+    public double PartialRequests, PartialErrors;
+    public List<WebIncident> Incidents = new List<WebIncident>();
+}
+
+/// <summary>Parsers for the Web App availability algorithm (README, "Algorithms").</summary>
+public static class WebParser
+{
+    /// <summary>Adds the Requests and Http5xx totals of a response into per-slot arrays (slots are hours or minutes).</summary>
+    public static void AddCounts(JsonDocument doc, long startTicks, long slotTicks, double[] requests, double[] errors)
+    {
+        if (!doc.RootElement.TryGetProperty("value", out var value)) return;
+        foreach (var metric in value.EnumerateArray())
+        {
+            string name = metric.GetProperty("name").GetProperty("value").GetString() ?? "";
+            double[] target = name.Equals("Requests", StringComparison.OrdinalIgnoreCase) ? requests
+                            : name.Equals("Http5xx", StringComparison.OrdinalIgnoreCase) ? errors : null;
+            if (target == null) continue;
+            // Requests and Http5xx are separate metrics; each is summed into its own array.
+            foreach (var series in metric.GetProperty("timeseries").EnumerateArray())
+            foreach (var dp in series.GetProperty("data").EnumerateArray())
+            {
+                if (!dp.TryGetProperty("total", out var tot) || tot.ValueKind != JsonValueKind.Number) continue;
+                long slot = (AzTime.Ticks(dp.GetProperty("timeStamp").GetString()!) - startTicks) / slotTicks;
+                if (slot >= 0 && slot < target.Length) target[slot] += tot.GetDouble();
+            }
+        }
+    }
+
+    /// <summary>Maps an Activity Log operation name to "stop", "start" or "restart"; "" for any other operation.</summary>
+    public static string LifecycleKind(string operation)
+    {
+        string o = (operation ?? "").ToLowerInvariant();
+        if (o.Contains("/sites/stop/"))    return "stop";
+        if (o.Contains("/sites/start/"))   return "start";
+        if (o.Contains("/sites/restart/")) return "restart";
+        return "";
+    }
+}
+
+/// <summary>One Activity Log event read from the REST API.</summary>
+public sealed class ActivityEvent
+{
+    public long   Ticks;
+    public string Operation     = "";   // operation name (its localized label when the name is missing)
+    public string CorrelationId = "";
+}
+
+/// <summary>Reader of the Activity Log REST API (management events of one resource).</summary>
+public static class ActivityLogParser
+{
+    /// <summary>Reads a string property; "" when it is absent or not a string.</summary>
+    private static string Text(JsonElement parent, string name)
+        => parent.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() ?? "" : "";
+
+    /// <summary>Reads one page of the response, skipping failed operations; returns the next page link, or "".</summary>
+    public static string ReadPage(JsonDocument doc, List<ActivityEvent> events)
+    {
+        var root = doc.RootElement;
+        string next = Text(root, "nextLink");
+        if (!root.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Array) return next;
+        foreach (var item in value.EnumerateArray())
+        {
+            // A failed operation changed nothing; the operation name falls back to its localized label.
+            string status = item.TryGetProperty("status", out var st) ? Text(st, "value") : "";
+            if (status.Equals("Failed", StringComparison.OrdinalIgnoreCase)) continue;
+            string op = "";
+            if (item.TryGetProperty("operationName", out var on) && on.ValueKind == JsonValueKind.Object)
+            {
+                op = Text(on, "value");
+                if (op.Length == 0) op = Text(on, "localizedValue");
+            }
+            // An event without an operation or a time cannot be used.
+            string time = Text(item, "eventTimestamp");
+            if (op.Length == 0 || time.Length == 0) continue;
+            events.Add(new ActivityEvent { Ticks = AzTime.Ticks(time), Operation = op, CorrelationId = Text(item, "correlationId") });
+        }
+        return next;
+    }
+}
+
+/// <summary>The minute-by-minute part of the Web App algorithm.</summary>
+public static class WebClassifier
+{
+    private const long OneMin = TimeSpan.TicksPerMinute;
+
+    /// <summary>
+    /// Builds, from the stop, start and restart operations, the periods the app was stopped by the customer
+    /// (a stop up to the next start or restart, or the end of the period) and the recycle windows (each
+    /// operation, plus the grace time). Events of one kind that are close together (at most 5 minutes apart,
+    /// 15 minutes in all) are one operation: the Activity Log records each operation several times.
+    /// </summary>
+    public static void BuildLifecycle(List<WebEvent> events, long periodEndTicks, long graceTicks,
+                                      List<long[]> stopped, List<long[]> recycle)
+    {
+        var sorted = new List<WebEvent>(events);
+        sorted.Sort((a, b) => a.Ticks.CompareTo(b.Ticks));
+        var operations = new List<(long start, long end, string kind)>();
+        // Group the events of each kind into operations by proximity.
+        foreach (string kind in new[] { "stop", "start", "restart" })
+        {
+            long first = -1, last = -1;
+            foreach (var e in sorted)
+            {
+                if (e.Op != kind) continue;
+                // A gap of more than 5 minutes, or a span of more than 15, starts a new operation.
+                if (first >= 0 && (e.Ticks - last > 5 * OneMin || e.Ticks - first > 15 * OneMin))
+                { operations.Add((first, last, kind)); first = -1; }
+                if (first < 0) first = e.Ticks;
+                last = e.Ticks;
+            }
+            if (first >= 0) operations.Add((first, last, kind));
+        }
+        operations.Sort((a, b) => a.start.CompareTo(b.start));
+        // In time order, a stop opens a stopped period and the next start or restart closes it.
+        long stopAt = -1;
+        foreach (var op in operations)
+        {
+            recycle.Add(new[] { op.start, op.end + graceTicks });
+            if (op.kind == "stop") { if (stopAt < 0) stopAt = op.start; }
+            else if (stopAt >= 0) { stopped.Add(new[] { stopAt, op.end }); stopAt = -1; }
+        }
+        if (stopAt >= 0) stopped.Add(new[] { stopAt, periodEndTicks });
+    }
+
+    /// <summary>
+    /// Finds the down minutes (every request failed with a 5xx) from the first minute the app existed and
+    /// decides each: stopped by the customer, inside a recycle window, inside a Resource Health window
+    /// (customer: excused, platform: Fault; a window starts leadTicks before the event and ends graceTicks
+    /// after it), otherwise Unresolved. Minutes without requests are not judged; minutes with only some
+    /// requests failed are counted as partial and not scored.
+    /// </summary>
+    public static WebResult Classify(double[] requests, double[] errors, int firstMinute, long startTicks,
+                                     List<long[]> stopped, List<long[]> recycle, List<HealthWindow> health,
+                                     long leadTicks, long graceTicks)
+    {
+        int n = requests.Length;
+        // Mark the stopped minutes first; they leave the eligible minutes whether or not they had traffic.
+        var isStopped = new bool[n];
+        foreach (var w in stopped)
+        {
+            int a = (int)Math.Max(0, Math.Floor((w[0] - startTicks) / (double)OneMin));
+            int b = (int)Math.Min(n, Math.Ceiling((w[1] - startTicks) / (double)OneMin));
+            for (int i = a; i < b; i++) isStopped[i] = true;
+        }
+
+        var r = new WebResult();
+        WebIncident cur = null;
+        // Walk the minutes since creation: only a minute with requests can be judged.
+        for (int m = firstMinute; m < n; m++)
+        {
+            if (isStopped[m]) r.StoppedMinutes++;
+            double req = requests[m], err = errors[m];
+            if (req <= 0) continue;
+            r.Active++; r.Requests += req; r.Errors += err;
+            if (err <= 0) continue;
+            if (err < req) { r.Partial++; r.PartialRequests += req; r.PartialErrors += err; continue; }
+
+            r.Down++;
+            if (req < 5) r.DownFewRequests++;
+            // Every request failed: decide who is responsible, in order stopped, recycle, Resource Health window.
+            long t = startTicks + m * OneMin;
+            string cls = "";
+            HealthWindow win = null;
+            // The first rule that matches wins; the recycle window covers the minute the operation was sent.
+            if (isStopped[m]) cls = "Stopped";
+            if (cls.Length == 0)
+                foreach (var w in recycle)
+                    if (t + OneMin > w[0] && t <= w[1]) { cls = "Recycle"; break; }
+            if (cls.Length == 0)
+                foreach (var w in health)
+                    if (t >= w.Start - leadTicks && t <= w.End + graceTicks) { cls = w.Customer ? "Customer" : "Fault"; win = w; break; }
+            if (cls.Length == 0) cls = "Unresolved";
+            // Count the decision for the summary.
+            switch (cls)
+            {
+                case "Stopped":  r.Stopped++;  break;
+                case "Recycle":  r.Recycle++;  break;
+                case "Customer": r.Customer++; break;
+                case "Fault":    r.Fault++;    break;
+                default:         r.Unresolved++; break;
+            }
+
+            // Consecutive down minutes (gap of at most 5) form one incident for the evidence.
+            if (cur != null && m - cur.EndMinute <= 5)
+            {
+                cur.EndMinute = m; cur.Minutes++; cur.Requests += req;
+                if (cls != "Unresolved") { cur.Class = cls; cur.Window = win; }
+            }
+            else
+            {
+                if (cur != null) r.Incidents.Add(cur);
+                cur = new WebIncident { StartMinute = m, EndMinute = m, Minutes = 1, Requests = req, Class = cls, Window = win };
+            }
+        }
+        if (cur != null) r.Incidents.Add(cur);
+        return r;
+    }
+}
+
+/// <summary>
+/// Reads the one-minute availability metric of a VM (0 or 1) or an Azure SQL database (0 to 100) and sorts
+/// its minutes into available, null, zero and degraded: the null, zero and degraded ones are the "suspect" minutes.
+/// </summary>
 public static class MetricProcessor
 {
     /// <summary>Per-resource response: root has "value" array.</summary>
-    public static MetricProcessorResult ProcessSingle(JsonDocument doc, bool isVm, bool isStorage, bool isWebApp = false)
-        => ProcessMetricArray(doc.RootElement.GetProperty("value"), isVm, isStorage, isWebApp);
+    public static MetricProcessorResult ProcessSingle(JsonDocument doc, bool isVm)
+        => ProcessMetricArray(doc.RootElement.GetProperty("value"), isVm);
 
     /// <summary>Batch response: root has "values" array, each with "resourceid" + "value".</summary>
-    public static BatchResourceResult[] ProcessBatch(JsonDocument doc, bool isVm, bool isStorage, bool isWebApp = false)
+    public static BatchResourceResult[] ProcessBatch(JsonDocument doc, bool isVm)
     {
         var results = new List<BatchResourceResult>();
         foreach (var entry in doc.RootElement.GetProperty("values").EnumerateArray())
@@ -798,15 +1553,14 @@ public static class MetricProcessor
             {
                 ResourceId      = resId,
                 ResourceIdLower = resId.ToLowerInvariant(),
-                Metrics         = ProcessMetricArray(entry.GetProperty("value"), isVm, isStorage, isWebApp)
+                Metrics         = ProcessMetricArray(entry.GetProperty("value"), isVm)
             });
         }
         return results.ToArray();
     }
 
-    // ── shared inner loop ────────────────────────────────────────────────────
-    private static MetricProcessorResult ProcessMetricArray(
-        JsonElement valueArr, bool isVm, bool isStorage, bool isWebApp)
+    /// <summary>Walks the Minimum series of the availability metric and sorts every minute (shared by the single and batch paths).</summary>
+    private static MetricProcessorResult ProcessMetricArray(JsonElement valueArr, bool isVm)
     {
         var r = new MetricProcessorResult();
         var nullTicks      = new List<long>();
@@ -814,112 +1568,37 @@ public static class MetricProcessor
         var degradedTicks  = new List<long>();
         var degradedValues = new List<double>();
 
-        if (isStorage)
+        foreach (var metricEl in valueArr.EnumerateArray())
         {
-            var txByTicks = new Dictionary<long, double>();
-            foreach (var metricEl in valueArr.EnumerateArray())
+            // Only the availability metric is read (the VM one or the SQL one).
+            string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
+            if (!string.Equals(mName, "VmAvailabilityMetric", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(mName, "Availability", StringComparison.OrdinalIgnoreCase)) continue;
+
+            // Each data point is one minute; the Minimum aggregation is the worst value inside it.
+            foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
+            foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
             {
-                if (!string.Equals(metricEl.GetProperty("name").GetProperty("value").GetString(), "Transactions", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
-                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
+                long ticks = AzTime.Ticks(dp.GetProperty("timeStamp").GetString()!);
+                double? minVal = null;
+                if (dp.TryGetProperty("minimum", out var minEl) && minEl.ValueKind == JsonValueKind.Number)
+                    minVal = minEl.GetDouble();
+
+                if (minVal.HasValue)
                 {
-                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
-                                         .ToUniversalTime().Ticks;
-                    if (dp.TryGetProperty("total", out var tot) && tot.ValueKind == JsonValueKind.Number)
-                        txByTicks[ticks] = tot.GetDouble();
+                    // A VM reports 0 or 1, SQL reports a percentage: scale to 0..1. A zero is a suspect
+                    // minute, a fraction is a degraded minute (still counted as partly available).
+                    r.NumericPoints++;
+                    double v = isVm ? minVal.Value : minVal.Value / 100.0;
+                    if (v == 0.0)      zeroTicks.Add(ticks);
+                    else { r.AvailableSum += v;
+                           if (v < 1.0) { degradedTicks.Add(ticks); degradedValues.Add(v); } }
                 }
-            }
-            foreach (var metricEl in valueArr.EnumerateArray())
-            {
-                if (!string.Equals(metricEl.GetProperty("name").GetProperty("value").GetString(), "Availability", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
-                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
-                {
-                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
-                                         .ToUniversalTime().Ticks;
-                    bool hasTx = txByTicks.TryGetValue(ticks, out double txVal) && txVal > 0;
-                    double? minVal = null;
-                    if (dp.TryGetProperty("minimum", out var minEl) && minEl.ValueKind == JsonValueKind.Number)
-                        minVal = minEl.GetDouble();
-
-                    if (hasTx && minVal.HasValue)
-                    {
-                        double norm = minVal.Value / 100.0;
-                        r.NumericPoints++;
-                        if (norm == 0.0)      zeroTicks.Add(ticks);
-                        else { r.AvailableSum += norm;
-                               if (norm < 1.0) { degradedTicks.Add(ticks); degradedValues.Add(norm); } }
-                    }
-                    else if (hasTx)  nullTicks.Add(ticks);
-                    else             r.ZeroTxMin++;
-                }
-            }
-        }
-        else if (isWebApp)
-        {
-            // Web App: MemoryWorkingSet as availability proxy.
-            // Average aggregation (bytes): value > 0 means the app process is alive (available 1.0),
-            // value == 0 means the app is stopped (suspect zero), null means platform could not
-            // collect metrics (suspect null). No degraded state — binary up/down model.
-            foreach (var metricEl in valueArr.EnumerateArray())
-            {
-                string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
-                if (!string.Equals(mName, "MemoryWorkingSet", StringComparison.OrdinalIgnoreCase)) continue;
-
-                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
-                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
-                {
-                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
-                                         .ToUniversalTime().Ticks;
-                    double? avgVal = null;
-                    if (dp.TryGetProperty("average", out var avgEl) && avgEl.ValueKind == JsonValueKind.Number)
-                        avgVal = avgEl.GetDouble();
-
-                    if (avgVal.HasValue)
-                    {
-                        r.NumericPoints++;
-                        if (avgVal.Value > 0.0)
-                            r.AvailableSum += 1.0;   // process alive → fully available
-                        else
-                            zeroTicks.Add(ticks);     // process not running → suspect zero
-                    }
-                    else
-                        nullTicks.Add(ticks);         // no data from platform → suspect null
-                }
-            }
-        }
-        else
-        {
-            foreach (var metricEl in valueArr.EnumerateArray())
-            {
-                string mName = metricEl.GetProperty("name").GetProperty("value").GetString() ?? "";
-                if (!string.Equals(mName, "VmAvailabilityMetric", StringComparison.OrdinalIgnoreCase) &&
-                    !string.Equals(mName, "Availability", StringComparison.OrdinalIgnoreCase)) continue;
-
-                foreach (var tsEl in metricEl.GetProperty("timeseries").EnumerateArray())
-                foreach (var dp  in tsEl.GetProperty("data").EnumerateArray())
-                {
-                    long ticks = DateTime.Parse(dp.GetProperty("timeStamp").GetString()!)
-                                         .ToUniversalTime().Ticks;
-                    double? minVal = null;
-                    if (dp.TryGetProperty("minimum", out var minEl) && minEl.ValueKind == JsonValueKind.Number)
-                        minVal = minEl.GetDouble();
-
-                    if (minVal.HasValue)
-                    {
-                        r.NumericPoints++;
-                        double v = isVm ? minVal.Value : minVal.Value / 100.0;
-                        if (v == 0.0)      zeroTicks.Add(ticks);
-                        else { r.AvailableSum += v;
-                               if (v < 1.0) { degradedTicks.Add(ticks); degradedValues.Add(v); } }
-                    }
-                    else nullTicks.Add(ticks);
-                }
+                else nullTicks.Add(ticks);
             }
         }
 
+        // Hand the collected minutes to the caller as arrays.
         r.NullTicks      = nullTicks.ToArray();
         r.ZeroTicks      = zeroTicks.ToArray();
         r.DegradedTicks  = degradedTicks.ToArray();
@@ -927,116 +1606,251 @@ public static class MetricProcessor
         return r;
     }
 }
-'@
+
+// ───────────────────────────────────────────────────────────────────────────
+// The VM algorithm (README, "Algorithms > Virtual machines") classifies every suspect minute with
+// the evidence available for it; a month holds ~44 K minutes per VM.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// <summary>Outcome counts of the VM algorithm for one VM.</summary>
+public sealed class VmClassifyResult
+{
+    public int[]  GapCounts = new int[13];   // null + zero minutes, indexed by outcome code
+    public int[]  DegCounts = new int[13];   // fractional (degraded) minutes, indexed by outcome code
+    public double ExcusedDegradedAvail;      // availability carried by excused degraded minutes
 }
 
-# ── Compiled gap investigation helpers ────────────────────────────────────────
-# ExpandToTickSet and ClassifyGaps run at native .NET speed, replacing interpreted
-# PowerShell loops that iterate over potentially tens of thousands of ticks.
-
-if (-not ([System.Management.Automation.PSTypeName]'GapProcessor').Type) {
-Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-
-// ── Gap investigation helpers ───────────────────────────────────────────────
-
-public sealed class GapClassificationResult
+/// <summary>Classifies Resource Health notes of a VM by what they say (customer, platform, planned, recovery, ...).</summary>
+public static class VmHealthClassifier
 {
-    public int    PlatformFaultGapMin;
-    public int    UnresolvedZeroDowntimeMin;
-    public int    HealthExplainedGapMin;
-    public int    MetricIssueNullMin;
-    public int    ActivityLogExcludedGapMin;
-    public int    CustomerExcusedDegradedMin;
-    public double CustomerExcusedDegradedAvail;
-    public int    ActivityLogDegradedMin;
-    public int    HealthConfirmedDegradedMin;
+    // Health note classes.
+    public const int Other = 0, Customer = 1, PlatformUnplanned = 2, PlatformDegraded = 3,
+                     PlatformPlanned = 4, SpotEviction = 5, Unknown = 6, Recovery = 7,
+                     DownDetected = 8, Rca = 9;
+
+    private const RegexOptions Opt = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+    private static readonly Regex Recov    = new Regex("^Available$|Live Migration Succeeded", Opt);
+    private static readonly Regex Spot     = new Regex("preempt|evict", Opt);
+    private static readonly Regex Down     = new Regex("^Down:", Opt);
+    private static readonly Regex Degraded = new Regex("Accelerated Networking|Degraded performance|Degraded Hardware", Opt);
+    private static readonly Regex Outage   = new Regex("host failure|dataplane down|^Unavailable$|Redeploy", Opt);
+
+    /// <summary>
+    /// Classifies a Resource Health note by what it says, not by whether its state changed.
+    /// Order matters: RCA and customer notes first, then recovery/unknown, then platform classes.
+    /// </summary>
+    public static int Classify(string title, string state, bool customer, string reasonType)
+    {
+        title = title ?? ""; state = state ?? ""; reasonType = reasonType ?? "";
+        if (title.StartsWith("Root Cause Analysis", StringComparison.OrdinalIgnoreCase)) return Rca;
+        if (customer) return Customer;
+        if (state.Equals("Available", StringComparison.OrdinalIgnoreCase) || Recov.IsMatch(title)) return Recovery;
+        if (state.Equals("Unknown", StringComparison.OrdinalIgnoreCase) ||
+            title.StartsWith("Unknown", StringComparison.OrdinalIgnoreCase)) return Unknown;
+        if (Spot.IsMatch(title)) return SpotEviction;
+        // "Down: ... unavailable for 15 minutes" is a detection note raised after the VM went down;
+        // it never starts or supersedes a state.
+        if (Down.IsMatch(title)) return DownDetected;
+        if (Degraded.IsMatch(title)) return PlatformDegraded;
+        if (Outage.IsMatch(title)) return PlatformUnplanned;
+        if (reasonType.Equals("Planned", StringComparison.OrdinalIgnoreCase)) return PlatformPlanned;
+        if (reasonType.Equals("Unplanned", StringComparison.OrdinalIgnoreCase) ||
+            reasonType.Equals("Platform Initiated", StringComparison.OrdinalIgnoreCase)) return PlatformUnplanned;
+        return Other;
+    }
 }
 
-public static class GapProcessor
+/// <summary>The VM algorithm: decides every suspect minute of a VM (README, "Algorithms > Virtual machines").</summary>
+public static class VmGapClassifier
 {
-    private const long OneMinTicks = 600_000_000L;
+    private const long OneMin = 600_000_000L;
 
-    /// <summary>Expands interval pairs (fromTicks[i]..toTicks[i]) into a HashSet of minute-aligned ticks.</summary>
-    public static HashSet<long> ExpandToTickSet(long[] fromTicks, long[] toTicks)
+    // Outcome codes (index into GapCounts / DegCounts)
+    //  1 FaultPlatformContext   2 FaultPlatformHealth   3 ExcusedNotExists     4 ExcusedCustomerContext
+    //  5 ExcusedActivityLog     6 ExcusedCustomerHealth 7 ExcusedPlanned       8 ExcusedSpotEviction
+    //  9 ExcusedHealthUnknown  10 ExcusedMetricGap     11 Unresolved          12 ExcusedInheritedCustomer
+    // Context mask bits: 2 Platform, 4 User, 8 Unknown.
+
+    /// <summary>
+    /// Reads a VmAvailabilityMetric response split by Context and returns, for each zero minute,
+    /// the mask of contexts reporting zero. Zeros with no Context information are Unknown (8).
+    /// </summary>
+    public static int[] GetZeroMasks(JsonDocument split, long[] zeroTicks)
+    {
+        var zeroMask = new Dictionary<long, int>();
+        // One series per Context value; a minute can appear in several (the masks are OR-ed together).
+        foreach (var metric in split.RootElement.GetProperty("value").EnumerateArray())
+        foreach (var ts in metric.GetProperty("timeseries").EnumerateArray())
+        {
+            // The Context dimension says who caused the zeros of the series: Platform 2, User 4, Unknown 8.
+            int ctxBit = 8;
+            if (ts.TryGetProperty("metadatavalues", out var mvs))
+            {
+                foreach (var mv in mvs.EnumerateArray())
+                {
+                    // Find the Context dimension of the series; its value tells who caused the zeros.
+                    string n = mv.GetProperty("name").GetProperty("value").GetString() ?? "";
+                    if (n.IndexOf("context", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    string v = mv.GetProperty("value").GetString() ?? "";
+                    if (v.Equals("Platform", StringComparison.OrdinalIgnoreCase)) ctxBit = 2;
+                    else if (v.Equals("User", StringComparison.OrdinalIgnoreCase) ||
+                             v.Equals("Customer", StringComparison.OrdinalIgnoreCase)) ctxBit = 4;
+                }
+            }
+            // Only the zero minutes matter here; OR the context into the mask of each.
+            foreach (var dp in ts.GetProperty("data").EnumerateArray())
+            {
+                if (!dp.TryGetProperty("minimum", out var mn) ||
+                    mn.ValueKind != JsonValueKind.Number || mn.GetDouble() != 0.0) continue;
+                long ticks = AzTime.Ticks(dp.GetProperty("timeStamp").GetString()!);
+                zeroMask.TryGetValue(ticks, out int cur);
+                zeroMask[ticks] = cur | ctxBit;
+            }
+        }
+        // Zeros that no Context series reports stay Unknown (8).
+        var masks = new int[zeroTicks.Length];
+        for (int i = 0; i < zeroTicks.Length; i++)
+            masks[i] = zeroMask.TryGetValue(zeroTicks[i], out int m) ? m : 8;
+        return masks;
+    }
+
+    /// <summary>Expands interval pairs (from[i] to to[i]) into the set of whole minutes they cover.</summary>
+    private static HashSet<long> Expand(long[] from, long[] to)
     {
         var set = new HashSet<long>();
-        if (fromTicks == null || fromTicks.Length == 0) return set;
-        for (int i = 0; i < fromTicks.Length; i++)
+        for (int i = 0; i < from.Length; i++)
         {
-            long t = fromTicks[i] - (fromTicks[i] % OneMinTicks);
-            if (t < fromTicks[i]) t += OneMinTicks;
-            while (t < toTicks[i])
-            {
-                set.Add(t);
-                t += OneMinTicks;
-            }
+            long t = from[i] - (from[i] % OneMin);
+            if (t < from[i]) t += OneMin;
+            for (; t < to[i]; t += OneMin) set.Add(t);
         }
         return set;
     }
 
-    /// <summary>Classifies each suspect tick into gap/degraded categories using precomputed HashSets.</summary>
-    public static GapClassificationResult ClassifyGaps(
-        long[] allGapTicks, long[] zeroTicks,
-        long[] degradedTicks, double[] degradedValues,
-        HashSet<long> activitySet, HashSet<long> faultSet,
-        HashSet<long> unknownSet, HashSet<long> customerSet,
-        bool healthHistoryApplied, long hcStartTicks)
+    // Index of the latest anchor starting at or before the tick (+2 min of clock skew).
+    private static int Lookup(long[] start, long tick)
     {
-        var r = new GapClassificationResult();
-        var zeroSet = new HashSet<long>(zeroTicks ?? Array.Empty<long>());
-
-        if (allGapTicks != null)
+        int lo = 0, hi = start.Length - 1, best = -1;
+        long limit = tick + 2 * OneMin;
+        while (lo <= hi)
         {
-            foreach (long tk in allGapTicks)
-            {
-                bool isZero     = zeroSet.Contains(tk);
-                bool inActivity = activitySet.Contains(tk);
-                bool inHCov     = healthHistoryApplied && tk >= hcStartTicks;
-                bool inFault    = inHCov && faultSet.Contains(tk);
-                bool inUnknown  = inHCov && unknownSet.Contains(tk);
-                bool inCustomer = inHCov && customerSet.Contains(tk);
-
-                if      (inFault)                   r.PlatformFaultGapMin++;
-                else if (inActivity)                r.ActivityLogExcludedGapMin++;
-                else if (inCustomer || inUnknown)   r.HealthExplainedGapMin++;
-                else if (isZero)                    r.UnresolvedZeroDowntimeMin++;
-                else                                r.MetricIssueNullMin++;
-            }
+            int mid = (lo + hi) >> 1;
+            if (start[mid] <= limit) { best = mid; lo = mid + 1; } else hi = mid - 1;
         }
+        return best;
+    }
 
-        if (degradedTicks != null)
+    // A platform-unplanned note stays the explanation for a minute within the window unless a
+    // customer action followed it. Notes logged seconds later (Resolved, Unknown) do not hide it.
+    private static int FindFaultAnchorUnlessCustomer(long[] start, int[] cls, long tick, long windowTicks)
+    {
+        for (int i = Lookup(start, tick); i >= 0; i--)
         {
-            for (int i = 0; i < degradedTicks.Length; i++)
-            {
-                long   tk = degradedTicks[i];
-                double dv = degradedValues[i];
-                bool inActivity = activitySet.Contains(tk);
-                bool inHCov     = healthHistoryApplied && tk >= hcStartTicks;
-                bool inFault    = inHCov && faultSet.Contains(tk);
-                bool inCustomer = inHCov && customerSet.Contains(tk);
-
-                if (inFault)
-                    r.HealthConfirmedDegradedMin++;
-                else if (inActivity || inCustomer)
-                {
-                    r.CustomerExcusedDegradedMin++;
-                    r.CustomerExcusedDegradedAvail += dv;
-                    if (inActivity) r.ActivityLogDegradedMin++;
-                }
-            }
+            if (tick - start[i] > windowTicks) return -1;
+            if (cls[i] == VmHealthClassifier.Customer) return -1;
+            if (cls[i] == VmHealthClassifier.PlatformUnplanned) return i;
         }
+        return -1;
+    }
 
-        return r;
+    /// <summary>
+    /// Classifies every suspect minute (null, zero, fractional) of one VM. Rules are applied in
+    /// order and the first match wins; see README, "Algorithms".
+    /// </summary>
+    public static VmClassifyResult Classify(
+        long[] nullTicks, long[] zeroTicks, int[] zeroMasks, long[] degTicks, double[] degVals,
+        long[] actFrom, long[] actTo, long[] nxFrom, long[] nxTo,
+        long[] entryTicks, int[] entryClasses, long faultWindowTicks)
+    {
+        var act = Expand(actFrom, actTo);
+        var nx  = Expand(nxFrom, nxTo);
+
+        // Only some note classes carry a state forward in time; the rest are evidence only.
+        var aStart = new List<long>(); var aClass = new List<int>();
+        for (int i = 0; i < entryTicks.Length; i++)
+        {
+            int c = entryClasses[i];
+            if (c == VmHealthClassifier.Customer || c == VmHealthClassifier.PlatformUnplanned ||
+                c == VmHealthClassifier.PlatformPlanned || c == VmHealthClassifier.SpotEviction ||
+                c == VmHealthClassifier.Unknown || c == VmHealthClassifier.Recovery)
+            { aStart.Add(entryTicks[i]); aClass.Add(c); }
+        }
+        long[] anchorStart = aStart.ToArray(); int[] anchorClass = aClass.ToArray();
+
+        // kind: 0 null, 1 zero, 2 fractional
+        var items = new List<(long tick, int kind, int mask, double val)>(
+            nullTicks.Length + zeroTicks.Length + degTicks.Length);
+        foreach (long t in nullTicks) items.Add((t, 0, 0, 0));
+        for (int i = 0; i < zeroTicks.Length; i++) items.Add((zeroTicks[i], 1, zeroMasks[i], 0));
+        for (int i = 0; i < degTicks.Length; i++) items.Add((degTicks[i], 2, 0, degVals[i]));
+        items.Sort((a, b) => a.tick.CompareTo(b.tick));
+
+        // Decide the suspect minutes in time order: a null run takes the explanation of the minute before it.
+        var res = new VmClassifyResult();
+        long prevTick = -1; int prevOutcome = 0;
+
+        foreach (var it in items)
+        {
+            int outcome = 0;
+            long t = it.tick;
+
+            // The VM did not exist yet.
+            if (nx.Contains(t)) outcome = 3;
+
+            // A measured zero tells who caused it, when the metric says so.
+            if (outcome == 0 && it.kind == 1)
+            {
+                if ((it.mask & 2) != 0) outcome = 1;
+                else if ((it.mask & 4) != 0 && (it.mask & 8) == 0) outcome = 4;
+            }
+
+            // A lifecycle operation of the Activity Log (start, deallocate, power off, restart).
+            if (outcome == 0 && act.Contains(t)) outcome = 5;
+
+            // A gap is explained by what started it: a null run that continues straight after a
+            // customer-explained minute stays customer-explained.
+            if (outcome == 0 && it.kind == 0 && prevTick >= 0 && t - prevTick <= OneMin &&
+                (prevOutcome == 3 || prevOutcome == 4 || prevOutcome == 5 || prevOutcome == 6 || prevOutcome == 12))
+                outcome = 12;
+
+            // A platform note explains the minute within the fault window, unless a customer action followed it.
+            if (outcome == 0 &&
+                FindFaultAnchorUnlessCustomer(anchorStart, anchorClass, t, faultWindowTicks) >= 0)
+                outcome = 2;
+
+            // Otherwise the latest state-carrying note decides: customer, planned maintenance, spot eviction,
+            // or unknown health (null minutes only).
+            if (outcome == 0)
+            {
+                int a = Lookup(anchorStart, t);
+                int c = a >= 0 ? anchorClass[a] : 0;
+                if (c == VmHealthClassifier.Customer) outcome = 6;
+                else if (c == VmHealthClassifier.PlatformPlanned) outcome = 7;
+                else if (c == VmHealthClassifier.SpotEviction) outcome = 8;
+                else if (c == VmHealthClassifier.Unknown && it.kind == 0) outcome = 9;
+            }
+
+            // Nothing explains it: a missing sample is a metric gap, a measured zero is downtime.
+            if (outcome == 0) outcome = it.kind == 0 ? 10 : 11;
+
+            if (it.kind == 2) res.DegCounts[outcome]++; else res.GapCounts[outcome]++;
+            if (it.kind == 2 && ((outcome >= 3 && outcome <= 10) || outcome == 12))
+                res.ExcusedDegradedAvail += it.val;
+            prevTick = t; prevOutcome = outcome;
+        }
+        return res;
     }
 }
 '@
 }
 
-# ── Kind configuration ────────────────────────────────────────────────────────
+#endregion
+
+#region Kind configuration
 # Maps resource kind → metric namespace, metric names, and aggregation.
 # Used by both the per-resource ARM Metrics API and the regional Batch API.
+# Storage accounts and Web Apps are not listed: they use their own algorithms (see "Storage algorithm"
+# and "Web App algorithm").
 
 $KindConfig = @{
     'VirtualMachine' = @{
@@ -1049,26 +1863,31 @@ $KindConfig = @{
         MetricNames = 'Availability'
         Aggregation = 'Minimum'
     }
-    'StorageAccount' = @{
-        Namespace   = 'Microsoft.Storage/storageAccounts'
-        MetricNames = 'Availability,Transactions'
-        Aggregation = 'Minimum,Total'
-    }
-    # Web App: MemoryWorkingSet as availability proxy — non-null value > 0 means
-    # the app process is alive (available); value = 0 means the app is stopped
-    # (suspect zero, like a deallocated VM); null means the platform could not
-    # collect metrics (suspect null). No degraded state — binary up/down model.
-    'WebApp' = @{
-        Namespace   = 'Microsoft.Web/sites'
-        MetricNames = 'MemoryWorkingSet'
-        Aggregation = 'Average'
-    }
 }
 
-# ── Batch endpoint validation ─────────────────────────────────────────────────
+#endregion
 
-## Probes each regional batch endpoint with an empty payload to verify reachability.
-## 400/401/403 are expected for the dummy subscription and treated as OK.
+#region Batch endpoint validation
+
+<#
+.SYNOPSIS
+    Verifies that every regional Azure Monitor Batch endpoint is reachable.
+
+.DESCRIPTION
+    Probes each region with an empty request for a dummy subscription. HTTP 400, 401 and 403 are
+    the expected answers (the endpoint is reachable, the request is just not valid) and count as
+    success. Any other failure aborts the run, so a blocked endpoint is found before thousands of
+    metric calls are attempted.
+
+.PARAMETER MetricsToken
+    Bearer token for the metrics.monitor.azure.com audience.
+
+.PARAMETER Regions
+    Lowercase Azure region names to probe.
+
+.OUTPUTS
+    None. Throws when one or more endpoints are unreachable.
+#>
 function Test-BatchEndpoints {
     param(
         [string]$MetricsToken,
@@ -1079,6 +1898,7 @@ function Test-BatchEndpoints {
     $allOk = $true
     foreach ($region in $Regions) {
         $endpoint = "https://$region.metrics.monitor.azure.com"
+        # An empty probe request: the endpoint answers 400/401/403 when it is reachable.
         $testUri = "$endpoint/subscriptions/00000000-0000-0000-0000-000000000000/metrics:getBatch?api-version=2023-10-01&metricnamespace=Microsoft.Compute/virtualMachines&metricnames=Percentage%20CPU"
         $body = '{"resourceids":[]}'
 
@@ -1088,6 +1908,7 @@ function Test-BatchEndpoints {
             Write-Host "  $region`: OK"
         }
         catch {
+            # Only an answer from the endpoint proves it is reachable; transport errors give status 0.
             $statusCode = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
             if ($statusCode -in @(400, 401, 403)) {
                 Write-Host "  $region`: OK (got expected $statusCode for probe)"
@@ -1098,6 +1919,7 @@ function Test-BatchEndpoints {
             }
         }
     }
+    # Any unreachable region aborts the run before thousands of calls are attempted.
     if (-not $allOk) {
         throw 'One or more batch endpoints are unreachable. Aborting.'
     }
@@ -1105,12 +1927,42 @@ function Test-BatchEndpoints {
     Write-Host ''
 }
 
-# ── Batch metric processing ───────────────────────────────────────────────────
+#endregion
 
-## Fetches Azure Monitor metrics using the regional Batch API instead of per-resource
-## ARM calls. Resources are grouped by (subscription, region, kind), chunked by
-## BatchSize, and processed in parallel waves with GC between waves to bound memory.
-## Uses HttpClient with ResponseHeadersRead for streaming JSON parsing.
+#region Batch metric processing
+
+<#
+.SYNOPSIS
+    Fetches availability metrics through the regional Azure Monitor Batch API.
+
+.DESCRIPTION
+    Groups resources by (subscription, region, kind), splits each group into chunks of at most
+    BatchSize resources (the API accepts up to 50), and sends the chunks in parallel waves with a
+    garbage collection between waves to bound memory on large estates. Responses are parsed from the
+    stream by the compiled MetricProcessor. A chunk that fails entirely yields excluded placeholders
+    for its resources, so one failed call never hides the others.
+
+.PARAMETER Resources
+    Resource descriptors from Get-ResourceInventory.
+
+.PARAMETER StartDate
+    Start of the observation window.
+
+.PARAMETER EndDate
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Number of batch calls per parallel wave.
+
+.PARAMETER BatchSize
+    Maximum resources per batch call.
+
+.PARAMETER MetricsToken
+    Bearer token for the metrics.monitor.azure.com audience.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID with one MetricResult per resource.
+#>
 function Get-BatchAvailabilityMetrics {
     param(
         [object[]]$Resources,
@@ -1121,6 +1973,7 @@ function Get-BatchAvailabilityMetrics {
         [string]$MetricsToken
     )
 
+    # The Batch API takes the time range with millisecond precision.
     $startIso = $StartDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
     $endIso   = $EndDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 
@@ -1140,53 +1993,46 @@ function Get-BatchAvailabilityMetrics {
     # calls — the Batch API has a max of 50 resources per call.
     $batchWorkItems = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in $groups.GetEnumerator()) {
+        # The group key packs subscription, region and kind.
         $parts = $entry.Key -split '\|'
         $subId    = $parts[0]
         $location = $parts[1]
         $kind     = $parts[2]
 
+        # A kind without a metric configuration has its own algorithm and cannot be batched.
         $config = $KindConfig[$kind]
         if (-not $config) {
             Write-Warning "No batch config for kind '$kind', skipping."
             continue
         }
 
-        $chunk = [System.Collections.Generic.List[object]]::new()
-        foreach ($res in $entry.Value) {
-            $chunk.Add($res)
-            if ($chunk.Count -ge $BatchSize) {
-                $batchWorkItems.Add([PSCustomObject]@{
-                    SubscriptionId = $subId
-                    Location       = $location
-                    Kind           = $kind
-                    Config         = $config
-                    Resources      = @($chunk)
-                })
-                $chunk = [System.Collections.Generic.List[object]]::new()
-            }
-        }
-        if ($chunk.Count -gt 0) {
+        # Split the group into chunks of BatchSize resources; each chunk is one batch API call.
+        $items = $entry.Value
+        for ($i = 0; $i -lt $items.Count; $i += $BatchSize) {
             $batchWorkItems.Add([PSCustomObject]@{
                 SubscriptionId = $subId
                 Location       = $location
                 Kind           = $kind
                 Config         = $config
-                Resources      = @($chunk)
+                Resources      = @($items.GetRange($i, [math]::Min($BatchSize, $items.Count - $i)))
             })
         }
     }
 
+    # Describe the plan to the user: how many batches go to which region, kind and subscription.
     $totalResources = $Resources.Count
     $totalBatches   = $batchWorkItems.Count
     $uniqueRegions  = @($groups.Keys | ForEach-Object { ($_ -split '\|')[1] } | Select-Object -Unique | Sort-Object)
     Write-Host "Grouped $totalResources resource(s) into $totalBatches batch(es) across $($uniqueRegions.Count) region(s) (max $BatchSize per batch)."
     $sortedEntries = @($groups.GetEnumerator() | Sort-Object { ($_.Key -split '\|')[1] }, { ($_.Key -split '\|')[2] }, { ($_.Key -split '\|')[0] })
     foreach ($entry in $sortedEntries) {
+        # One summary line per group, with the number of calls it needs.
         $parts = $entry.Key -split '\|'
         $subName  = $entry.Value[0].SubscriptionName
         $kind     = Get-ShortKind $parts[2]
         $location = $parts[1]
         $count    = $entry.Value.Count
+        # Number of API calls this group needs.
         $chunks   = [math]::Ceiling($count / $BatchSize)
         Write-Host "  $location / $kind / $(Get-TruncatedString $subName 30) : $count resource(s) -> $chunks batch(es)"
     }
@@ -1204,6 +2050,7 @@ function Get-BatchAvailabilityMetrics {
     # with GC between waves to bound memory usage.
     $waveSize = $ThrottleLimit
     for ($waveStart = 0; $waveStart -lt $batchWorkItems.Count; $waveStart += $waveSize) {
+        # Slice the next wave and prepare the shared progress counter the runspaces update.
         $waveEnd   = [math]::Min($waveStart + $waveSize, $batchWorkItems.Count)
         $waveItems = @($batchWorkItems[$waveStart..($waveEnd - 1)])
         $waveNum   = [math]::Floor($waveStart / $waveSize) + 1
@@ -1212,27 +2059,31 @@ function Get-BatchAvailabilityMetrics {
         $waveProgress = [hashtable]::Synchronized(@{ Done = 0; Total = $waveItems.Count; Base = $batchesDone; Grand = $totalBatches; Waves = $totalWaves; Wave = $waveNum })
         [Console]::Write("`r  Fetching batch metrics: wave $waveNum/$totalWaves, batch $batchesDone/$totalBatches done")
 
+        # Each parallel iteration is one batch call. Runspaces do not see the caller's variables,
+        # so everything is passed in through $using:.
         $waveResults = @($waveItems | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        # Unpack the work item and the values shared with the caller.
         $workItem     = $_
         $client       = $using:batchHttpClient
         $startIso     = $using:startIso
         $endIso       = $using:endIso
         $wp           = $using:waveProgress
 
+        # The work item says which subscription, region, kind and resources this call covers.
         $subId    = $workItem.SubscriptionId
         $location = $workItem.Location
         $kind     = $workItem.Kind
         $config   = $workItem.Config
         $resources = $workItem.Resources
 
+        # Only VM values are 0/1; SQL values are percentages (see MetricProcessor).
         $isVm      = $kind -eq 'VirtualMachine'
-        $isStorage = $kind -eq 'StorageAccount'
-        $isWebApp  = $kind -eq 'WebApp'
 
         $resourceIds = @($resources | ForEach-Object { $_.ResourceId })
 
         $endpoint = "https://$location.metrics.monitor.azure.com"
 
+        # The Batch API is regional; the time range, namespace, metric and aggregation are query parameters.
         $uri = "$endpoint/subscriptions/$subId/metrics:getBatch" +
                "?starttime=$([uri]::EscapeDataString($startIso))" +
                "&endtime=$([uri]::EscapeDataString($endIso))" +
@@ -1242,76 +2093,22 @@ function Get-BatchAvailabilityMetrics {
                "&aggregation=$([uri]::EscapeDataString($config.Aggregation))" +
                "&api-version=2023-10-01"
 
-        $bodyObj = @{ resourceids = $resourceIds }
-        $bodyJson = $bodyObj | ConvertTo-Json -Compress -Depth 3
+        $bodyJson = @{ resourceids = $resourceIds } | ConvertTo-Json -Compress -Depth 3
 
-        $doc = $null
-        for ($attempt = 1; $attempt -le 5; $attempt++) {
-            $httpReq = [System.Net.Http.HttpRequestMessage]::new(
-                [System.Net.Http.HttpMethod]::Post, $uri)
-            $httpReq.Content = [System.Net.Http.StringContent]::new(
-                $bodyJson, [System.Text.Encoding]::UTF8, 'application/json')
-            $httpResp = $null
-            try {
-                $httpResp = $client.SendAsync($httpReq,
-                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
-                ).GetAwaiter().GetResult()
-                $sc = [int]$httpResp.StatusCode
-                if ($sc -ge 200 -and $sc -lt 300) {
-                    $respStream = $httpResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-                    try { $doc = [System.Text.Json.JsonDocument]::ParseAsync($respStream).GetAwaiter().GetResult() }
-                    finally { $respStream.Dispose() }
-                    break
-                }
-                if (($sc -eq 429 -or $sc -ge 500) -and $attempt -lt 5) {
-                    $httpResp.Dispose()
-                    $httpResp = $null
-                    Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
-                    continue
-                }
-                $names = ($resources | ForEach-Object { $_.Name }) -join ', '
-                Write-Warning "Batch metric query failed for [$names]: HTTP $sc"
-                break
-            }
-            catch {
-                $retryable = $_.ToString() -match 'transport|connection.*closed|reset by peer|timed?\s*out'
-                if ($retryable -and $attempt -lt 5) {
-                    Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
-                    continue
-                }
-                $names = ($resources | ForEach-Object { $_.Name }) -join ', '
-                Write-Warning "Batch metric query failed for [$names]: $_"
-                break
-            }
-            finally {
-                if ($httpResp) { $httpResp.Dispose() }
-                $httpReq.Dispose()
-            }
+        # POST with retry on throttling, server errors and transient transport failures.
+        $http = [AzHttp]::Post($client, $uri, $bodyJson)
+        $doc  = $http.Doc
+        if (-not $doc) {
+            $names = ($resources | ForEach-Object { $_.Name }) -join ', '
+            Write-Warning "Batch metric query failed for [$names]: $($http.Error)"
         }
-        $bodyJson = $null
 
         # If the batch call failed entirely, emit placeholder results
         # marking each resource as excluded from availability.
         if (-not $doc) {
-            foreach ($resource in $resources) {
-                [PSCustomObject]@{
-                    ResourceId              = $resource.ResourceId
-                    ResourceIdLower         = $resource.ResourceId.ToLowerInvariant()
-                    Name                    = $resource.Name
-                    AvailableSum            = 0.0
-                    GapMinutes              = 0
-                    ZeroTxMin               = 0
-                    ExcludeFromAvailability = $true
-                    GapTicks                = @()
-                    ZeroAvailTicks          = @()
-                    DegradedMinutes         = 0
-                    DegradedTicks           = @()
-                    DegradedValues          = @()
-                    SuspectMinutes          = 0
-                }
-            }
-        $wp.Done++
-        [Console]::Write("`r  Fetching batch metrics: wave $($wp.Wave)/$($wp.Waves), batch $($wp.Base + $wp.Done)/$($wp.Grand) done")
+            foreach ($resource in $resources) { [MetricResult]::Excluded($resource.ResourceId, $resource.Name) }
+            $wp.Done++
+            [Console]::Write("`r  Fetching batch metrics: wave $($wp.Wave)/$($wp.Waves), batch $($wp.Base + $wp.Done)/$($wp.Grand) done")
             return
         }
 
@@ -1321,27 +2118,10 @@ function Get-BatchAvailabilityMetrics {
 
         # Parse the batch response and extract per-resource metric results.
         try {
-            $batchResults = [MetricProcessor]::ProcessBatch($doc, $isVm, $isStorage, $isWebApp)
+            $batchResults = [MetricProcessor]::ProcessBatch($doc, $isVm)
             foreach ($br in $batchResults) {
-                $resObj  = if ($resById.ContainsKey($br.ResourceIdLower)) { $resById[$br.ResourceIdLower] } else { $null }
-                $resName = if ($resObj) { $resObj.Name } else { $br.ResourceId }
-                $m = $br.Metrics
-
-                [PSCustomObject]@{
-                    ResourceId              = $br.ResourceId
-                    ResourceIdLower         = $br.ResourceIdLower
-                    Name                    = $resName
-                    AvailableSum            = $m.AvailableSum
-                    GapMinutes              = $m.GapMinutes
-                    ZeroTxMin               = $m.ZeroTxMin
-                    ExcludeFromAvailability = $m.ExcludeFromAvailability
-                    GapTicks                = $m.NullTicks
-                    ZeroAvailTicks          = $m.ZeroTicks
-                    DegradedMinutes         = $m.DegradedMinutes
-                    DegradedTicks           = $m.DegradedTicks
-                    DegradedValues          = $m.DegradedValues
-                    SuspectMinutes          = $m.SuspectMinutes
-                }
+                $resName = $resById[$br.ResourceIdLower]?.Name ?? $br.ResourceId
+                [MetricResult]::From($br.ResourceId, $resName, $br.Metrics)
             }
         }
         finally {
@@ -1377,11 +2157,37 @@ function Get-BatchAvailabilityMetrics {
     $resultByRes
 }
 
-# ── Per-resource metrics (parallel) ───────────────────────────────────────────
+#endregion
 
-## Fetches Azure Monitor metrics one resource at a time via the ARM Metrics API.
-## Uses ForEach-Object -Parallel with a shared HttpClient for connection pooling
-## and System.Text.Json for streaming JSON parsing. Retries on 429/5xx.
+#region Per-resource metrics
+
+<#
+.SYNOPSIS
+    Fetches availability metrics one resource at a time through the ARM Metrics API.
+
+.DESCRIPTION
+    Runs the calls in parallel with a shared HttpClient (connection pooling) and parses each
+    response from the stream with the compiled MetricProcessor. Throttling and transient failures
+    are retried; a resource whose query or parsing fails gets an excluded placeholder.
+
+.PARAMETER Resources
+    Resource descriptors from Get-ResourceInventory.
+
+.PARAMETER StartDate
+    Start of the observation window.
+
+.PARAMETER EndDate
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent calls.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID with one MetricResult per resource.
+#>
 function Get-AvailabilityMetrics {
     param(
         [object[]]$Resources,
@@ -1393,6 +2199,7 @@ function Get-AvailabilityMetrics {
     $total = $Resources.Count
     Write-Host "Querying metrics for $total resource(s) with parallelism $ThrottleLimit..."
 
+    # One shared client for all calls (connection pooling); the token is set once.
     $armHttpClient = [System.Net.Http.HttpClient]::new()
     $armHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
     $armHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
@@ -1404,13 +2211,12 @@ function Get-AvailabilityMetrics {
     # Metrics API URL, fetches with retry, and parses via compiled C#.
     $Resources | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         $resource = $_
+        # Runspaces do not see the caller's variables: pass the client and the period through $using:.
         $client   = $using:armHttpClient
         $startIso = ($using:StartDate).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         $endIso   = ($using:EndDate).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
         $isVm      = $resource.Kind -eq 'VirtualMachine'
-        $isStorage  = $resource.Kind -eq 'StorageAccount'
-        $isWebApp   = $resource.Kind -eq 'WebApp'
 
         # Look up metric namespace, names, and aggregation for this resource kind
         $kindCfg = ($using:KindConfig)[$resource.Kind]
@@ -1424,87 +2230,23 @@ function Get-AvailabilityMetrics {
                "&metricnames=$([uri]::EscapeDataString($metricNames))" +
                "&timespan=$startIso/$endIso&interval=PT1M&aggregation=$agg"
 
-        $doc = $null
-        for ($attempt = 1; $attempt -le 5; $attempt++) {
-            $httpReq = [System.Net.Http.HttpRequestMessage]::new(
-                [System.Net.Http.HttpMethod]::Get, $uri)
-            $httpResp = $null
-            try {
-                $httpResp = $client.SendAsync($httpReq,
-                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
-                ).GetAwaiter().GetResult()
-                $sc = [int]$httpResp.StatusCode
-                if ($sc -ge 200 -and $sc -lt 300) {
-                    $respStream = $httpResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-                    try { $doc = [System.Text.Json.JsonDocument]::ParseAsync($respStream).GetAwaiter().GetResult() }
-                    finally { $respStream.Dispose() }
-                    break
-                }
-                if (($sc -eq 429 -or $sc -ge 500) -and $attempt -lt 5) {
-                    $httpResp.Dispose()
-                    $httpResp = $null
-                    Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
-                    continue
-                }
-                Write-Warning "Metric query failed for '$($resource.Name)': HTTP $sc"
-                break
-            }
-            catch {
-                $retryable = $_.ToString() -match 'transport|connection.*closed|reset by peer|timed?\s*out'
-                if ($retryable -and $attempt -lt 5) {
-                    Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt)))
-                    continue
-                }
-                Write-Warning "Metric query failed for '$($resource.Name)': $_"
-                break
-            }
-            finally {
-                if ($httpResp) { $httpResp.Dispose() }
-                $httpReq.Dispose()
-            }
-        }
+        # GET with retry on throttling, server errors and transient transport failures.
+        $http = [AzHttp]::Get($client, $uri)
+        $doc  = $http.Doc
+        if (-not $doc) { Write-Warning "Metric query failed for '$($resource.Name)': $($http.Error)" }
 
         # Parse the JSON response via compiled C# MetricProcessor — classifies
         # each per-minute datapoint as available, null, zero, or degraded.
         $m = $null
         if ($doc) {
-            try   { $m = [MetricProcessor]::ProcessSingle($doc, $isVm, $isStorage, $isWebApp) }
+            try   { $m = [MetricProcessor]::ProcessSingle($doc, $isVm) }
             catch { Write-Warning "Metric processing failed for '$($resource.Name)': $_" }
             finally { $doc.Dispose() }
         }
 
-        # Emit a standardised result object (or a placeholder if parsing failed)
-        if ($m) {
-            [PSCustomObject]@{
-                ResourceId              = $resource.ResourceId
-                Name                    = $resource.Name
-                AvailableSum            = $m.AvailableSum
-                GapMinutes              = $m.GapMinutes
-                ZeroTxMin               = $m.ZeroTxMin
-                ExcludeFromAvailability = $m.ExcludeFromAvailability
-                GapTicks                = $m.NullTicks
-                ZeroAvailTicks          = $m.ZeroTicks
-                DegradedMinutes         = $m.DegradedMinutes
-                DegradedTicks           = $m.DegradedTicks
-                DegradedValues          = $m.DegradedValues
-                SuspectMinutes          = $m.SuspectMinutes
-            }
-        } else {
-            [PSCustomObject]@{
-                ResourceId              = $resource.ResourceId
-                Name                    = $resource.Name
-                AvailableSum            = 0.0
-                GapMinutes              = 0
-                ZeroTxMin               = 0
-                ExcludeFromAvailability = $true
-                GapTicks                = @()
-                ZeroAvailTicks          = @()
-                DegradedMinutes         = 0
-                DegradedTicks           = @()
-                DegradedValues          = @()
-                SuspectMinutes          = 0
-            }
-        }
+        # Emit a standardised result object (or an excluded placeholder if the query or parsing failed)
+        if ($m) { [MetricResult]::From($resource.ResourceId, $resource.Name, $m) }
+        else    { [MetricResult]::Excluded($resource.ResourceId, $resource.Name) }
     # Collect results as they complete, index by lowercase resource ID,
     # and update the progress bar on every 10th resource.
     } | ForEach-Object {
@@ -1522,21 +2264,65 @@ function Get-AvailabilityMetrics {
     $resultByRes
 }
 
-# ── Suspect gap investigation (parallel) ──────────────────────────────────────
+#endregion
 
-## For each resource with suspect minutes, queries Activity Log and Resource
-## Health to classify every suspect minute.
-## When Log Analytics data is provided, Activity Log uses pre-fetched events;
-## Resource Health uses a hybrid approach: LA transitions older than the REST
-## API ~30-day retention cutoff are merged with REST API transitions for the
-## last ~30 days. Without Log Analytics, REST APIs are the sole data source.
-## Classification precedence:
-##   1. Platform fault (Resource Health)       → stays eligible, counts as downtime
-##   2. Lifecycle activity (Activity Log)       → excluded from eligibility
-##   3. Unknown / customer-initiated (Health)  → excluded from eligibility
-##   4. Remaining null                          → metric issue, excluded
-##   5. Remaining 0%                            → trusted as downtime
-##   6. Remaining degraded (0% < v < 100%)     → trusted as degraded availability
+#region Suspect gap investigation
+
+<#
+.SYNOPSIS
+    Classifies every suspect minute of the resources that have any, using Activity Log and Resource Health.
+
+.DESCRIPTION
+    For each candidate resource, collects Activity Log lifecycle events and Resource Health history
+    and classifies every suspect minute (null, 0% or degraded metric value). Virtual machines and
+    Azure SQL databases are the kinds served here; each follows its own algorithm (README, "Algorithms").
+
+    Virtual machines: zero minutes are attributed with the metric's Context dimension, Resource Health
+    notes are classified by what they say, platform notes explain minutes only within a bounded window,
+    and a gap stays explained by what started it.
+
+    SQL databases: a zero minute is excused inside a resume window or a customer Resource Health
+    window, is a Fault inside a platform window and is Unresolved otherwise.
+
+    Resource Health notes come from the REST history and the workspace combined, exactly as for the
+    other kinds (see Get-HealthSources). When Log Analytics data is provided, the Activity Log uses
+    the pre-fetched events; otherwise it is read per resource from the REST API.
+
+.PARAMETER Candidates
+    Resources with at least one suspect minute, with their null, zero and degraded ticks.
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent investigations.
+
+.PARAMETER GraceMinutes
+    Grace window after Activity Log lifecycle events.
+
+.PARAMETER FaultWindowMinutes
+    How long a platform Resource Health note can explain suspect minutes that the metric itself does
+    not attribute (VM algorithm).
+
+.PARAMETER HealthLeadMinutes
+    Minutes before a platform Resource Health event that a SQL zero minute is still attributed to it
+    (SQL algorithm).
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.PARAMETER HealthCoverageStart
+    Start of the period covered by Resource Health history.
+
+.PARAMETER LogAnalyticsData
+    Optional output of Get-LogAnalyticsData.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID with one classification record per resource.
+#>
 function Invoke-SuspectGapInvestigation {
     param(
         [object[]]$Candidates,
@@ -1544,6 +2330,8 @@ function Invoke-SuspectGapInvestigation {
         [DateTimeOffset]$PeriodEnd,
         [int]$ThrottleLimit,
         [int]$GraceMinutes,
+        [int]$FaultWindowMinutes = 30,
+        [int]$HealthLeadMinutes = 5,
         [string]$ArmToken,
         [DateTimeOffset]$HealthCoverageStart,
         [hashtable]$LogAnalyticsData
@@ -1554,27 +2342,26 @@ function Invoke-SuspectGapInvestigation {
     $total = $Candidates.Count
     $resultByRes = @{}
 
-    # REST API Resource Health retention cutoff — in hybrid mode, LA transitions
-    # older than this are kept and REST transitions cover the last ~30 days.
-    $restHealthCutoff = Get-RestHealthCutoff
+    $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
 
-    # Shared HttpClient for REST API calls within the parallel block.
-    # Always created: needed for Resource Health REST calls (sole source
-    # without -SourceWorkspaceId; hybrid supplement with -SourceWorkspaceId)
-    # and for Activity Log REST calls when -SourceWorkspaceId is not specified.
+    # Shared HttpClient for the REST calls within the parallel block: Resource Health (combined with
+    # the workspace history), the metric Context split, and the Activity Log when no workspace is used.
     $gapHttpClient = [System.Net.Http.HttpClient]::new()
     $gapHttpClient.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
     $gapHttpClient.Timeout = [TimeSpan]::FromMinutes(5)
 
     $Candidates | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        # Unpack the candidate and the values shared with the caller.
         $c         = $_
         $client      = $using:gapHttpClient
         $pStart      = $using:PeriodStart
         $pEnd        = $using:PeriodEnd
         $graceMin    = $using:GraceMinutes
+        $faultWinMin = $using:FaultWindowMinutes
+        $leadMin     = $using:HealthLeadMinutes
         $hcStart     = $using:HealthCoverageStart
         $laData      = $using:LogAnalyticsData
-        $restCutoff  = $using:restHealthCutoff
+        $healthSources = $using:healthSources
 
         # Pre-fetched Log Analytics data for this resource (if available)
         $resLaData = $null
@@ -1585,76 +2372,55 @@ function Invoke-SuspectGapInvestigation {
             }
         }
 
-        # ── Local helpers ─────────────────────────────────────────────
-        ## ARM GET with retry on 429/5xx and exponential backoff (shared HttpClient).
-        function script:ArmGet([string]$uri, [System.Net.Http.HttpClient]$httpClient) {
-            for ($a = 0; $a -lt 6; $a++) {
-                $httpReq = [System.Net.Http.HttpRequestMessage]::new(
-                    [System.Net.Http.HttpMethod]::Get, $uri)
-                $httpResp = $null
-                try {
-                    $httpResp = $httpClient.SendAsync($httpReq,
-                        [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
-                    ).GetAwaiter().GetResult()
-                    $sc = [int]$httpResp.StatusCode
-                    if ($sc -ge 200 -and $sc -lt 300) {
-                        return $httpResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                    }
-                    if (($sc -eq 429 -or $sc -ge 500) -and $a -lt 5) {
-                        Start-Sleep -Seconds ([math]::Min(30, [math]::Pow(2, $a)))
-                        continue
-                    }
-                    $httpResp.EnsureSuccessStatusCode() | Out-Null
-                } catch {
-                    if ($a -lt 5) {
-                        $code = try { [int]$_.Exception.InnerException.StatusCode } catch { 0 }
-                        if ($code -eq 429 -or $code -ge 500) {
-                            Start-Sleep -Seconds ([math]::Min(30, [math]::Pow(2, $a)))
-                            continue
-                        }
-                    }
-                    throw
-                } finally {
-                    if ($httpResp) { $httpResp.Dispose() }
-                    $httpReq.Dispose()
-                }
-            }
+        #region Local helpers
+        # Functions defined inside the parallel block: runspaces started by ForEach-Object -Parallel
+        # do not see the script's functions, so each iteration carries its own copies.
+
+        <#
+        .SYNOPSIS
+            Sends an ARM GET request and returns the parsed JSON response.
+        .DESCRIPTION
+            Uses the shared retrying client (AzHttp) and throws when the call fails.
+        .PARAMETER uri
+            Request URI.
+        .PARAMETER httpClient
+            Shared HttpClient carrying the bearer token.
+        .OUTPUTS
+            PSCustomObject - the response body (timestamps kept as strings).
+        #>
+        function script:GetArmJson([string]$uri, [System.Net.Http.HttpClient]$httpClient) {
+            $http = [AzHttp]::Get($httpClient, $uri)
+            if (-not $http.Doc) { throw "GET failed: $($http.Error)" }
+            try   { $http.Doc.RootElement.GetRawText() | ConvertFrom-Json -DateKind String }
+            finally { $http.Doc.Dispose() }
         }
 
-        ## Truncates a DateTimeOffset to the minute boundary (seconds = 0).
+        <#
+        .SYNOPSIS
+            Truncates a DateTimeOffset to the minute boundary.
+        .PARAMETER v
+            Timestamp to truncate.
+        .OUTPUTS
+            System.DateTimeOffset (UTC, seconds = 0).
+        #>
         function script:TruncMin([DateTimeOffset]$v) {
             [DateTimeOffset]::new($v.Year, $v.Month, $v.Day, $v.Hour, $v.Minute, 0, [TimeSpan]::Zero)
         }
 
-        ## Safely reads a string property from a JsonElement, returning '' if absent.
-        function script:GetJsonStr([System.Text.Json.JsonElement]$el, [string]$name) {
-            $v = [System.Text.Json.JsonElement]::new()
-            if ($el.TryGetProperty($name, [ref]$v) -and
-                $v.ValueKind -ne [System.Text.Json.JsonValueKind]::Null) {
-                return $v.GetString()
-            }
-            ''
-        }
-
-        ## Parses a timestamp string from Azure APIs (multiple formats) into a UTC DateTime.
-        function script:ParseTimestamp([string]$s) {
-            if ([string]::IsNullOrWhiteSpace($s)) { return $null }
-            $dto = [DateTimeOffset]::MinValue
-            if ([DateTimeOffset]::TryParse($s,
-                    [System.Globalization.CultureInfo]::InvariantCulture,
-                    [System.Globalization.DateTimeStyles]::AssumeUniversal,
-                    [ref]$dto)) {
-                return $dto.UtcDateTime
-            }
-            $null
-        }
-
-        ## Sorts intervals by FromTicks and merges overlapping/adjacent ones.
+        <#
+        .SYNOPSIS
+            Sorts intervals by start and merges the ones that overlap or touch.
+        .PARAMETER intervals
+            Objects with From, To, FromTicks and ToTicks.
+        .OUTPUTS
+            PSCustomObject[] - the merged, non-overlapping intervals.
+        #>
         function script:MergeIntervals([object[]]$intervals) {
             if ($intervals.Count -le 1) { return $intervals }
             $sorted = @($intervals | Sort-Object FromTicks)
             $merged = [System.Collections.Generic.List[object]]::new()
             $merged.Add($sorted[0])
+            # Extend the last merged interval while the next one starts inside it or touches it.
             for ($i = 1; $i -lt $sorted.Count; $i++) {
                 $last = $merged[$merged.Count - 1]
                 if ($sorted[$i].FromTicks -le $last.ToTicks) {
@@ -1667,57 +2433,135 @@ function Invoke-SuspectGapInvestigation {
             @($merged)
         }
 
-        # ── Activity Log ──────────────────────────────────────────────
+        <#
+        .SYNOPSIS
+            Builds the auto-resume windows of an Azure SQL database from its Activity Log resume events.
+        .DESCRIPTION
+            Events are grouped into one window per operation by proximity, not by correlation ID: the
+            platform logs the resume of a paused serverless database with an all-zero correlation ID, so
+            grouping by it would join every resume of the period into one window. Consecutive events
+            at most 5 minutes apart belong to the same operation (a window never exceeds 15 minutes), and
+            a failed operation leaves a lone Started event that explains a single minute. A window runs
+            from the minute of its first event to one minute after the minute of its last event, which
+            covers the first failed connections and the minute the resume completes.
+        .PARAMETER Events
+            Activity Log events (Timestamp) of the resume operation.
+        .OUTPUTS
+            PSCustomObject[] with From, To, FromTicks and ToTicks, merged and clamped to the period.
+        #>
+        function script:NewResumeIntervals($Events) {
+            $intervals = [System.Collections.Generic.List[object]]::new()
+            $first = $null; $last = $null
+            # Closes the open window: first event's minute to two minutes after the last event's minute, clamped to the period.
+            $close = {
+                $from = TruncMin $first
+                $to   = (TruncMin $last).AddMinutes(2)
+                if ($from -lt $pStart) { $from = $pStart }
+                if ($to -gt $pEnd)     { $to = $pEnd }
+                if ($to -gt $from) {
+                    $intervals.Add([PSCustomObject]@{ From = $from; To = $to; FromTicks = $from.UtcTicks; ToTicks = $to.UtcTicks })
+                }
+            }
+            # Start a new window when the gap exceeds 5 minutes or the window would exceed 15 minutes.
+            foreach ($evt in ($Events | Sort-Object Timestamp)) {
+                if ($first -and (($evt.Timestamp - $last).TotalMinutes -gt 5 -or ($evt.Timestamp - $first).TotalMinutes -gt 15)) {
+                    & $close; $first = $null
+                }
+                if (-not $first) { $first = $evt.Timestamp }
+                $last = $evt.Timestamp
+            }
+            if ($first) { & $close }
+            MergeIntervals @($intervals)
+        }
+        #endregion
+
+        #region Activity Log
         # Checks Activity Log for events that explain metric gaps:
-        #   a) Resource creation/deletion — VM timeCreated establishes initial
+        #   a) Resource creation/deletion — the creation time establishes initial
         #      existence; delete→write cycles establish later non-existence.
         #   b) Kind-specific lifecycle operations (VM start/deallocate/poweroff/restart,
-        #      SQL pause/resume, WebApp stop/start/restart). Kinds with no known
-        #      lifecycle ops (e.g. Storage) produce no matches here.
+        #      SQL resume).
         # When Log Analytics data is available, use pre-fetched events; otherwise call
         # the Activity Log REST API per-resource.
         $activityIntervals = @()
+        # The VM algorithm needs lifecycle and non-existence intervals separately: a measured
+        # zero is attributed before lifecycle windows are consulted.
+        $lifecycleIntervals    = @()
+        $nonExistenceIntervals = @()
 
-        if ($c.AllGapTicks.Count -gt 0 -or $c.DegradedTicks.Count -gt 0) {
+        if ($c.AllGapTicks.Count -gt 0 -or $c.DegradedTicks.Count -gt 0 -or $c.Kind -eq 'AzureSqlDatabase') {
             try {
+                # VM lifecycle: each operation explains the minutes around it, with the grace window.
                 $vmRules = @(
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/start/action', 'start virtual machine') }
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/deallocate/action', 'deallocate virtual machine') }
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/poweroff/action', 'power off virtual machine') }
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/restart/action', 'restart virtual machine') }
                 )
+                # SQL lifecycle: only the resume of a paused serverless database explains failed connections.
+                # No zero minute was ever explained by a pause alone, so pause events are not used.
                 $sqlRules = @(
-                    @{ ApplyGrace = $true; Tokens = @('microsoft.sql/servers/databases/pause', 'pause sql database', 'pause database') }
-                    @{ ApplyGrace = $true; Tokens = @('microsoft.sql/servers/databases/resume', 'resume sql database', 'resume database') }
-                )
-                # Web App lifecycle: stop applies grace (trailing zero metrics while process
-                # shuts down), start/restart apply grace for the brief recycle window.
-                $webAppRules = @(
-                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/stop/action', 'stop web app', 'stopwebsite') }
-                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/start/action', 'start web app', 'startwebsite') }
-                    @{ ApplyGrace = $true;  Tokens = @('microsoft.web/sites/restart/action', 'restart web app', 'restartwebsite') }
+                    @{ ApplyGrace = $false; Tokens = @('microsoft.sql/servers/databases/resume', 'resume sql database', 'resume database') }
                 )
                 $rules = switch ($c.Kind) {
                     'VirtualMachine'   { $vmRules }
                     'AzureSqlDatabase' { $sqlRules }
-                    'WebApp'           { $webAppRules }
                     default            { @() }
                 }
 
                 $events = [System.Collections.Generic.List[object]]::new()
 
-                # Resource creation/deletion tokens — derived from KindConfig
-                # namespace (e.g. 'microsoft.web/sites/write', 'microsoft.web/sites/delete').
+                # Resource creation/deletion tokens — derived from the metric namespace of the kind
+                # (e.g. 'microsoft.compute/virtualmachines/write', '.../delete').
                 # Used to build non-existence intervals where the resource did not exist:
                 # before the first write, between delete→write pairs, and after a
-                # trailing delete.  Applies universally to all resource kinds.
+                # trailing delete.
                 $createToken = (($using:KindConfig)[$c.Kind].Namespace + '/write').ToLowerInvariant()
                 $deleteToken = (($using:KindConfig)[$c.Kind].Namespace + '/delete').ToLowerInvariant()
                 $existenceEvents = [System.Collections.Generic.List[object]]::new()
 
-                # Unlike the generic ARM write operation, a VM's timeCreated value
+                <#
+                .SYNOPSIS
+                    Routes one Activity Log event to the existence and lifecycle lists.
+                .DESCRIPTION
+                    Creation (write) and deletion events feed the existence tracking; an event matching a
+                    lifecycle rule of the resource kind is kept, with the grace window of its rule, for the
+                    interval building below. Reads the enclosing scope's rules, tokens and event lists.
+                .PARAMETER OperationKey
+                    Operation name of the event (operation value, or its localized label).
+                .PARAMETER Timestamp
+                    When the event happened.
+                .PARAMETER CorrelationId
+                    Correlation ID that ties together the events of one operation.
+                #>
+                function script:AddActivityEvent([string]$OperationKey, [DateTimeOffset]$Timestamp, [string]$CorrelationId) {
+                    $normalized = $OperationKey.ToLowerInvariant()
+
+                    if ($normalized.Contains($createToken)) {
+                        $existenceEvents.Add([PSCustomObject]@{ Timestamp = $Timestamp; Type = 'Write' })
+                    }
+                    elseif ($normalized.Contains($deleteToken)) {
+                        $existenceEvents.Add([PSCustomObject]@{ Timestamp = $Timestamp; Type = 'Delete' })
+                    }
+
+                    # The first rule whose token matches keeps the event, with the grace window of that rule.
+                    foreach ($rule in $rules) {
+                        foreach ($token in $rule.Tokens) {
+                            if (-not $normalized.Contains($token)) { continue }
+                            $events.Add([PSCustomObject]@{
+                                Timestamp     = $Timestamp
+                                OperationKey  = $OperationKey
+                                CorrelationId = $CorrelationId
+                                GraceMinutes  = $rule.ApplyGrace ? $graceMin : 0
+                            })
+                            return
+                        }
+                    }
+                }
+
+                # Unlike the generic ARM write operation, the creation time of a VM or SQL database
                 # is authoritative creation evidence for its current incarnation.
-                if ($c.Kind -eq 'VirtualMachine' -and $null -ne $c.CreationTime) {
+                if ($c.Kind -in 'VirtualMachine', 'AzureSqlDatabase' -and $null -ne $c.CreationTime) {
                     $existenceEvents.Add([PSCustomObject]@{
                         Timestamp = [DateTimeOffset]$c.CreationTime
                         Type      = 'Created'
@@ -1727,41 +2571,12 @@ function Invoke-SuspectGapInvestigation {
                 if ($resLaData -and $resLaData.ActivityEvents.Count -gt 0) {
                     # ── Log Analytics path: use pre-fetched events ────
                     foreach ($laEvt in $resLaData.ActivityEvents) {
-                        $opKey = [string]$laEvt.OperationName
-                        if (-not $opKey) { continue }
-
-                        $normalized = $opKey.ToLowerInvariant()
-
-                        # Check for resource creation/deletion events
-                        if ($normalized.Contains($createToken)) {
-                            $existenceEvents.Add([PSCustomObject]@{ Timestamp = $laEvt.Timestamp; Type = 'Write' })
-                        }
-                        elseif ($normalized.Contains($deleteToken)) {
-                            $existenceEvents.Add([PSCustomObject]@{ Timestamp = $laEvt.Timestamp; Type = 'Delete' })
-                        }
-
-                        $matched = $false; $eventGrace = 0
-                        foreach ($rule in $rules) {
-                            foreach ($t in $rule.Tokens) {
-                                if ($normalized.Contains($t)) {
-                                    $matched = $true
-                                    $eventGrace = if ($rule.ApplyGrace) { $graceMin } else { 0 }
-                                    break
-                                }
-                            }
-                            if ($matched) { break }
-                        }
-                        if (-not $matched) { continue }
-
-                        $events.Add([PSCustomObject]@{
-                            Timestamp     = $laEvt.Timestamp
-                            OperationKey  = $opKey
-                            CorrelationId = [string]$laEvt.CorrelationId
-                            GraceMinutes  = $eventGrace
-                        })
+                        if (-not $laEvt.OperationName) { continue }
+                        AddActivityEvent ([string]$laEvt.OperationName) $laEvt.Timestamp ([string]$laEvt.CorrelationId)
                     }
                 } elseif (-not $laData) {
-                    # ── REST API path (original) ──────────────────────
+                    # ── REST API path: no workspace, read the Activity Log of this resource ──
+                    # Page through the Activity Log of the resource, filtered by time and resource.
                     $filter = "eventTimestamp ge '$($pStart.ToString('O'))' and eventTimestamp le '$($pEnd.ToString('O'))' and resourceUri eq '$($c.ResourceId)'"
                     $select = 'eventTimestamp,operationName,correlationId,status'
                     $url = "https://management.azure.com/subscriptions/$($c.SubscriptionId)" +
@@ -1769,76 +2584,28 @@ function Invoke-SuspectGapInvestigation {
                            "?api-version=2015-04-01&`$filter=$([uri]::EscapeDataString($filter))" +
                            "&`$select=$([uri]::EscapeDataString($select))"
 
+                    # The API returns pages: keep reading until there is no next link, then route the events.
+                    $restEvents = [System.Collections.Generic.List[ActivityEvent]]::new()
                     while ($url) {
-                        $json = ArmGet $url $client
-                        $doc = [System.Text.Json.JsonDocument]::Parse($json)
-                        try {
-                            $valEl = [System.Text.Json.JsonElement]::new()
-                            if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
-                                $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
-                                foreach ($item in $valEl.EnumerateArray()) {
-                                    $tsStr = GetJsonStr $item 'eventTimestamp'
-                                    $ts = ParseTimestamp $tsStr
-                                    if ($null -eq $ts) { continue }
-
-                                    $opValue = ''; $opLabel = ''
-                                    $opEl = [System.Text.Json.JsonElement]::new()
-                                    if ($item.TryGetProperty('operationName', [ref]$opEl) -and
-                                        $opEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
-                                        $opValue = GetJsonStr $opEl 'value'
-                                        $opLabel = GetJsonStr $opEl 'localizedValue'
-                                    }
-                                    $opKey = if ($opValue) { $opValue } else { $opLabel }
-                                    if (-not $opKey) { continue }
-
-                                    $normalized = $opKey.ToLowerInvariant()
-
-                                    # Check for resource creation/deletion events
-                                    if ($normalized.Contains($createToken)) {
-                                        $existenceEvents.Add([PSCustomObject]@{ Timestamp = [DateTimeOffset]$ts; Type = 'Write' })
-                                    }
-                                    elseif ($normalized.Contains($deleteToken)) {
-                                        $existenceEvents.Add([PSCustomObject]@{ Timestamp = [DateTimeOffset]$ts; Type = 'Delete' })
-                                    }
-
-                                    $matched = $false; $eventGrace = 0
-                                    foreach ($rule in $rules) {
-                                        foreach ($t in $rule.Tokens) {
-                                            if ($normalized.Contains($t)) {
-                                                $matched = $true
-                                                $eventGrace = if ($rule.ApplyGrace) { $graceMin } else { 0 }
-                                                break
-                                            }
-                                        }
-                                        if ($matched) { break }
-                                    }
-                                    if (-not $matched) { continue }
-
-                                    $corrId = GetJsonStr $item 'correlationId'
-                                    $events.Add([PSCustomObject]@{
-                                        Timestamp    = [DateTimeOffset]$ts
-                                        OperationKey = $opKey
-                                        CorrelationId = $corrId
-                                        GraceMinutes = $eventGrace
-                                    })
-                                }
-                            }
-
-                            $nextEl = [System.Text.Json.JsonElement]::new()
-                            $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
-                                       $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
-                                $nextEl.GetString()
-                            } else { $null }
-                        }
-                        finally { $doc.Dispose() }
+                        $http = [AzHttp]::Get($client, $url)
+                        if (-not $http.Doc) { throw $http.Error }
+                        try   { $url = [ActivityLogParser]::ReadPage($http.Doc, $restEvents) }
+                        finally { $http.Doc.Dispose() }
+                    }
+                    foreach ($e in $restEvents) {
+                        AddActivityEvent $e.Operation ([DateTimeOffset]::new($e.Ticks, [TimeSpan]::Zero)) $e.CorrelationId
                     }
                 }
 
-                # Build time intervals from events: group by operation+correlationId
-                # so that events belonging to the same action collapse into a single
-                # interval. Compute from/to per group, apply the grace window for
+                # Build time intervals from events. SQL resume events become one window per operation
+                # (see NewResumeIntervals). The other kinds group events by operation+correlationId
+                # so that events belonging to the same action collapse into a single interval.
+                # Compute from/to per group, apply the grace window for
                 # operations that have trailing transition time, then merge overlaps.
-                if ($events.Count -gt 0) {
+                if ($c.Kind -eq 'AzureSqlDatabase') {
+                    $activityIntervals = NewResumeIntervals $events
+                }
+                elseif ($events.Count -gt 0) {
                     # Group events by operation key + correlation ID.  Events without
                     # a correlation ID are grouped by their truncated timestamp.
                     $groups = @{}
@@ -1859,6 +2626,7 @@ function Invoke-SuspectGapInvestigation {
                         $maxTs = ($group | ForEach-Object { $_.Timestamp } | Measure-Object -Maximum).Maximum
                         $maxGr = ($group | ForEach-Object { $_.GraceMinutes } | Measure-Object -Maximum).Maximum
 
+                        # One interval per group: first event's minute to the last event's minute, plus one minute and the grace.
                         $from = TruncMin $minTs
                         $to   = (TruncMin $maxTs).AddMinutes(1)
                         if ($maxGr -gt 0) { $to = $to.AddMinutes($maxGr) }
@@ -1876,47 +2644,6 @@ function Invoke-SuspectGapInvestigation {
                     # Merge overlapping/adjacent intervals so that overlapping
                     # lifecycle events don't double-count.
                     $activityIntervals = MergeIntervals $rawIntervals
-
-                    # Build paired stop→start intervals for web apps.  Unlike VMs
-                    # (where Resource Health reports "Unavailable – Customer Initiated"
-                    # for the entire deallocated period), stopped web apps show only
-                    # "Available" in Resource Health.  We must infer the full stopped
-                    # window from the Activity Log stop and start/restart events.
-                    if ($c.Kind -eq 'WebApp') {
-                        $stopTokens  = $webAppRules[0].Tokens          # stop
-                        $startTokens = $webAppRules[1].Tokens + $webAppRules[2].Tokens  # start + restart
-
-                        $stopTs  = [System.Collections.Generic.List[DateTimeOffset]]::new()
-                        $startTs = [System.Collections.Generic.List[DateTimeOffset]]::new()
-                        foreach ($evt in $events) {
-                            $norm = $evt.OperationKey.ToLowerInvariant()
-                            foreach ($t in $stopTokens)  { if ($norm.Contains($t)) { $stopTs.Add($evt.Timestamp); break } }
-                            foreach ($t in $startTokens) { if ($norm.Contains($t)) { $startTs.Add($evt.Timestamp); break } }
-                        }
-
-                        if ($stopTs.Count -gt 0) {
-                            $stopTs  = [System.Collections.Generic.List[DateTimeOffset]]($stopTs  | Sort-Object | Select-Object -Unique)
-                            $startTs = [System.Collections.Generic.List[DateTimeOffset]]($startTs | Sort-Object | Select-Object -Unique)
-
-                            $pairedIntervals = [System.Collections.Generic.List[object]]::new()
-                            foreach ($st in $stopTs) {
-                                $nextStart = $startTs | Where-Object { $_ -gt $st } | Select-Object -First 1
-                                $from = TruncMin $st
-                                $to   = if ($nextStart) { (TruncMin $nextStart).AddMinutes(1 + $graceMin) } else { $pEnd }
-                                if ($from -lt $pStart) { $from = $pStart }
-                                if ($to -gt $pEnd)     { $to = $pEnd }
-                                if ($to -gt $from) {
-                                    $pairedIntervals.Add([PSCustomObject]@{
-                                        From = $from;  To = $to
-                                        FromTicks = $from.UtcTicks; ToTicks = $to.UtcTicks
-                                    })
-                                }
-                            }
-                            if ($pairedIntervals.Count -gt 0) {
-                                $activityIntervals = MergeIntervals (@($activityIntervals) + @($pairedIntervals))
-                            }
-                        }
-                    }
                 }
 
                 # Build non-existence intervals from resource creation/deletion
@@ -1928,9 +2655,12 @@ function Invoke-SuspectGapInvestigation {
                 #   - periodStart → VM timeCreated (when no prior incarnation is seen)
                 #   - Delete → next Write (destroy/recreate cycle)
                 #   - last Delete → periodEnd (resource deleted, not recreated)
+                $lifecycleIntervals = @($activityIntervals)
                 if ($existenceEvents.Count -gt 0) {
                     $sortedExEvts = $existenceEvents | Sort-Object Timestamp
                     $nonExistIntervals = [System.Collections.Generic.List[object]]::new()
+                    # Initial state: existing when created before the period, absent when created inside it
+                    # (unless a delete came first), otherwise unknown.
                     $createdEvent = $sortedExEvts | Where-Object { $_.Type -eq 'Created' } | Select-Object -First 1
                     $deleteBeforeCreation = $createdEvent -and ($sortedExEvts | Where-Object {
                         $_.Type -eq 'Delete' -and $_.Timestamp -lt $createdEvent.Timestamp
@@ -1942,10 +2672,12 @@ function Invoke-SuspectGapInvestigation {
                     } else {
                         'unknown'
                     }
+                    # Non-existence runs from the start of the period when the resource was created inside it.
                     $nonExistStart = $null   # timestamp where non-existence began
                     $absenceEstablishedByDelete = $false
                     if ($exState -eq 'not-exists') { $nonExistStart = $pStart }
 
+                    # Replay the events in time order.
                     foreach ($exEvt in $sortedExEvts) {
                         if ($exEvt.Type -eq 'Created' -or $exEvt.Type -eq 'Write') {
                             $isAuthoritativeCreation = $exEvt.Type -eq 'Created'
@@ -1988,6 +2720,7 @@ function Invoke-SuspectGapInvestigation {
                     }
 
                     # Merge non-existence intervals with lifecycle activity intervals
+                    $nonExistenceIntervals = @($nonExistIntervals)
                     if ($nonExistIntervals.Count -gt 0) {
                         $activityIntervals = MergeIntervals (@($activityIntervals) + @($nonExistIntervals))
                     }
@@ -1998,171 +2731,36 @@ function Invoke-SuspectGapInvestigation {
             }
         }
 
-        # ── Resource Health ───────────────────────────────────────────
-        # Query Resource Health transitions to classify platform faults,
-        # unknown states, and customer-initiated events.
-        # Hybrid mode (-SourceWorkspaceId): LA transitions older than the REST
-        # API ~30-day cutoff are merged with REST API transitions for the last
-        # ~30 days.  REST data is authoritative within its retention window:
-        # it provides curated synthetic entries that fill coverage gaps
-        # between incidents and retroactively corrects cause classification.
-        # REST-only mode (no -SourceWorkspaceId): REST API is the sole source.
+        #endregion
+
+        #region Resource Health
+        # Both algorithms read the same combined history (Get-HealthSources, HealthHistory.Collect): the
+        # REST history plus, with a workspace, the Activity Log events. VMs classify each note, SQL
+        # databases turn the notes into impact windows. It is skipped when the period lies entirely
+        # outside the coverage of the available sources.
         $healthHistoryApplied = [DateTimeOffset]$hcStart -lt [DateTimeOffset]$pEnd
-        $faultIntervals    = @()
-        $unknownIntervals  = @()
-        $customerIntervals = @()
+        # Classified Resource Health notes (UTC ticks + class) used by the VM algorithm.
+        $vmEntries = [System.Collections.Generic.List[object]]::new()
+        # Impact windows built from the combined history, used by the SQL algorithm.
+        $healthWindows = @()
 
         if ($healthHistoryApplied) {
             try {
-                $transitions = [System.Collections.Generic.List[object]]::new()
-
-                # In hybrid mode, add LA transitions older than the REST cutoff
-                if ($laData -and $resLaData -and $resLaData.HealthTransitions.Count -gt 0) {
-                    foreach ($ht in $resLaData.HealthTransitions) {
-                        if ($ht.OccurredOn -lt $restCutoff) {
-                            $transitions.Add($ht)
-                        }
+                # One combined history (REST + workspace) per resource.
+                $fetch = [HealthHistory]::Collect($client, $c.ResourceId,
+                    $healthSources.WorkspaceNotes[$c.ResourceId.ToLowerInvariant()], $healthSources.UseRest)
+                if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($c.Name)': $($fetch.Error)" }
+                # VMs classify each note by what it says; SQL databases turn the notes into impact windows.
+                if ($c.Kind -eq 'VirtualMachine') {
+                    foreach ($note in $fetch.Notes) {
+                        $vmEntries.Add([PSCustomObject]@{
+                            Ticks = $note.Ticks
+                            Class = [VmHealthClassifier]::Classify($note.Title, $note.State, $note.Customer, $note.Reason)
+                        })
                     }
                 }
-
-                # Fetch REST health transitions when they can overlap the period.
-                # In hybrid mode, Log Analytics is sufficient when the period
-                # ends before the REST API's ~30-day retention window.
-                $useRestHealth = $null -eq $laData -or $pEnd -gt $restCutoff
-                $url = if ($useRestHealth) {
-                    "https://management.azure.com$($c.ResourceId)" +
-                    "/providers/Microsoft.ResourceHealth/availabilityStatuses" +
-                    "?api-version=2025-05-01"
-                } else { $null }
-
-                while ($url) {
-                    $json = ArmGet $url $client
-                    $doc = [System.Text.Json.JsonDocument]::Parse($json)
-                    try {
-                        $valEl = [System.Text.Json.JsonElement]::new()
-                        if ($doc.RootElement.TryGetProperty('value', [ref]$valEl) -and
-                            $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
-                            foreach ($item in $valEl.EnumerateArray()) {
-                                $propsEl = [System.Text.Json.JsonElement]::new()
-                                if (-not $item.TryGetProperty('properties', [ref]$propsEl)) { continue }
-
-                                $occurredStr = GetJsonStr $propsEl 'occuredTime'
-                                $occurred = ParseTimestamp $occurredStr
-                                if ($null -eq $occurred) { continue }
-
-                                $transitions.Add([PSCustomObject]@{
-                                    OccurredOn       = [DateTimeOffset]$occurred
-                                    State            = GetJsonStr $propsEl 'availabilityState'
-                                    ReasonType       = GetJsonStr $propsEl 'reasonType'
-                                    Context          = GetJsonStr $propsEl 'context'
-                                    HealthEventCause = GetJsonStr $propsEl 'healthEventCause'
-                                })
-                            }
-                        }
-
-                        $nextEl = [System.Text.Json.JsonElement]::new()
-                        $url = if ($doc.RootElement.TryGetProperty('nextLink', [ref]$nextEl) -and
-                                   $nextEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
-                            $nextEl.GetString()
-                        } else { $null }
-                    }
-                    finally { $doc.Dispose() }
-                }
-
-                # Sort transitions chronologically (REST API returns newest-
-                # first; LA data arrives in query order — sort to be safe)
-                $transArr = @($transitions | Sort-Object { $_.OccurredOn })
-
-                # Helper: checks multiple fields for customer-initiated indicators
-                # (REST uses ReasonType; LA uses HealthEventCause; both use Context)
-                $isCust = {
-                    param($t)
-                    $t.ReasonType -eq 'Customer Initiated' -or
-                    $t.ReasonType -eq 'User Initiated' -or
-                    $t.Context -eq 'Customer Initiated' -or
-                    $t.HealthEventCause -eq 'UserInitiated'
-                }
-
-                # Build fault intervals — open when state becomes Unavailable/Degraded
-                # (non-customer, non-unknown), close when state changes back.
-                # Clamped to health coverage start and observation period end.
-                $fStart = $null
-                foreach ($t in $transArr) {
-                    $isAvail   = $t.State -eq 'Available'
-                    $isUnknown = $t.State -eq 'Unknown'
-                    $isC       = & $isCust $t
-                    $isFault   = -not $isAvail -and -not $isUnknown -and -not $isC
-
-                    if ($isFault -and $null -eq $fStart) {
-                        $fStart = if ($t.OccurredOn -lt $hcStart) { [DateTimeOffset]$hcStart } else { $t.OccurredOn }
-                    } elseif (-not $isFault -and $null -ne $fStart) {
-                        $fE = if ($t.OccurredOn -gt $pEnd) { [DateTimeOffset]$pEnd } else { $t.OccurredOn }
-                        if ($fE -gt $fStart) {
-                            $faultIntervals += [PSCustomObject]@{
-                                From = $fStart; To = $fE
-                                FromTicks = $fStart.UtcTicks; ToTicks = $fE.UtcTicks
-                            }
-                        }
-                        $fStart = $null
-                    }
-                }
-                # Still in fault at end of transitions — extend to period end
-                if ($null -ne $fStart) {
-                    $faultIntervals += [PSCustomObject]@{
-                        From = $fStart; To = [DateTimeOffset]$pEnd
-                        FromTicks = $fStart.UtcTicks; ToTicks = ([DateTimeOffset]$pEnd).UtcTicks
-                    }
-                }
-
-                # Build unknown intervals — Azure reports 'Unknown' when it
-                # cannot determine health (monitoring gap, not necessarily an outage).
-                $uStart = $null
-                foreach ($t in $transArr) {
-                    $isUnknown = $t.State -eq 'Unknown'
-                    if ($isUnknown -and $null -eq $uStart) {
-                        $uStart = if ($t.OccurredOn -lt $hcStart) { [DateTimeOffset]$hcStart } else { $t.OccurredOn }
-                    } elseif (-not $isUnknown -and $null -ne $uStart) {
-                        $uE = if ($t.OccurredOn -gt $pEnd) { [DateTimeOffset]$pEnd } else { $t.OccurredOn }
-                        if ($uE -gt $uStart) {
-                            $unknownIntervals += [PSCustomObject]@{
-                                From = $uStart; To = $uE
-                                FromTicks = $uStart.UtcTicks; ToTicks = $uE.UtcTicks
-                            }
-                        }
-                        $uStart = $null
-                    }
-                }
-                if ($null -ne $uStart) {
-                    $unknownIntervals += [PSCustomObject]@{
-                        From = $uStart; To = [DateTimeOffset]$pEnd
-                        FromTicks = $uStart.UtcTicks; ToTicks = ([DateTimeOffset]$pEnd).UtcTicks
-                    }
-                }
-
-                # Build customer-initiated intervals — VM stops, restarts, etc.
-                # that are not platform faults. These minutes are excluded from
-                # eligibility (customer chose to cause the unavailability).
-                $cStart = $null
-                foreach ($t in $transArr) {
-                    $isC = & $isCust $t
-                    if ($isC -and $null -eq $cStart) {
-                        $cStart = if ($t.OccurredOn -lt $hcStart) { [DateTimeOffset]$hcStart } else { $t.OccurredOn }
-                    } elseif (-not $isC -and $null -ne $cStart) {
-                        $cE = if ($t.OccurredOn -gt $pEnd) { [DateTimeOffset]$pEnd } else { $t.OccurredOn }
-                        if ($cE -gt $cStart) {
-                            $customerIntervals += [PSCustomObject]@{
-                                From = $cStart; To = $cE
-                                FromTicks = $cStart.UtcTicks; ToTicks = $cE.UtcTicks
-                            }
-                        }
-                        $cStart = $null
-                    }
-                }
-                if ($null -ne $cStart) {
-                    $customerIntervals += [PSCustomObject]@{
-                        From = $cStart; To = [DateTimeOffset]$pEnd
-                        FromTicks = $cStart.UtcTicks; ToTicks = ([DateTimeOffset]$pEnd).UtcTicks
-                    }
+                else {
+                    $healthWindows = @([HealthHistory]::BuildWindows($fetch.Notes, 30 * 600000000L, 2 * 600000000L))
                 }
             }
             catch {
@@ -2170,44 +2768,226 @@ function Invoke-SuspectGapInvestigation {
             }
         }
 
-        # ── Classify each suspect tick ────────────────────────────────
-        # Expands intervals into HashSets of minute-aligned ticks and classifies
-        # every suspect minute via compiled C# (GapProcessor). Precedence:
-        #   1. Platform fault (Resource Health)       → stays eligible, 0 available
-        #   2. Lifecycle activity (Activity Log)       → excluded from eligibility
-        #   3. Unknown / customer-initiated (Health)  → excluded from eligibility
-        #   4. Remaining null                          → metric issue, excluded
-        #   5. Remaining 0%                            → downtime, stays eligible
-        #   6. Remaining degraded (0% < v < 100%)     → trusted, stays eligible
-        $aFrom = [long[]]@($activityIntervals | ForEach-Object { $_.FromTicks })
-        $aTo   = [long[]]@($activityIntervals | ForEach-Object { $_.ToTicks })
-        $fFrom = [long[]]@($faultIntervals    | ForEach-Object { $_.FromTicks })
-        $fTo   = [long[]]@($faultIntervals    | ForEach-Object { $_.ToTicks })
-        $uFrom = [long[]]@($unknownIntervals  | ForEach-Object { $_.FromTicks })
-        $uTo   = [long[]]@($unknownIntervals  | ForEach-Object { $_.ToTicks })
-        $cFrom = [long[]]@($customerIntervals | ForEach-Object { $_.FromTicks })
-        $cTo   = [long[]]@($customerIntervals | ForEach-Object { $_.ToTicks })
+        #endregion
 
-        $activityTickSet = [GapProcessor]::ExpandToTickSet($aFrom, $aTo)
-        $faultTickSet    = [GapProcessor]::ExpandToTickSet($fFrom, $fTo)
-        $unknownTickSet  = [GapProcessor]::ExpandToTickSet($uFrom, $uTo)
-        $customerTickSet = [GapProcessor]::ExpandToTickSet($cFrom, $cTo)
+        #region Classify each suspect minute
+        # Virtual machines and SQL databases each follow their own algorithm (README, "Algorithms").
+        # Both fill $cr (counts per outcome), $outcomeText (one-line summary) and $evidence.
+        $outcomeText  = $null
+        $outcomeLabel = $null
+        $evidence     = [System.Collections.Generic.List[string]]::new()
 
-        $hcStartTicks = ([DateTimeOffset]$hcStart).UtcTicks
+        if ($c.Kind -eq 'VirtualMachine') {
+            # Who caused each zero minute: a second metric call split by the Context
+            # dimension (Platform / User / Unknown). Without it, zeros stay Unknown.
+            $zeroTicks = [long[]]@($c.ZeroTicksArray)
+            # Every zero starts as Unknown (8) until the Context split says otherwise.
+            $zeroMasks = [int[]]::new($zeroTicks.Length)
+            for ($i = 0; $i -lt $zeroMasks.Length; $i++) { $zeroMasks[$i] = 8 }
+            if ($zeroTicks.Length -gt 0) {
+                try {
+                    # A second call splits the metric by its Context dimension (Platform / User / Unknown).
+                    $ctxUrl = "https://management.azure.com$($c.ResourceId)/providers/Microsoft.Insights/metrics?" +
+                              'api-version=2024-02-01&metricnamespace=Microsoft.Compute%2FvirtualMachines' +
+                              '&metricnames=VmAvailabilityMetric&interval=PT1M&aggregation=Minimum' +
+                              "&timespan=$($pStart.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($pEnd.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))" +
+                              '&$filter=' + [uri]::EscapeDataString("Context eq '*'")
+                    $ctxHttp = [AzHttp]::Get($client, $ctxUrl)
+                    if (-not $ctxHttp.Doc) { throw $ctxHttp.Error }
+                    try { $zeroMasks = [VmGapClassifier]::GetZeroMasks($ctxHttp.Doc, $zeroTicks) }
+                    finally { $ctxHttp.Doc.Dispose() }
+                }
+                catch {
+                    Write-Warning "Metric Context query failed for '$($c.Name)'; zero minutes treated as Unknown: $_"
+                }
+            }
 
-        $cr = [GapProcessor]::ClassifyGaps(
-            [long[]]@($c.AllGapTicks),
-            [long[]]@($c.ZeroTicksArray),
-            [long[]]@($c.DegradedTicks),
-            [double[]]@($c.DegradedValues),
-            $activityTickSet, $faultTickSet, $unknownTickSet, $customerTickSet,
-            $healthHistoryApplied, $hcStartTicks)
+            # Health notes in time order; lifecycle and non-existence intervals as tick pairs.
+            $sortedNotes = @($vmEntries | Sort-Object Ticks)
+            $lcFrom = [long[]]@($lifecycleIntervals    | ForEach-Object { $_.FromTicks })
+            $lcTo   = [long[]]@($lifecycleIntervals    | ForEach-Object { $_.ToTicks })
+            $nxFrom = [long[]]@($nonExistenceIntervals | ForEach-Object { $_.FromTicks })
+            $nxTo   = [long[]]@($nonExistenceIntervals | ForEach-Object { $_.ToTicks })
+
+            # Run the compiled VM algorithm over every suspect minute of the VM.
+            $vr = [VmGapClassifier]::Classify(
+                [long[]]@($c.NullTicksArray), $zeroTicks, $zeroMasks,
+                [long[]]@($c.DegradedTicks), [double[]]@($c.DegradedValues),
+                $lcFrom, $lcTo, $nxFrom, $nxTo,
+                [long[]]@($sortedNotes | ForEach-Object { $_.Ticks }),
+                [int[]]@($sortedNotes  | ForEach-Object { $_.Class }),
+                ([long]$faultWinMin * 600000000L))
+
+            # Map outcomes to the record the final assembly step consumes:
+            #   1,2 platform fault | 3,5 lifecycle | 4,6,7,8,9,12 explained | 10 metric gap | 11 unresolved
+            $gap = $vr.GapCounts; $deg = $vr.DegCounts
+            $degExcused = 0
+            foreach ($k in 3..10 + 12) { $degExcused += $deg[$k] }
+            $cr = [PSCustomObject]@{
+                PlatformFaultGapMin          = $gap[1] + $gap[2]
+                ActivityLogExcludedGapMin    = $gap[3] + $gap[5]
+                HealthExplainedGapMin        = $gap[4] + $gap[6] + $gap[7] + $gap[8] + $gap[9] + $gap[12]
+                MetricIssueNullMin           = $gap[10]
+                UnresolvedZeroDowntimeMin    = $gap[11]
+                HealthConfirmedDegradedMin   = $deg[1] + $deg[2]
+                ActivityLogDegradedMin       = $deg[3] + $deg[5]
+                CustomerExcusedDegradedMin   = $degExcused
+                CustomerExcusedDegradedAvail = $vr.ExcusedDegradedAvail
+            }
+
+            # One-line breakdown of what decided the suspect minutes, for the console narration.
+            $outcomeNames = 'platform fault (metric Context)', 'platform fault (health note)', 'before creation',
+                'customer (metric Context)', 'lifecycle operation', 'customer (health note)', 'planned maintenance',
+                'spot eviction', 'health unknown', 'metric gap', 'unresolved 0%', 'continues customer stop'
+            $outcomeLabel = 'VM algorithm'
+            $outcomeText = (@(foreach ($k in 1..12) {
+                $n = $gap[$k] + $deg[$k]
+                if ($n -gt 0) { "$($outcomeNames[$k - 1]) $n" }
+            })) -join '; '
+        }
+        elseif ($c.Kind -eq 'AzureSqlDatabase') {
+            # SQL algorithm (README, "Algorithms > Azure SQL databases"). The metric is 0 when every connection of
+            # the minute failed with a system error and 100 otherwise (never null in practice), so a zero minute
+            # is the only downtime signal. Decision order for a zero minute:
+            #   before creation -> excused; inside a resume window -> excused (auto-resume is by design);
+            #   inside a customer health window -> excused; inside a platform health window -> Fault;
+            #   anything else -> Unresolved. A null minute is a metric gap unless creation or a resume explains it.
+            $tpm = 600000000L
+            $leadTicks  = $leadMin * $tpm
+            $graceTicks = 2 * $tpm
+            # True when the minute lies inside any of the given intervals.
+            $inAny = {
+                param($list, [long]$t)
+                foreach ($w in $list) { if ($t -ge $w.FromTicks -and $t -lt $w.ToTicks) { return $true } }
+                $false
+            }
+            $lifecycle = @($lifecycleIntervals)
+            $nonExist  = @($nonExistenceIntervals)
+            $n = @{ NotExists = 0; Resume = 0; Customer = 0; Fault = 0; Unresolved = 0; Gap = 0 }
+            $badMinutes = [System.Collections.Generic.List[object]]::new()   # Fault and Unresolved minutes, for the evidence
+
+            foreach ($t in [long[]]@($c.ZeroTicksArray)) {
+                # Zero minute: apply the decision order described above.
+                if (& $inAny $nonExist $t)  { $n.NotExists++; continue }
+                if (& $inAny $lifecycle $t) { $n.Resume++; continue }
+                $win = $null
+                foreach ($w in $healthWindows) {
+                    if ($t -ge $w.Start - $leadTicks -and $t -le $w.End + $graceTicks) { $win = $w; break }
+                }
+                if ($win -and $win.Customer) { $n.Customer++ }
+                elseif ($win) { $n.Fault++;      $badMinutes.Add([PSCustomObject]@{ Ticks = $t; Verdict = 'Fault'; Title = $win.Title }) }
+                else          { $n.Unresolved++; $badMinutes.Add([PSCustomObject]@{ Ticks = $t; Verdict = 'Unresolved'; Title = '' }) }
+            }
+            # Null minute: excused by creation or a resume, otherwise a metric gap.
+            foreach ($t in [long[]]@($c.NullTicksArray)) {
+                if (& $inAny $nonExist $t)  { $n.NotExists++ }
+                elseif (& $inAny $lifecycle $t) { $n.Resume++ }
+                else { $n.Gap++ }
+            }
+
+            # The same record shape as the VM branch, so Step 7 treats both kinds alike (no degraded minutes for SQL).
+            $cr = [PSCustomObject]@{
+                PlatformFaultGapMin          = $n.Fault
+                ActivityLogExcludedGapMin    = $n.NotExists + $n.Resume
+                HealthExplainedGapMin        = $n.Customer
+                MetricIssueNullMin           = $n.Gap
+                UnresolvedZeroDowntimeMin    = $n.Unresolved
+                HealthConfirmedDegradedMin   = 0
+                ActivityLogDegradedMin       = 0
+                CustomerExcusedDegradedMin   = 0
+                CustomerExcusedDegradedAvail = 0
+            }
+            # One-line summary of what decided the suspect minutes, for the console narration.
+            $outcomeLabel = 'SQL algorithm'
+            $outcomeText = (@(
+                if ($n.NotExists   -gt 0) { "before creation $($n.NotExists)" }
+                if ($n.Resume      -gt 0) { "auto-resume $($n.Resume)" }
+                if ($n.Customer    -gt 0) { "customer (health note) $($n.Customer)" }
+                if ($n.Fault       -gt 0) { "platform fault (health note) $($n.Fault)" }
+                if ($n.Gap         -gt 0) { "metric gap $($n.Gap)" }
+                if ($n.Unresolved  -gt 0) { "unresolved 0% $($n.Unresolved)" }
+            )) -join '; '
+
+            #region SQL evidence
+            # What the failed connections were, for the minutes that count against availability: the error
+            # codes of connection_failed and the successful connections of the same minute. One pair of calls
+            # per day that has such minutes (at most 6 days).
+            if ($badMinutes.Count -gt 0) {
+                # Detail per minute (keyed by its ticks): the error codes and the successful connections.
+                $detail = @{}
+                $days = @($badMinutes | ForEach-Object { [long][math]::Floor($_.Ticks / 864000000000L) } | Sort-Object -Unique | Select-Object -First 6)
+                foreach ($day in $days) {
+                    # One call per day keeps each response small; the day starts at midnight UTC.
+                    $dayStart = [DateTime]::new($day * 864000000000L, [DateTimeKind]::Utc)
+                    $base = "https://management.azure.com$($c.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+                            '&metricnamespace=Microsoft.Sql%2Fservers%2Fdatabases&aggregation=Total&interval=PT1M' +
+                            "&timespan=$($dayStart.ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($dayStart.AddDays(1).ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+                    try {
+                        # connection_failed is split by its Error dimension; connection_successful is one series.
+                        $failedResp = GetArmJson ($base + '&metricnames=connection_failed&$filter=' + [uri]::EscapeDataString("Error eq '*'")) $client
+                        $okResp     = GetArmJson ($base + '&metricnames=connection_successful') $client
+                    }
+                    catch { Write-Warning "SQL connection metrics failed for '$($c.Name)': $_"; continue }
+                    # Failed connections: one series per error code; keep them per minute.
+                    foreach ($series in $failedResp.value[0].timeseries) {
+                        $code = ($series.metadatavalues | Where-Object { $_.name.value -eq 'error' }).value
+                        # The index of a data point is its minute within the day.
+                        for ($i = 0; $i -lt $series.data.Count; $i++) {
+                            $v = $series.data[$i].PSObject.Properties['total']
+                            if ($v -and $v.Value -gt 0) {
+                                $key = $dayStart.Ticks + $i * $tpm
+                                if (-not $detail.ContainsKey($key)) { $detail[$key] = @{ Errors = @(); Ok = 0 } }
+                                $detail[$key].Errors += "$code x$($v.Value)"
+                            }
+                        }
+                    }
+                    # Successful connections of the same minutes (attached to the minutes that had failures).
+                    $okData = $okResp.value[0].timeseries[0].data
+                    for ($i = 0; $i -lt $okData.Count; $i++) {
+                        $v = $okData[$i].PSObject.Properties['total']
+                        if ($v -and $v.Value -gt 0) {
+                            $key = $dayStart.Ticks + $i * $tpm
+                            if ($detail.ContainsKey($key)) { $detail[$key].Ok = $v.Value }
+                        }
+                    }
+                }
+                # One evidence line for each of the first five minutes that count.
+                foreach ($b in ($badMinutes | Select-Object -First 5)) {
+                    $d = $detail[[long]$b.Ticks]
+                    $what = $d ? "$($d.Errors -join ', ') failed connection(s), $($d.Ok) successful" : 'no connection metric data for the minute'
+                    $why  = $b.Verdict -eq 'Fault' ? "Resource Health '$($b.Title)'" : 'no Resource Health event'
+                    $evidence.Add("minute $([DateTime]::new([long]$b.Ticks, [DateTimeKind]::Utc).ToString('u')): $what -> $($b.Verdict) ($why)")
+                }
+                if ($badMinutes.Count -gt 5) { $evidence.Add("... and $($badMinutes.Count - 5) more minute(s) counted against availability") }
+            }
+
+            # Resource Health platform events that produced no zero minute and are not an auto-resume: brief
+            # failures (Resource Health reports about two seconds) that the metric does not count, because
+            # at least one connection succeeded in the minute.
+            $briefEvents = 0
+            $zeroTicksAll = [long[]]@($c.ZeroTicksArray)
+            foreach ($w in $healthWindows) {
+                # A brief event is a platform event inside the period that overlaps neither a resume nor a zero minute.
+                if ($w.Customer -or $w.End -lt $pStart.UtcTicks -or $w.Start -ge $pEnd.UtcTicks) { continue }
+                $from = $w.Start - $leadTicks; $to = $w.End + $graceTicks
+                # A resume that overlaps the event explains it; a zero minute inside it means the metric did count it.
+                $overlapsResume = $false
+                foreach ($r in $lifecycle) { if ($r.FromTicks -lt $to -and $r.ToTicks -gt $from) { $overlapsResume = $true; break } }
+                if ($overlapsResume) { continue }
+                $hasZero = $false
+                foreach ($t in $zeroTicksAll) { if ($t -ge $from -and $t -le $to) { $hasZero = $true; break } }
+                if (-not $hasZero) { $briefEvents++ }
+            }
+            if ($briefEvents -gt 0) {
+                $evidence.Add("$briefEvents Resource Health platform event(s) without a zero minute: brief failures that the metric does not count (some connections succeeded in the minute)")
+            }
+            #endregion
+        }
 
         # Emit the classification result for this resource — will be wired
         # into the eligibility record in Step 7 of the main pipeline.
         [PSCustomObject]@{
             ResourceId                        = $c.ResourceId
-            HealthHistoryApplied              = $healthHistoryApplied
             ActivityLogExcludedGapMinutes     = $cr.ActivityLogExcludedGapMin
             HealthExplainedGapMinutes         = $cr.HealthExplainedGapMin
             MetricIssueNullMinutes            = $cr.MetricIssueNullMin
@@ -2217,7 +2997,11 @@ function Invoke-SuspectGapInvestigation {
             CustomerExcusedDegradedAvailableSum = $cr.CustomerExcusedDegradedAvail
             ActivityLogDegradedMinutes        = $cr.ActivityLogDegradedMin
             HealthConfirmedDegradedMinutes    = $cr.HealthConfirmedDegradedMin
+            OutcomeText                       = $outcomeText
+            OutcomeLabel                      = $outcomeLabel
+            Evidence                          = @($evidence)
         }
+        #endregion
     } | ForEach-Object {
         $done++
         $resultByRes[$_.ResourceId.ToLowerInvariant()] = $_
@@ -2232,9 +3016,894 @@ function Invoke-SuspectGapInvestigation {
     $resultByRes
 }
 
-# ── Output ────────────────────────────────────────────────────────────────────
+#endregion
 
-## Prints a fixed-width table with one row per resource showing availability metrics.
+#region Storage algorithm
+# Storage accounts do not use the PT1M Availability metric: its Minimum is the worst single
+# ApiName/Authentication/GeoType series of the minute, so one failed request can cost a full minute.
+# Instead the score follows the Azure Storage SLA: failed / counted requests per hour, averaged over
+# the hours of the period, idle hours counting as available (README, "Algorithms > Storage accounts").
+
+# Only these response types are requested: counted = Success + server failures. Throttling, network,
+# client and authentication errors are therefore never part of the score.
+$StorageResponseFilter = "ResponseType eq 'Success' or ResponseType eq 'ServerOtherError' or ResponseType eq 'ServerTimeoutError'"
+
+# Accounts with fewer counted requests than this in the period are flagged as low-volume.
+$StorageLowVolumeRequests = 10000
+
+<#
+.SYNOPSIS
+    Gets the hourly counted and failed request totals of storage accounts for the whole period.
+
+.DESCRIPTION
+    One Azure Monitor call per account (Transactions, PT1H, Total, filtered to Success and server
+    failures). A failed query yields a null result, which excludes the account from availability.
+
+.PARAMETER Resources
+    Storage account descriptors from Get-ResourceInventory.
+
+.PARAMETER PeriodStart
+    Start of the observation window (aligned to a whole hour).
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent calls.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID; each value is a StorageHourly or $null.
+#>
+function Get-StorageHourlyCounts {
+    param(
+        [object[]]$Resources,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$ThrottleLimit,
+        [string]$ArmToken
+    )
+
+    $hours      = [int][math]::Ceiling(($PeriodEnd - $PeriodStart).TotalHours)
+    $startTicks = $PeriodStart.UtcTicks
+    $timespan   = "$($PeriodStart.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($PeriodEnd.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+    # Hourly slots of the period; the filter keeps Success and server failures only.
+    $filter     = [uri]::EscapeDataString($StorageResponseFilter)
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $client.Timeout = [TimeSpan]::FromMinutes(5)
+
+    $byRes = @{}
+    $Resources | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        $res = $_
+        $uri = "https://management.azure.com$($res.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+               "&metricnamespace=Microsoft.Storage%2FstorageAccounts&metricnames=Transactions&aggregation=Total&interval=PT1H" +
+               "&timespan=$($using:timespan)&`$filter=$($using:filter)"
+        $http = [AzHttp]::Get($using:client, $uri)
+        # A failed query leaves a null result, which excludes the account from availability.
+        $hourly = $null
+        if ($http.Doc) {
+            try   { $hourly = [StorageParser]::ParseHourly($http.Doc, $using:startTicks, $using:hours) }
+            catch { Write-Warning "Storage metric processing failed for '$($res.Name)': $_" }
+            finally { $http.Doc.Dispose() }
+        }
+        else { Write-Warning "Storage metric query failed for '$($res.Name)': $($http.Error)" }
+        [PSCustomObject]@{ Key = $res.ResourceId.ToLowerInvariant(); Hourly = $hourly }
+    } | ForEach-Object { $byRes[$_.Key] = $_.Hourly }
+
+    $client.Dispose()
+    $byRes
+}
+
+<#
+.SYNOPSIS
+    Attributes the server failures of the given storage accounts minute by minute.
+
+.DESCRIPTION
+    For each account: (1) reads the PT1M Success and server-failure counts of the days that had failures
+    (one call per day when there are few, otherwise 10-day spans, halved again when the response is too
+    large); (2) builds the platform and customer Resource Health windows from the REST history combined
+    with Log Analytics when a workspace is used; (3) classifies every minute that had failures. A minute inside a
+    platform window (starting HealthLeadMinutes before the event, because Resource Health raises it after
+    the first failures, and ending two minutes after it is resolved) is a Fault, inside a customer window
+    (for example "Throttled") is Excused, anything else is Unresolved. Excused requests then leave the
+    hourly error rates, and the sum of the hourly error rates is returned.
+
+.PARAMETER Candidates
+    Objects with Resource, Hourly (StorageHourly) and FirstMinute (first minute after the account was created).
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent investigations.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.PARAMETER HealthLeadMinutes
+    Minutes before a Resource Health event that its failures are still attributed to it.
+
+.PARAMETER LogAnalyticsData
+    Optional output of Get-LogAnalyticsData (Resource Health history held in the Activity Log).
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID; each value has the failing-minute counts per class, the
+    sum of the hourly error rates and the evidence (incidents, health windows).
+#>
+function Invoke-StorageInvestigation {
+    param(
+        [object[]]$Candidates,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$ThrottleLimit,
+        [string]$ArmToken,
+        [int]$HealthLeadMinutes,
+        [hashtable]$LogAnalyticsData
+    )
+
+    $filter = [uri]::EscapeDataString($StorageResponseFilter)
+    $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $client.Timeout = [TimeSpan]::FromMinutes(5)
+
+    $byRes = @{}
+    $Candidates | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        # Unpack the candidate and the values shared with the caller.
+        $c      = $_
+        $res    = $c.Resource
+        $hourly = $c.Hourly
+        $client = $using:client
+        $pStart = ($using:PeriodStart).UtcDateTime
+        $pEnd   = ($using:PeriodEnd).UtcDateTime
+        $nMin   = [int]($pEnd - $pStart).TotalMinutes
+        $hours  = $hourly.Counted.Length
+        $tpm    = [TimeSpan]::TicksPerMinute
+        $key    = $res.ResourceId.ToLowerInvariant()
+        $healthSources = $using:healthSources
+        # A platform window starts HealthLeadMinutes before the event and ends two minutes after it.
+        $leadTicks  = $using:HealthLeadMinutes * $tpm
+        $graceTicks = 2 * $tpm
+
+        #region Minute detail
+        # Success and server failures per minute, only for the periods that had failures.
+        $failedMin  = [double[]]::new($nMin)
+        $countedMin = [double[]]::new($nMin)
+        # Index (within the period) of the days that had failures; the minute detail is read only for those.
+        $days = [System.Collections.Generic.SortedSet[int]]::new()
+        for ($h = 0; $h -lt $hours; $h++) { if ($hourly.Failed[$h] -gt 0) { [void]$days.Add([int][math]::Floor($h / 24)) } }
+        # One call per failing day when there are few, otherwise spans of 10 days.
+        $spanDays = $days.Count -le 2 ? 1 : 10
+        # The spans (units of $spanDays days) that contain at least one failing day.
+        $units = [System.Collections.Generic.SortedSet[int]]::new()
+        foreach ($d in $days) { [void]$units.Add([int][math]::Floor($d / $spanDays)) }
+        # The spans to read (start and end ticks); MetricSpans splits a span that the service refuses as too large.
+        $bounds = [long[]]@(foreach ($u in $units) {
+            $spanEnd = $pStart.AddDays(($u + 1) * $spanDays)
+            if ($spanEnd -gt $pEnd) { $spanEnd = $pEnd }
+            $pStart.AddDays($u * $spanDays).Ticks
+            $spanEnd.Ticks
+        })
+        $uri = "https://management.azure.com$($res.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+               "&metricnamespace=Microsoft.Storage%2FstorageAccounts&metricnames=Transactions&aggregation=Total&interval=PT1M" +
+               "&`$filter=$($using:filter)"
+        $detailError = [MetricSpans]::Read($client, $uri, $bounds, [Action[System.Text.Json.JsonDocument]]{
+            param($doc) [StorageParser]::AddMinutes($doc, $pStart.Ticks, $failedMin, $countedMin)
+        })
+        $detailComplete = -not $detailError
+        if ($detailError) { Write-Warning "Storage minute detail failed for '$($res.Name)': $detailError" }
+        #endregion
+
+        #region Resource Health windows
+        # The same combined history and the same window rules as the VM and SQL algorithms
+        # (Get-HealthSources, HealthHistory.BuildWindows).
+        $fetch = [HealthHistory]::Collect($client, $res.ResourceId, $healthSources.WorkspaceNotes[$key], $healthSources.UseRest)
+        if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($res.Name)': $($fetch.Error)" }
+        $windows = [HealthHistory]::BuildWindows($fetch.Notes, 30 * $tpm, $graceTicks)
+        #endregion
+
+        #region Classify the failing minutes
+        # Each minute that had server failures is a Fault (platform window), Excused (customer window)
+        # or Unresolved. Consecutive failing minutes (gap of at most 5) form one incident for the evidence.
+        $count = @{ Fault = 0; Excused = 0; Unresolved = 0 }
+        $weighted = 0.0
+        $excusedByHour = [double[]]::new($hours)
+        $incidents = [System.Collections.Generic.List[object]]::new()
+        $cur = $null
+        for ($m = $c.FirstMinute; $m -lt $nMin; $m++) {
+            $failed = $failedMin[$m]
+            if ($failed -le 0 -or $countedMin[$m] -le 0) { continue }
+            # The share of this minute's counted requests that failed weights the loss.
+            $share = $failed / $countedMin[$m]
+            $ticks = $pStart.Ticks + $m * $tpm
+            # A window covers the minute from the lead before its start to the grace after its end.
+            $class = 'Unresolved'; $win = $null
+            foreach ($w in $windows) {
+                if ($ticks -ge $w.Start - $leadTicks -and $ticks -le $w.End + $graceTicks) {
+                    $class = $w.Customer ? 'Excused' : 'Fault'; $win = $w; break
+                }
+            }
+            $count[$class]++
+            $weighted += $share
+            if ($class -eq 'Excused') { $excusedByHour[[int][math]::Floor($m / 60)] += $failed }
+            # Extend the current incident, or close it and start a new one.
+            if ($cur -and ($m - $cur.EndMinute) -le 5) {
+                $cur.EndMinute = $m; $cur.Minutes++; $cur.Failed += $failed; $cur.Counted += $countedMin[$m]; $cur.Weighted += $share
+                if ($share -gt $cur.Peak) { $cur.Peak = $share }
+                if ($class -ne 'Unresolved') { $cur.Class = $class; $cur.Window = $win }
+            }
+            else {
+                if ($cur) { $incidents.Add($cur) }
+                $cur = [PSCustomObject]@{ StartMinute = $m; EndMinute = $m; Minutes = 1; Failed = $failed; Counted = $countedMin[$m]
+                                          Weighted = $share; Peak = $share; Class = $class; Window = $win }
+            }
+        }
+        if ($cur) { $incidents.Add($cur) }
+        #endregion
+
+        # Hourly error rates, after removing the excused requests from both counts.
+        $firstHour = [int][math]::Floor($c.FirstMinute / 60)
+        $errorSum = 0.0
+        for ($h = $firstHour; $h -lt $hours; $h++) {
+            $f = $hourly.Failed[$h] - $excusedByHour[$h]
+            $n = $hourly.Counted[$h] - $excusedByHour[$h]
+            if ($f -gt 0 -and $n -gt 0) { $errorSum += $f / $n }
+        }
+
+        # The result of the account: counts per class, the sum of the hourly error rates and the heaviest incidents first.
+        [PSCustomObject]@{
+            Key = $key; Fault = $count.Fault; Excused = $count.Excused; Unresolved = $count.Unresolved
+            Weighted = $weighted; ErrorSum = $errorSum; DetailComplete = $detailComplete
+            Windows = $windows.Count; PeriodStart = $pStart
+            Incidents = @($incidents | Sort-Object Weighted -Descending)
+        }
+    } | ForEach-Object { $byRes[$_.Key] = $_ }
+
+    $client.Dispose()
+    $byRes
+}
+
+<#
+.SYNOPSIS
+    Runs the storage availability algorithm for all storage accounts and returns one result per account.
+
+.DESCRIPTION
+    1. Hourly request totals for every account (Get-StorageHourlyCounts).
+    2. The accounts that had server failures are investigated minute by minute against Resource Health
+       (Invoke-StorageInvestigation); with -SourceWorkspaceId the older health history comes from Log Analytics.
+    3. Availability % = 100 - average hourly error rate over the hours since the account was created. Idle
+       hours count as available; an account with no counted request in the period is excluded (N/A).
+
+.PARAMETER Resources
+    Storage account descriptors from Get-ResourceInventory.
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER TotalMinutes
+    Length of the observation window in minutes.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent calls.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.PARAMETER HealthLeadMinutes
+    Minutes before a Resource Health event that its failures are still attributed to it.
+
+.PARAMETER SourceWorkspaceId
+    Optional Log Analytics workspace with the Activity Log (Resource Health history).
+
+.PARAMETER SubscriptionIds
+    Subscription IDs queried in the workspace.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID with one result per account.
+#>
+function Invoke-StorageAvailability {
+    param(
+        [object[]]$Resources,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$TotalMinutes,
+        [int]$ThrottleLimit,
+        [string]$ArmToken,
+        [int]$HealthLeadMinutes,
+        [string]$SourceWorkspaceId,
+        [string[]]$SubscriptionIds
+    )
+    Write-Host "Querying hourly request counts for $($Resources.Count) storage account(s) with parallelism $ThrottleLimit..."
+    $hourlyByRes = Get-StorageHourlyCounts -Resources $Resources -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+        -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken
+
+    # First minute of the period in which the account existed (idle hours before creation are not eligible).
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $firstMinuteByRes = @{}
+    foreach ($res in $Resources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        $first = 0
+        if ($res.CreationTime -and $res.CreationTime -gt $PeriodStart) {
+            $first = [math]::Min($TotalMinutes, [int][math]::Ceiling(($res.CreationTime - $PeriodStart).TotalMinutes))
+        }
+        $firstMinuteByRes[$key] = $first
+        $hourly = $hourlyByRes[$key]
+        if ($hourly -and ($hourly.Failed | Measure-Object -Sum).Sum -gt 0) {
+            $candidates.Add([PSCustomObject]@{ Resource = $res; Hourly = $hourly; FirstMinute = $first })
+        }
+    }
+
+    # Accounts with server failures are investigated minute by minute; the workspace, if any, supplies the health history.
+    $investigation = @{}
+    if ($candidates.Count -gt 0) {
+        Write-Host "Investigating server failures of $($candidates.Count) storage account(s)..."
+        $logAnalyticsData = $null
+        if ($SourceWorkspaceId) {
+            Write-Host -NoNewline 'Fetching Resource Health history from Log Analytics... '
+            $logAnalyticsToken = Get-PlainToken 'https://api.loganalytics.io'
+            $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId -SubscriptionIds $SubscriptionIds `
+                -ResourceIds @($candidates.Resource.ResourceId) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+                -ArmToken $logAnalyticsToken
+        }
+        $investigation = Invoke-StorageInvestigation -Candidates @($candidates) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+            -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken -HealthLeadMinutes $HealthLeadMinutes -LogAnalyticsData $logAnalyticsData
+    }
+
+    # One result per account.
+    $results = @{}
+    foreach ($res in $Resources) {
+        $key    = $res.ResourceId.ToLowerInvariant()
+        $hourly = $hourlyByRes[$key]
+        $first  = $firstMinuteByRes[$key]
+        $hours  = [int][math]::Ceiling(($PeriodEnd - $PeriodStart).TotalHours)
+        # The percentage is 100 minus the average hourly error rate over the hours since the account was created.
+        $firstHour = [int][math]::Floor($first / 60)
+        $counted = $hourly ? ($hourly.Counted | Measure-Object -Sum).Sum : 0
+        $failed  = $hourly ? ($hourly.Failed  | Measure-Object -Sum).Sum : 0
+        $inv     = $investigation[$key]
+        $errorSum = $inv ? $inv.ErrorSum : 0.0
+        $eligibleMinutes = $TotalMinutes - $first
+
+        $results[$key] = [PSCustomObject]@{
+            Excluded        = (-not $hourly) -or $counted -le 0 -or $eligibleMinutes -le 0
+            EligibleMinutes = $eligibleMinutes
+            Percent         = 100 - 100 * $errorSum / [math]::Max(1, $hours - $firstHour)
+            CountedRequests = $counted
+            FailedRequests  = $failed
+            Fault           = $inv ? $inv.Fault : 0
+            Excused         = $inv ? $inv.Excused : 0
+            Unresolved      = $inv ? $inv.Unresolved : 0
+            Weighted        = $inv ? $inv.Weighted : 0.0
+            DetailComplete  = $inv ? $inv.DetailComplete : $true
+            Incidents       = $inv ? $inv.Incidents : @()
+            PeriodStart     = $PeriodStart.UtcDateTime
+            LowVolume       = $counted -lt $StorageLowVolumeRequests
+        }
+    }
+    $results
+}
+
+<#
+.SYNOPSIS
+    Writes the result of the storage algorithm into a resource's eligibility record and prints the narration.
+
+.DESCRIPTION
+    Suspect = Faults + Excused + Unresolved holds, counted in failing minutes (minutes with at least one
+    server failure). AvailableMinutes is the eligible minutes scaled by the hourly availability, so
+    AvailabilityPct equals the hourly SLA figure.
+
+.PARAMETER Record
+    The eligibility record of the account (see Step 4).
+
+.PARAMETER Result
+    The account's result from Invoke-StorageAvailability.
+
+.OUTPUTS
+    None. Updates Record and writes the narration lines to the host.
+#>
+function Set-StorageEligibility {
+    param(
+        [PSCustomObject]$Record,
+        [PSCustomObject]$Result
+    )
+    $name = $Record.Name
+    if ($Result.Excluded) {
+        $Record.EligibleMinutes = 0
+        $Record.AvailableMinutes = 0
+        Write-Host "  [$name] excluded from availability (no counted storage requests in period)"
+        return
+    }
+
+    # Suspect minutes are the failing minutes; the available minutes follow the hourly percentage.
+    $Record.EligibleMinutes           = $Result.EligibleMinutes
+    $Record.SuspectMinutes            = $Result.Fault + $Result.Excused + $Result.Unresolved
+    $Record.ConfirmedDowntimeMinutes  = $Result.Fault
+    $Record.ExcusedMinutes            = $Result.Excused
+    $Record.UnexplainedSuspectMinutes = $Result.Unresolved
+    $Record.AvailableMinutes          = [math]::Round($Result.EligibleMinutes * $Result.Percent / 100, 2)
+    $Record.AvailabilityPct           = [math]::Round($Result.Percent, 5).ToString('F5')
+
+    if ($Record.SuspectMinutes -gt 0) {
+        Write-Host ("  [$name] storage: {0:N0} server failure(s) in {1:N0} counted request(s); {2} failing min = {3} confirmed by Resource Health + {4} customer-excused + {5} unresolved (weighted loss {6:N2} min)" -f
+            $Result.FailedRequests, $Result.CountedRequests, $Record.SuspectMinutes, $Result.Fault, $Result.Excused, $Result.Unresolved, $Result.Weighted)
+        # The three heaviest incidents are listed; the rest is counted.
+        foreach ($i in ($Result.Incidents | Select-Object -First 3)) {
+            $when = $Result.PeriodStart.AddMinutes($i.StartMinute).ToString('u')
+            $cause = $i.Window ? "Resource Health '$($i.Window.Title)'$($i.Window.Summary ? ': ' + $i.Window.Summary : '')" : 'no Resource Health event'
+            Write-Host ("  [$name]   incident {0}, {1} min: {2:N0} failed of {3:N0} counted ({4:P2} peak) -> {5} -> {6}" -f
+                $when, $i.Minutes, $i.Failed, $i.Counted, $i.Peak, $i.Class, $cause)
+        }
+        if ($Result.Incidents.Count -gt 3) { Write-Host "  [$name]   ... and $($Result.Incidents.Count - 3) smaller incident(s)" }
+        if (-not $Result.DetailComplete) { Write-Host "  [$name]   WARNING: minute detail incomplete, some failing minutes are not classified" }
+    }
+    if ($Result.LowVolume) {
+        Write-Host ("  [$name] low volume: only {0:N0} counted request(s) in the period, the percentage rests on very few requests" -f $Result.CountedRequests)
+    }
+}
+
+#endregion
+
+#region Web App algorithm
+# Web Apps have no availability metric. The score follows what a customer sees: a minute is down when
+# every request of the minute failed with an HTTP 5xx. Only the minutes the app is set to running count
+# (the App Service SLA "Deployment Minutes"). Minutes without requests are not judged and count as
+# available (README, "Algorithms > Web Apps").
+
+# Apps with fewer requests than this in the period are flagged as low-volume when they have down minutes.
+$WebLowVolumeRequests = 10000
+
+# App Service plan tiers the App Service SLA does not cover.
+$WebNoSlaTiers = @('Free', 'Shared')
+
+<#
+.SYNOPSIS
+    Gets the hourly request and HTTP 5xx totals of Web Apps for the whole period.
+
+.DESCRIPTION
+    One Azure Monitor call per app (Requests and Http5xx, PT1H, Total). It tells which apps had traffic
+    and which had any 5xx, so that only the latter need the minute detail. A failed query yields a null
+    result, which excludes the app from availability.
+
+.PARAMETER Resources
+    Web App descriptors from Get-ResourceInventory.
+
+.PARAMETER PeriodStart
+    Start of the observation window (aligned to a whole hour).
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent calls.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID; each value has Requests and Errors (double[] per hour) or is $null.
+#>
+function Get-WebHourlyCounts {
+    param(
+        [object[]]$Resources,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$ThrottleLimit,
+        [string]$ArmToken
+    )
+
+    $hours      = [int][math]::Ceiling(($PeriodEnd - $PeriodStart).TotalHours)
+    $startTicks = $PeriodStart.UtcTicks
+    $timespan   = "$($PeriodStart.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))/$($PeriodEnd.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $client.Timeout = [TimeSpan]::FromMinutes(5)
+
+    $byRes = @{}
+    $Resources | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        $res = $_
+        $uri = "https://management.azure.com$($res.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+               "&metricnamespace=Microsoft.Web%2Fsites&metricnames=Requests,Http5xx&aggregation=Total&interval=PT1H" +
+               "&timespan=$($using:timespan)"
+        $http = [AzHttp]::Get($using:client, $uri)
+        # One call per app: the hourly totals fill two arrays; a failed query leaves $null and excludes the app.
+        $counts = $null
+        if ($http.Doc) {
+            try {
+                $counts = [PSCustomObject]@{ Requests = [double[]]::new($using:hours); Errors = [double[]]::new($using:hours) }
+                [WebParser]::AddCounts($http.Doc, $using:startTicks, [TimeSpan]::TicksPerHour, $counts.Requests, $counts.Errors)
+            }
+            catch { $counts = $null; Write-Warning "Web App metric processing failed for '$($res.Name)': $_" }
+            finally { $http.Doc.Dispose() }
+        }
+        else { Write-Warning "Web App metric query failed for '$($res.Name)': $($http.Error)" }
+        [PSCustomObject]@{ Key = $res.ResourceId.ToLowerInvariant(); Counts = $counts }
+    } | ForEach-Object { $byRes[$_.Key] = $_.Counts }
+
+    $client.Dispose()
+    $byRes
+}
+
+<#
+.SYNOPSIS
+    Finds and classifies the down minutes of the given Web Apps.
+
+.DESCRIPTION
+    For each app: (1) builds the stopped periods and the recycle windows from the stop, start and restart
+    operations of the Activity Log (from Log Analytics when a workspace is used; otherwise read from the
+    REST API, only for the apps that had 5xx); (2) for an app that had 5xx, reads the PT1M Requests and
+    Http5xx counts (spans of 5 days, halved when the response is too large) and builds the Resource Health
+    windows from the REST history combined with Log Analytics (Get-HealthSources); (3) lets the compiled
+    WebClassifier decide each minute in which every request failed (see the README for the order of decisions).
+
+.PARAMETER Candidates
+    Objects with Resource, FirstMinute (first minute after the app was created) and Detail ($true when the
+    app had any 5xx in the period).
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent investigations.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.PARAMETER HealthLeadMinutes
+    Minutes before a Resource Health event that its down minutes are still attributed to it.
+
+.PARAMETER GraceMinutes
+    Minutes after a stop, start or restart that its down minutes are still excused.
+
+.PARAMETER LogAnalyticsData
+    Optional output of Get-LogAnalyticsData (Activity Log and Resource Health history in the workspace).
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID; each value has the WebResult of the app, whether the minute
+    detail was complete and the number of Resource Health windows.
+#>
+function Invoke-WebInvestigation {
+    param(
+        [object[]]$Candidates,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$ThrottleLimit,
+        [string]$ArmToken,
+        [int]$HealthLeadMinutes,
+        [int]$GraceMinutes,
+        [hashtable]$LogAnalyticsData
+    )
+
+    $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Add('Authorization', "Bearer $ArmToken")
+    $client.Timeout = [TimeSpan]::FromMinutes(5)
+
+    $byRes = @{}
+    $Candidates | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        # Unpack the candidate and the values shared with the caller.
+        $c      = $_
+        $res    = $c.Resource
+        $client = $using:client
+        $pStart = ($using:PeriodStart).UtcDateTime
+        $pEnd   = ($using:PeriodEnd).UtcDateTime
+        $nMin   = [int]($pEnd - $pStart).TotalMinutes
+        $tpm    = [TimeSpan]::TicksPerMinute
+        $key    = $res.ResourceId.ToLowerInvariant()
+        $laData = $using:LogAnalyticsData
+        $healthSources = $using:healthSources
+
+        #region Stopped periods and recycle windows
+        # Lifecycle operations come from the workspace, or from the REST API when there is none.
+        $events = [System.Collections.Generic.List[WebEvent]]::new()
+        if ($laData) {
+            # The events were fetched in bulk: keep the stop, start and restart operations of this app.
+            if ($laData.ContainsKey($key)) {
+                foreach ($e in $laData[$key].ActivityEvents) {
+                    $kind = [WebParser]::LifecycleKind([string]$e.OperationName)
+                    if ($kind) { $events.Add([WebEvent]::new($e.Timestamp.UtcTicks, $kind)) }
+                }
+            }
+        }
+        elseif ($c.Detail) {
+            # Without a workspace the Activity Log is read per app, and only for the apps that need it.
+            $raw = [System.Collections.Generic.List[ActivityEvent]]::new()
+            $filter = "eventTimestamp ge '$($pStart.ToString('O'))' and eventTimestamp le '$($pEnd.ToString('O'))' and resourceUri eq '$($res.ResourceId)'"
+            $url = "https://management.azure.com/subscriptions/$($res.SubscriptionId)/providers/microsoft.insights/eventtypes/management/values" +
+                   "?api-version=2015-04-01&`$filter=$([uri]::EscapeDataString($filter))&`$select=$([uri]::EscapeDataString('eventTimestamp,operationName,correlationId,status'))"
+            while ($url) {
+                $http = [AzHttp]::Get($client, $url)
+                if (-not $http.Doc) { Write-Warning "Activity Log query failed for '$($res.Name)': $($http.Error)"; break }
+                try   { $url = [ActivityLogParser]::ReadPage($http.Doc, $raw) }
+                finally { $http.Doc.Dispose() }
+            }
+            foreach ($e in $raw) {
+                $kind = [WebParser]::LifecycleKind($e.Operation)
+                if ($kind) { $events.Add([WebEvent]::new($e.Ticks, $kind)) }
+            }
+        }
+        # Turn the operations into the stopped periods and the recycle windows.
+        $stopped = [System.Collections.Generic.List[long[]]]::new()
+        $recycle = [System.Collections.Generic.List[long[]]]::new()
+        [WebClassifier]::BuildLifecycle($events, $pEnd.Ticks, $using:GraceMinutes * $tpm, $stopped, $recycle)
+        #endregion
+
+        #region Minute detail and Resource Health windows (apps that had 5xx)
+        # Per-minute counts of the period; they stay empty for an app without 5xx.
+        $requestsMin = [double[]]::new($nMin)
+        $errorsMin   = [double[]]::new($nMin)
+        $detailComplete = $true
+        $windows = [System.Collections.Generic.List[HealthWindow]]::new()
+        if ($c.Detail) {
+            # Spans of 5 days (7,200 minutes); MetricSpans splits a span that the service refuses as too large.
+            $bounds = [long[]]@(for ($d = 0; $d -lt $nMin; $d += 7200) {
+                $pStart.AddMinutes($d).Ticks
+                $pStart.AddMinutes([math]::Min($d + 7200, $nMin)).Ticks
+            })
+            $uri = "https://management.azure.com$($res.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+                   "&metricnamespace=Microsoft.Web%2Fsites&metricnames=Requests,Http5xx&aggregation=Total&interval=PT1M"
+            $detailError = [MetricSpans]::Read($client, $uri, $bounds, [Action[System.Text.Json.JsonDocument]]{
+                param($doc) [WebParser]::AddCounts($doc, $pStart.Ticks, $tpm, $requestsMin, $errorsMin)
+            })
+            $detailComplete = -not $detailError
+            if ($detailError) { Write-Warning "Web App minute detail failed for '$($res.Name)': $detailError" }
+
+            # The same combined history and the same window rules as the VM, SQL and storage algorithms.
+            $fetch = [HealthHistory]::Collect($client, $res.ResourceId, $healthSources.WorkspaceNotes[$key], $healthSources.UseRest)
+            if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($res.Name)': $($fetch.Error)" }
+            $windows = [HealthHistory]::BuildWindows($fetch.Notes, 30 * $tpm, 2 * $tpm)
+        }
+        #endregion
+
+        $result = [WebClassifier]::Classify($requestsMin, $errorsMin, $c.FirstMinute, $pStart.Ticks, $stopped, $recycle,
+                                            $windows, $using:HealthLeadMinutes * $tpm, 2 * $tpm)
+        [PSCustomObject]@{ Key = $key; Result = $result; DetailComplete = $detailComplete; Windows = $windows.Count }
+    } | ForEach-Object { $byRes[$_.Key] = $_ }
+
+    $client.Dispose()
+    $byRes
+}
+
+<#
+.SYNOPSIS
+    Runs the Web App availability algorithm for all Web Apps and returns one result per app.
+
+.DESCRIPTION
+    1. Hourly request and 5xx totals for every app (Get-WebHourlyCounts). An app with no request in the
+       period cannot be judged and is excluded (N/A).
+    2. Every other app is investigated (Invoke-WebInvestigation): its stopped periods leave the eligible
+       minutes, and for an app that had 5xx each minute in which every request failed is decided.
+       With -SourceWorkspaceId the Activity Log comes from Log Analytics for all the apps; without it only
+       the apps that had 5xx read it, so the stopped minutes of the other apps are not removed from their
+       eligible minutes (their availability stays 100%).
+    3. Eligible minutes = minutes since the app was created, without the minutes it was stopped and the
+       down minutes excused by a recycle or a customer Resource Health window.
+       Availability % = (eligible - Fault - Unresolved down minutes) / eligible.
+
+.PARAMETER Resources
+    Web App descriptors from Get-ResourceInventory.
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.PARAMETER TotalMinutes
+    Length of the observation window in minutes.
+
+.PARAMETER ThrottleLimit
+    Maximum concurrent calls.
+
+.PARAMETER ArmToken
+    Bearer token for Azure Resource Manager.
+
+.PARAMETER HealthLeadMinutes
+    Minutes before a Resource Health event that its down minutes are still attributed to it.
+
+.PARAMETER GraceMinutes
+    Minutes after a stop, start or restart that its down minutes are still excused.
+
+.PARAMETER SourceWorkspaceId
+    Optional Log Analytics workspace with the Activity Log (lifecycle operations and Resource Health history).
+
+.PARAMETER SubscriptionIds
+    Subscription IDs queried in the workspace.
+
+.OUTPUTS
+    Hashtable keyed by lowercase resource ID with one result per app.
+#>
+function Invoke-WebAvailability {
+    param(
+        [object[]]$Resources,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd,
+        [int]$TotalMinutes,
+        [int]$ThrottleLimit,
+        [string]$ArmToken,
+        [int]$HealthLeadMinutes,
+        [int]$GraceMinutes,
+        [string]$SourceWorkspaceId,
+        [string[]]$SubscriptionIds
+    )
+    Write-Host "Querying hourly request counts for $($Resources.Count) web app(s) with parallelism $ThrottleLimit..."
+    $hourlyByRes = Get-WebHourlyCounts -Resources $Resources -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+        -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken
+
+    # Apps with traffic are investigated; the first minute is the first one in which the app existed.
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $totals = @{}
+    foreach ($res in $Resources) {
+        $key    = $res.ResourceId.ToLowerInvariant()
+        $hourly = $hourlyByRes[$key]
+        # The totals tell which apps have traffic (investigated) and which had any 5xx (minute detail).
+        $requests = $hourly ? ($hourly.Requests | Measure-Object -Sum).Sum : 0
+        $errors   = $hourly ? ($hourly.Errors   | Measure-Object -Sum).Sum : 0
+        $first = 0
+        if ($res.CreationTime -and $res.CreationTime -gt $PeriodStart) {
+            $first = [math]::Min($TotalMinutes, [int][math]::Ceiling(($res.CreationTime - $PeriodStart).TotalMinutes))
+        }
+        $totals[$key] = [PSCustomObject]@{ Requests = $requests; Errors = $errors; FirstMinute = $first }
+        if ($requests -gt 0) {
+            $candidates.Add([PSCustomObject]@{ Resource = $res; FirstMinute = $first; Detail = $errors -gt 0 })
+        }
+    }
+
+    # The workspace, if any, supplies the Activity Log and the health history of all the apps with traffic.
+    $investigation = @{}
+    if ($candidates.Count -gt 0) {
+        $detailCount = @($candidates | Where-Object Detail).Count
+        Write-Host "Investigating $($candidates.Count) web app(s) with traffic ($detailCount with HTTP 5xx)..."
+        $logAnalyticsData = $null
+        if ($SourceWorkspaceId) {
+            Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
+            $logAnalyticsToken = Get-PlainToken 'https://api.loganalytics.io'
+            $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId -SubscriptionIds $SubscriptionIds `
+                -ResourceIds @($candidates.Resource.ResourceId) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+                -ArmToken $logAnalyticsToken
+        }
+        $investigation = Invoke-WebInvestigation -Candidates @($candidates) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
+            -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken -HealthLeadMinutes $HealthLeadMinutes -GraceMinutes $GraceMinutes `
+            -LogAnalyticsData $logAnalyticsData
+    }
+
+    # One result per app.
+    $results = @{}
+    foreach ($res in $Resources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        $t   = $totals[$key]
+        $inv = $investigation[$key]
+        $w   = $inv ? $inv.Result : $null
+        # Eligible minutes leave the time before creation, the stopped minutes and the excused down minutes.
+        $stoppedMinutes = $w ? $w.StoppedMinutes : 0
+        $excused  = $w ? $w.Recycle + $w.Customer : 0
+        $lost     = $w ? $w.Fault + $w.Unresolved : 0
+        $eligible = $TotalMinutes - $t.FirstMinute - $stoppedMinutes - $excused
+        $results[$key] = [PSCustomObject]@{
+            Excluded        = $t.Requests -le 0 -or $eligible -le 0
+            EligibleMinutes = $eligible
+            Percent         = $eligible -gt 0 ? 100 * ($eligible - $lost) / $eligible : 0
+            Tier            = $res.Tier
+            Requests        = $t.Requests
+            Errors          = $t.Errors
+            Detail          = $w
+            DetailComplete  = $inv ? $inv.DetailComplete : $true
+            PeriodStart     = $PeriodStart.UtcDateTime
+            LowVolume       = $t.Requests -lt $WebLowVolumeRequests
+        }
+    }
+    $results
+}
+
+<#
+.SYNOPSIS
+    Writes the result of the Web App algorithm into an app's eligibility record and prints the narration.
+
+.DESCRIPTION
+    Suspect = down minutes (every request failed with a 5xx) = Faults + Excused + Unresolved, where Excused
+    counts the minutes the app was stopped, recycled or inside a customer Resource Health window.
+    AvailableMinutes is the eligible minutes minus the Fault and Unresolved down minutes.
+
+.PARAMETER Record
+    The eligibility record of the app (see Step 4).
+
+.PARAMETER Result
+    The app's result from Invoke-WebAvailability.
+
+.OUTPUTS
+    None. Updates Record and writes the narration lines to the host.
+#>
+function Set-WebEligibility {
+    param(
+        [PSCustomObject]$Record,
+        [PSCustomObject]$Result
+    )
+    $name = $Record.Name
+    if ($Result.Excluded) {
+        $Record.EligibleMinutes = 0
+        $Record.AvailableMinutes = 0
+        Write-Host "  [$name] excluded from availability (no requests in period)"
+        return
+    }
+
+    # Without minute detail (an app that never had a 5xx) there is no down minute: the figure is 100%.
+    $w = $Result.Detail
+    $down = $w ? $w.Down : 0
+    $lost = $w ? $w.Fault + $w.Unresolved : 0
+    # Fill the eligibility record; the available minutes are the eligible ones minus Fault and Unresolved.
+    $Record.EligibleMinutes           = $Result.EligibleMinutes
+    $Record.SuspectMinutes            = $down
+    $Record.ConfirmedDowntimeMinutes  = $w ? $w.Fault : 0
+    $Record.ExcusedMinutes            = $w ? $w.Stopped + $w.Recycle + $w.Customer : 0
+    $Record.UnexplainedSuspectMinutes = $w ? $w.Unresolved : 0
+    $Record.AvailableMinutes          = [math]::Round($Result.EligibleMinutes - $lost, 2)
+    $Record.AvailabilityPct           = [math]::Round($Result.Percent, 5).ToString('F5')
+
+    if ($Result.Tier -in $WebNoSlaTiers) {
+        Write-Host "  [$name] tier $($Result.Tier): the App Service SLA does not cover this tier, the figure is informative only"
+    }
+    # Narration: the share of minutes with traffic that were down, the heaviest incidents and the volume warnings.
+    if ($down -gt 0) {
+        Write-Host ("  [$name] web: {0:N0} of {1:N0} min with traffic had every request fail with a 5xx ({2:P1}), {3:N0} request(s) in all: {4} confirmed by Resource Health + {5} excused ({6} stopped, {7} recycle, {8} customer) + {9} unresolved" -f
+            $down, $w.Active, ($down / $w.Active), $Result.Requests, $w.Fault, $Record.ExcusedMinutes, $w.Stopped, $w.Recycle, $w.Customer, $w.Unresolved)
+        # The heaviest incidents (longest first), three at most.
+        $sorted = @($w.Incidents | Sort-Object Minutes -Descending)
+        # The first three incidents are listed with their cause; the others are only counted.
+        foreach ($i in ($sorted | Select-Object -First 3)) {
+            $when = $Result.PeriodStart.AddMinutes($i.StartMinute).ToString('u')
+            $cause = $i.Window ? "Resource Health '$($i.Window.Title)'$($i.Window.Summary ? ': ' + $i.Window.Summary : '')" : 'no Resource Health event'
+            Write-Host ("  [$name]   incident {0}, {1} min, {2:N0} request(s) -> {3} -> {4}" -f $when, $i.Minutes, $i.Requests, $i.Class, $cause)
+        }
+        if ($sorted.Count -gt 3) { Write-Host "  [$name]   ... and $($sorted.Count - 3) smaller incident(s)" }
+        # Warnings about how much the percentage can be trusted: sparse down minutes and few requests.
+        if ($w.DownFewRequests -gt 0) {
+            Write-Host "  [$name]   $($w.DownFewRequests) of the down minute(s) carried fewer than 5 requests"
+        }
+        if ($Result.LowVolume) {
+            Write-Host ("  [$name] low volume: only {0:N0} request(s) in the period, the percentage rests on very few requests" -f $Result.Requests)
+        }
+    }
+    if ($w -and $w.Partial -gt 0) {
+        Write-Host ("  [$name] {0:N0} min with traffic had some requests fail with a 5xx ({1:P1} of those requests); not scored" -f
+            $w.Partial, ($w.PartialErrors / $w.PartialRequests))
+    }
+    if ($w -and -not $Result.DetailComplete) { Write-Host "  [$name]   WARNING: minute detail incomplete, some down minutes are not classified" }
+}
+
+#endregion
+
+#region Output
+
+<#
+.SYNOPSIS
+    Prints a fixed-width table with one row per resource.
+
+.DESCRIPTION
+    Columns: subscription, name, kind, location, suspect minutes, faults, excused minutes,
+    unresolved minutes, available minutes, eligible minutes and availability percentage.
+    Counters that are zero are left blank so the interesting rows stand out.
+
+.PARAMETER Sorted
+    Per-resource eligibility records, already sorted.
+
+.OUTPUTS
+    None. Writes to the host.
+#>
 function Write-ResultsTable([object[]]$Sorted) {
     $fmt = '{0,-24} {1,-30} {2,-7} {3,-12} {4,7} {5,6} {6,7} {7,10} {8,10} {9,8} {10,10}'
     Write-Host ''
@@ -2242,16 +3911,17 @@ function Write-ResultsTable([object[]]$Sorted) {
         'Suspect', 'Faults', 'Excused', 'Unresolved', 'AvailMin', 'EligMin', 'Avail%')
     Write-Host ([string]::new([char]0x2500, 141))
 
+    # Zero counters stay blank so that the interesting rows stand out.
     foreach ($r in $Sorted) {
         Write-Host ($fmt -f
             (Get-TruncatedString $r.SubscriptionName 24),
             (Get-TruncatedString $r.Name 30),
             (Get-ShortKind $r.Kind),
             $r.Location,
-            $(if ($r.SuspectMinutes -gt 0) { "$($r.SuspectMinutes)" } else { '' }),
-            $(if ($r.ConfirmedDowntimeMinutes -gt 0) { "$($r.ConfirmedDowntimeMinutes)" } else { '' }),
-            $(if ($r.ExcusedMinutes -gt 0) { "$($r.ExcusedMinutes)" } else { '' }),
-            $(if ($r.UnexplainedSuspectMinutes -gt 0) { "$($r.UnexplainedSuspectMinutes)" } else { '' }),
+            ($r.SuspectMinutes -gt 0 ? "$($r.SuspectMinutes)" : ''),
+            ($r.ConfirmedDowntimeMinutes -gt 0 ? "$($r.ConfirmedDowntimeMinutes)" : ''),
+            ($r.ExcusedMinutes -gt 0 ? "$($r.ExcusedMinutes)" : ''),
+            ($r.UnexplainedSuspectMinutes -gt 0 ? "$($r.UnexplainedSuspectMinutes)" : ''),
             [math]::Round($r.AvailableMinutes, 2),
             $r.EligibleMinutes,
             $r.AvailabilityPct)
@@ -2259,96 +3929,125 @@ function Write-ResultsTable([object[]]$Sorted) {
     Write-Host ''
 }
 
-## Calculates summary records once for console output and optional ingestion.
+<#
+.SYNOPSIS
+    Calculates the summary records shown on the console and ingested into Log Analytics.
+
+.DESCRIPTION
+    Resources without an availability figure (N/A) are left out. Summaries are produced per
+    subscription and kind/location, per subscription in total and, when more than one
+    subscription is involved, across all subscriptions.
+
+.PARAMETER Sorted
+    Per-resource eligibility records.
+
+.OUTPUTS
+    PSCustomObject[] with SummaryLevel (KindLocation, SubscriptionTotal, OverallKindLocation,
+    Overall), SubscriptionName, Kind, Location, ResourceCount, AvailableMinutes, EligibleMinutes
+    and AvailabilityPct.
+#>
 function Get-AvailabilitySummaries([object[]]$Sorted) {
+    <#
+    .SYNOPSIS
+        Aggregates per-resource records into one summary record.
+    .PARAMETER Level
+        Summary level name.
+    .PARAMETER SubscriptionName
+        Subscription the summary belongs to ('' for cross-subscription levels).
+    .PARAMETER Kind
+        Resource kind ('' when the summary spans kinds).
+    .PARAMETER Location
+        Location ('' when the summary spans locations).
+    .PARAMETER Items
+        Per-resource records to aggregate.
+    .OUTPUTS
+        PSCustomObject summary record.
+    #>
+    function New-Summary([string]$Level, [string]$SubscriptionName, [string]$Kind, [string]$Location, [object[]]$Items) {
+        $available = ($Items | Measure-Object AvailableMinutes -Sum).Sum
+        $eligibleMinutes = ($Items | Measure-Object EligibleMinutes -Sum).Sum
+        [PSCustomObject]@{
+            SummaryLevel     = $Level
+            SubscriptionName = $SubscriptionName
+            Kind             = $Kind
+            Location         = $Location
+            ResourceCount    = $Items.Count
+            AvailableMinutes = $available
+            EligibleMinutes  = $eligibleMinutes
+            AvailabilityPct  = $eligibleMinutes -gt 0 ? [math]::Round($available / $eligibleMinutes * 100, 5) : 0
+        }
+    }
+
+    # N/A resources have no availability figure and are left out.
     $eligible = @($Sorted | Where-Object { $_.AvailabilityPct -ne 'N/A' })
     $summaries = [System.Collections.Generic.List[object]]::new()
     $subscriptionGroups = @($eligible | Group-Object SubscriptionName | Sort-Object Name)
 
+    # Per subscription: one summary per kind and location, then the subscription total.
     foreach ($subGroup in $subscriptionGroups) {
         foreach ($g in ($subGroup.Group | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
             $items = @($g.Group)
-            $a = ($items | Measure-Object AvailableMinutes -Sum).Sum
-            $e = ($items | Measure-Object EligibleMinutes  -Sum).Sum
-            $pct = if ($e -gt 0) { [math]::Round($a / $e * 100, 5) } else { 0 }
-            $summaries.Add([PSCustomObject]@{
-                SummaryLevel     = 'KindLocation'
-                SubscriptionName = $subGroup.Name
-                Kind             = $items[0].Kind
-                Location         = $items[0].Location
-                ResourceCount    = $items.Count
-                AvailableMinutes = $a
-                EligibleMinutes  = $e
-                AvailabilityPct  = $pct
-            })
+            $summaries.Add((New-Summary 'KindLocation' $subGroup.Name $items[0].Kind $items[0].Location $items))
         }
-        $ta = ($subGroup.Group | Measure-Object AvailableMinutes -Sum).Sum
-        $te = ($subGroup.Group | Measure-Object EligibleMinutes  -Sum).Sum
-        $tpct = if ($te -gt 0) { [math]::Round($ta / $te * 100, 5) } else { 0 }
-        $summaries.Add([PSCustomObject]@{
-            SummaryLevel     = 'SubscriptionTotal'
-            SubscriptionName = $subGroup.Name
-            Kind             = ''
-            Location         = ''
-            ResourceCount    = $subGroup.Count
-            AvailableMinutes = $ta
-            EligibleMinutes  = $te
-            AvailabilityPct  = $tpct
-        })
+        $summaries.Add((New-Summary 'SubscriptionTotal' $subGroup.Name '' '' @($subGroup.Group)))
     }
 
+    # Across subscriptions: only meaningful when more than one is involved.
     if ($subscriptionGroups.Count -gt 1) {
         foreach ($g in ($eligible | Group-Object { "$($_.Kind)|$($_.Location)" } | Sort-Object Name)) {
             $items = @($g.Group)
-            $a = ($items | Measure-Object AvailableMinutes -Sum).Sum
-            $e = ($items | Measure-Object EligibleMinutes  -Sum).Sum
-            $pct = if ($e -gt 0) { [math]::Round($a / $e * 100, 5) } else { 0 }
-            $summaries.Add([PSCustomObject]@{
-                SummaryLevel     = 'OverallKindLocation'
-                SubscriptionName = ''
-                Kind             = $items[0].Kind
-                Location         = $items[0].Location
-                ResourceCount    = $items.Count
-                AvailableMinutes = $a
-                EligibleMinutes  = $e
-                AvailabilityPct  = $pct
-            })
+            $summaries.Add((New-Summary 'OverallKindLocation' '' $items[0].Kind $items[0].Location $items))
         }
-        $oa = ($eligible | Measure-Object AvailableMinutes -Sum).Sum
-        $oe = ($eligible | Measure-Object EligibleMinutes  -Sum).Sum
-        $opct = if ($oe -gt 0) { [math]::Round($oa / $oe * 100, 5) } else { 0 }
-        $summaries.Add([PSCustomObject]@{
-            SummaryLevel     = 'Overall'
-            SubscriptionName = ''
-            Kind             = ''
-            Location         = ''
-            ResourceCount    = $eligible.Count
-            AvailableMinutes = $oa
-            EligibleMinutes  = $oe
-            AvailabilityPct  = $opct
-        })
+        $summaries.Add((New-Summary 'Overall' '' '' '' $eligible))
     }
 
     $summaries.ToArray()
 }
 
-## Prints precomputed per-subscription and cross-subscription summaries.
+<#
+.SYNOPSIS
+    Prints the per-subscription and cross-subscription summaries.
+
+.PARAMETER Summaries
+    Records produced by Get-AvailabilitySummaries.
+
+.OUTPUTS
+    None. Writes to the host.
+#>
 function Write-SubscriptionSummaries([object[]]$Summaries) {
+    <#
+    .SYNOPSIS
+        Formats one summary line.
+    .PARAMETER Label
+        Text identifying the summary (kind and location, TOTAL or OVERALL).
+    .PARAMETER Summary
+        Summary record.
+    .OUTPUTS
+        System.String.
+    #>
+    function Format-SummaryLine([string]$Label, $Summary) {
+        $available = [math]::Round($Summary.AvailableMinutes, 2)
+        $eligibleMinutes = [math]::Round($Summary.EligibleMinutes, 2)
+        "  $Label [$($Summary.ResourceCount) res]: $($Summary.AvailabilityPct)% ($available / $eligibleMinutes eligible min)"
+    }
+
     $subscriptionTotals = @($Summaries |
         Where-Object SummaryLevel -eq 'SubscriptionTotal' |
         Sort-Object SubscriptionName)
 
+    # One block per subscription: its kinds and locations, then its total.
     foreach ($total in $subscriptionTotals) {
         Write-Host "--- $($total.SubscriptionName) Summary ---"
         foreach ($summary in ($Summaries |
             Where-Object { $_.SummaryLevel -eq 'KindLocation' -and $_.SubscriptionName -eq $total.SubscriptionName } |
             Sort-Object Kind, Location)) {
-            Write-Host "  $(Get-ShortKind $summary.Kind), $($summary.Location) [$($summary.ResourceCount) res]: $($summary.AvailabilityPct)% ($([math]::Round($summary.AvailableMinutes, 2)) / $([math]::Round($summary.EligibleMinutes, 2)) eligible min)"
+            Write-Host (Format-SummaryLine "$(Get-ShortKind $summary.Kind), $($summary.Location)" $summary)
         }
-        Write-Host "  TOTAL [$($total.ResourceCount) res]: $($total.AvailabilityPct)% ($([math]::Round($total.AvailableMinutes, 2)) / $([math]::Round($total.EligibleMinutes, 2)) eligible min)"
+        Write-Host (Format-SummaryLine 'TOTAL' $total)
         Write-Host ''
     }
 
+    # The overall block exists only when several subscriptions were processed.
     $overall = $Summaries | Where-Object SummaryLevel -eq 'Overall' | Select-Object -First 1
     if ($overall) {
         Write-Host ([string]::new([char]0x2550, 62))
@@ -2357,49 +4056,43 @@ function Write-SubscriptionSummaries([object[]]$Summaries) {
         foreach ($summary in ($Summaries |
             Where-Object SummaryLevel -eq 'OverallKindLocation' |
             Sort-Object Kind, Location)) {
-            Write-Host "  $(Get-ShortKind $summary.Kind), $($summary.Location) [$($summary.ResourceCount) res]: $($summary.AvailabilityPct)% ($([math]::Round($summary.AvailableMinutes, 2)) / $([math]::Round($summary.EligibleMinutes, 2)) eligible min)"
+            Write-Host (Format-SummaryLine "$(Get-ShortKind $summary.Kind), $($summary.Location)" $summary)
         }
-        Write-Host "  OVERALL [$($overall.ResourceCount) res]: $($overall.AvailabilityPct)% ($([math]::Round($overall.AvailableMinutes, 2)) / $([math]::Round($overall.EligibleMinutes, 2)) eligible min)"
+        Write-Host (Format-SummaryLine 'OVERALL' $overall)
         Write-Host ''
     }
 }
 
-## Acquires a plain-text bearer token via Az.Accounts.
-## Handles both SecureString (Az.Accounts ≥ 5.x) and legacy plain string returns.
-function Get-PlainToken([string]$ResourceUrl) {
-    $raw = (Get-AzAccessToken -ResourceUrl $ResourceUrl).Token
-    ($raw -is [securestring]) ? ($raw | ConvertFrom-SecureString -AsPlainText) : [string]$raw
-}
+#endregion
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+#region Main
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-# Step 1: Resolve observation window
+#region Step 1: Resolve the observation window
 $window = Resolve-ObservationWindow $Month
 $utcStart     = $window.Start
 $utcEnd       = $window.End
 $totalMinutes = $window.TotalMinutes
 
-$healthCoverageStart = if ($SourceWorkspaceId) {
-    Get-HealthCoverageStart $utcStart -UseLogAnalytics
-} else {
-    Get-HealthCoverageStart $utcStart
-}
+# Resource Health history covers the whole period with a workspace, otherwise only the REST retention (~30 days).
+$healthCoverageStart = Get-HealthCoverageStart $utcStart -UseLogAnalytics:([bool]$SourceWorkspaceId)
 $healthCoveredMinutes = $healthCoverageStart -lt $utcEnd ? [int]($utcEnd - $healthCoverageStart).TotalMinutes : 0
 
 $periodLabel = $window.IsMonthToDate ? "month $($window.NormalizedMonth) (month-to-date)" : "month $($window.NormalizedMonth)"
 Write-Host "Period: $periodLabel ($($utcStart.ToString('u')) -> $($utcEnd.ToString('u')), $totalMinutes min)"
 
 if ($SourceWorkspaceId) {
-    Write-Host "Log Analytics source workspace: $SourceWorkspaceId (Activity Log via KQL, Resource Health via KQL + REST API hybrid)"
+    Write-Host "Log Analytics source workspace: $SourceWorkspaceId (Activity Log via KQL, Resource Health via KQL + REST API)"
 } elseif ($healthCoverageStart -gt $utcStart -and $healthCoveredMinutes -gt 0) {
-    Write-Host "WARNING: Resource Health history covers only part of this period ($($healthCoverageStart.ToString('u')) -> $($utcEnd.ToString('u')), $healthCoveredMinutes of $totalMinutes min). Earlier minutes will use Activity Log and metric fallback rules."
+    Write-Host "WARNING: Resource Health history covers only part of this period ($($healthCoverageStart.ToString('u')) -> $($utcEnd.ToString('u')), $healthCoveredMinutes of $totalMinutes min). Earlier minutes have no Resource Health evidence."
 } elseif ($healthCoveredMinutes -eq 0) {
-    Write-Host 'WARNING: Resource Health history does not cover this period. All suspect minutes will use Activity Log and metric fallback rules.'
+    Write-Host 'WARNING: Resource Health history does not cover this period. Suspect minutes have no Resource Health evidence.'
 }
 
-# Step 2: Authenticate and resolve subscriptions
+#endregion
+
+#region Step 2: Authenticate and resolve subscriptions
 # -BatchSize explicitly set implies -Batch
 if ($PSBoundParameters.ContainsKey('BatchSize') -and -not $Batch) { $Batch = [switch]::new($true) }
 
@@ -2413,6 +4106,7 @@ foreach ($subscription in $allAzSubs) {
     }
     $azSubsByName[$subscription.Name].Add($subscription)
 }
+# Every requested name must match exactly one subscription.
 $resolvedSubs = @(foreach ($name in $Subscriptions) {
     if (-not $azSubsByName.ContainsKey($name)) { throw "Subscription '$name' not found." }
     if ($azSubsByName[$name].Count -gt 1) { throw "Multiple subscriptions named '$name'." }
@@ -2421,13 +4115,16 @@ $resolvedSubs = @(foreach ($name in $Subscriptions) {
 $subIds      = @($resolvedSubs.Id)
 $subIdToName = @{}; foreach ($s in $resolvedSubs) { $subIdToName[$s.Id] = $s.Name }
 
+# One ARM token serves all the REST calls of the run.
 $armToken = Get-PlainToken 'https://management.azure.com'
 
 Write-Host 'OK'
 Write-Host "Processing $($resolvedSubs.Count) subscription(s): $($resolvedSubs.Name -join ', ')"
 Write-Host "Kinds: $($Kinds -join ', ')"
 
-# Step 3: Query Resource Graph inventory
+#endregion
+
+#region Step 3: Query the Resource Graph inventory
 Write-Host -NoNewline 'Querying resource inventory... '
 $resources = Get-ResourceInventory -SubscriptionIds $subIds -SubIdToName $subIdToName `
     -Kinds $Kinds -ResourceNameFilter $Resource
@@ -2442,7 +4139,10 @@ if ($Batch) {
     Write-Host "Mode: Batch (batch-size=$BatchSize)"
 }
 
-# Step 4: Build initial eligibility records (all minutes start as eligible)
+#endregion
+
+#region Step 4: Build the initial eligibility records
+# Every minute starts as eligible; the later steps subtract the excused minutes.
 $eligByRes = @{}
 foreach ($res in $resources) {
     $eligByRes[$res.ResourceId.ToLowerInvariant()] = [PSCustomObject]@{
@@ -2462,19 +4162,62 @@ foreach ($res in $resources) {
     }
 }
 
-# Step 5: Fetch Azure Monitor metrics
-if ($Batch) {
-    $uniqueRegions = @($resources | ForEach-Object { $_.Location.ToLowerInvariant() } | Select-Object -Unique | Sort-Object)
-    Test-BatchEndpoints -MetricsToken $metricsToken -Regions $uniqueRegions
-    $metricResults = Get-BatchAvailabilityMetrics -Resources $resources -StartDate $utcStart `
-        -EndDate $utcEnd -ThrottleLimit $Parallelism -BatchSize $BatchSize -MetricsToken $metricsToken
-    $metricsToken = $null
-} else {
-    $metricResults = Get-AvailabilityMetrics -Resources $resources -StartDate $utcStart `
-        -EndDate $utcEnd -ThrottleLimit $Parallelism -ArmToken $armToken
+#endregion
+
+#region Step 5: Fetch Azure Monitor metrics
+# Storage accounts and Web Apps use their own algorithms (Steps 5c and 5d) and are not part of the PT1M metric fetch.
+$metricResources = @($resources | Where-Object { $_.Kind -notin 'StorageAccount', 'WebApp' })
+$metricResults = @{}
+# Batch mode sends one call per group of resources of a region; otherwise every resource is queried on its own.
+if ($metricResources.Count -gt 0) {
+    if ($Batch) {
+        $uniqueRegions = @($metricResources | ForEach-Object { $_.Location.ToLowerInvariant() } | Select-Object -Unique | Sort-Object)
+        Test-BatchEndpoints -MetricsToken $metricsToken -Regions $uniqueRegions
+        $metricResults = Get-BatchAvailabilityMetrics -Resources $metricResources -StartDate $utcStart `
+            -EndDate $utcEnd -ThrottleLimit $Parallelism -BatchSize $BatchSize -MetricsToken $metricsToken
+    } else {
+        $metricResults = Get-AvailabilityMetrics -Resources $metricResources -StartDate $utcStart `
+            -EndDate $utcEnd -ThrottleLimit $Parallelism -ArmToken $armToken
+    }
+}
+$metricsToken = $null
+
+#endregion
+
+#region Step 5c: Storage accounts
+# The storage algorithm (README, "Algorithms > Storage accounts") scores the hourly server-failure rate
+# and attributes the failing minutes to Resource Health. It fills the eligibility records directly.
+$storageResources = @($resources | Where-Object { $_.Kind -eq 'StorageAccount' })
+if ($storageResources.Count -gt 0) {
+    $storageResults = Invoke-StorageAvailability -Resources $storageResources -PeriodStart $utcStart -PeriodEnd $utcEnd `
+        -TotalMinutes $totalMinutes -ThrottleLimit $Parallelism -ArmToken $armToken `
+        -HealthLeadMinutes $HealthLeadMinutes -SourceWorkspaceId $SourceWorkspaceId -SubscriptionIds $subIds
+    foreach ($res in $storageResources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        Set-StorageEligibility -Record $eligByRes[$key] -Result $storageResults[$key]
+    }
 }
 
-# Step 5b: Detect perpetually-deallocated VMs
+#endregion
+
+#region Step 5d: Web Apps
+# The Web App algorithm (README, "Algorithms > Web Apps") counts the minutes in which every request failed
+# with a 5xx and attributes them to the Activity Log and Resource Health. It fills the eligibility records directly.
+$webResources = @($resources | Where-Object { $_.Kind -eq 'WebApp' })
+if ($webResources.Count -gt 0) {
+    $webResults = Invoke-WebAvailability -Resources $webResources -PeriodStart $utcStart -PeriodEnd $utcEnd `
+        -TotalMinutes $totalMinutes -ThrottleLimit $Parallelism -ArmToken $armToken `
+        -HealthLeadMinutes $HealthLeadMinutes -GraceMinutes $ActivityGraceMinutes `
+        -SourceWorkspaceId $SourceWorkspaceId -SubscriptionIds $subIds
+    foreach ($res in $webResources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        Set-WebEligibility -Record $eligByRes[$key] -Result $webResults[$key]
+    }
+}
+
+#endregion
+
+#region Step 5b: Detect perpetually-deallocated VMs
 # VMs that are currently deallocated/stopped AND had zero healthy minutes for the
 # entire period are excused — the VM was never running so availability is N/A.
 # This handles cases where the deallocate event fell outside Activity Log and
@@ -2485,41 +4228,43 @@ $vmCandidates = @($resources | Where-Object {
     $metricResults.ContainsKey($_.ResourceId.ToLowerInvariant()) -and
     $metricResults[$_.ResourceId.ToLowerInvariant()].SuspectMinutes -ge $totalMinutes
 })
-if ($vmCandidates.Count -gt 0) {
-    foreach ($vm in $vmCandidates) {
-        try {
-            $ivUrl = "https://management.azure.com$($vm.ResourceId)/instanceView?api-version=2024-07-01"
-            $ivResp = Invoke-RestMethod -Uri $ivUrl -Headers @{ Authorization = "Bearer $armToken" } -Method Get
-            $powerCode = ($ivResp.statuses | Where-Object { $_.code -like 'PowerState/*' } | Select-Object -First 1).code
-            if ($powerCode -eq 'PowerState/deallocated' -or $powerCode -eq 'PowerState/stopped') {
-                $perpetuallyDeallocated.Add($vm.ResourceId) | Out-Null
-                $elig = $eligByRes[$vm.ResourceId.ToLowerInvariant()]
-                $elig.EligibleMinutes = 0
-                $elig.ExcusedMinutes = $totalMinutes
-                $elig.SuspectMinutes = $totalMinutes
-                $elig.AvailabilityPct = 'N/A'
-                Write-Host "  [$($vm.Name)] Deallocated for entire period — excluded from availability counts"
-            }
+# The instance view tells the current power state of each candidate.
+foreach ($vm in $vmCandidates) {
+    try {
+        $ivUrl = "https://management.azure.com$($vm.ResourceId)/instanceView?api-version=2024-07-01"
+        $ivResp = Invoke-RestMethod -Uri $ivUrl -Headers @{ Authorization = "Bearer $armToken" } -Method Get
+        $powerCode = ($ivResp.statuses | Where-Object { $_.code -like 'PowerState/*' } | Select-Object -First 1).code
+        if ($powerCode -in 'PowerState/deallocated', 'PowerState/stopped') {
+            [void]$perpetuallyDeallocated.Add($vm.ResourceId)
+            $elig = $eligByRes[$vm.ResourceId.ToLowerInvariant()]
+            $elig.EligibleMinutes = 0
+            $elig.ExcusedMinutes = $totalMinutes
+            $elig.SuspectMinutes = $totalMinutes
+            $elig.AvailabilityPct = 'N/A'
+            Write-Host "  [$($vm.Name)] Deallocated for entire period — excluded from availability counts"
         }
-        catch {
-            Write-Warning "Instance View check failed for '$($vm.Name)': $_"
-        }
+    }
+    catch {
+        Write-Warning "Instance View check failed for '$($vm.Name)': $_"
     }
 }
 
-# Step 6: Build suspect candidates and investigate via Activity Log + Resource Health
-# Build the list of resources that have at least one suspect minute —
-# these need Activity Log + Resource Health investigation. Combine null
-# and zero ticks into a single AllGapTicks array for the gap classifier.
+#endregion
+
+#region Step 6: Build the suspect candidates
+# Collect the resources that have at least one suspect minute: these need Activity Log and
+# Resource Health investigation. Null and zero ticks are combined into one AllGapTicks array,
+# and kept separately as well because the VM algorithm treats them differently.
 $suspectCandidates = [System.Collections.Generic.List[object]]::new()
 foreach ($res in $resources) {
     $key = $res.ResourceId.ToLowerInvariant()
     if ($perpetuallyDeallocated.Contains($res.ResourceId)) { continue }
     $mr = $metricResults[$key]
     if ($mr -and $mr.SuspectMinutes -gt 0) {
+        # Null and zero minutes together are the gap ticks; the VM algorithm also needs them apart.
         $allTicks = [System.Collections.Generic.List[long]]::new()
-        if ($mr.GapTicks.Count -gt 0)       { foreach ($t in $mr.GapTicks)       { $allTicks.Add([long]$t) } }
-        if ($mr.ZeroAvailTicks.Count -gt 0)  { foreach ($t in $mr.ZeroAvailTicks)  { $allTicks.Add([long]$t) } }
+        $allTicks.AddRange([long[]]@($mr.GapTicks))
+        $allTicks.AddRange([long[]]@($mr.ZeroAvailTicks))
         if ($allTicks.Count -gt 0 -or $mr.DegradedTicks.Count -gt 0) {
             $suspectCandidates.Add([PSCustomObject]@{
                 Name           = $res.Name
@@ -2528,6 +4273,7 @@ foreach ($res in $resources) {
                 SubscriptionId = $res.SubscriptionId
                 CreationTime   = $res.CreationTime
                 AllGapTicks    = @($allTicks)
+                NullTicksArray = @($mr.GapTicks)
                 ZeroTicksArray = @($mr.ZeroAvailTicks)
                 DegradedTicks  = @($mr.DegradedTicks)
                 DegradedValues = @($mr.DegradedValues)
@@ -2536,36 +4282,59 @@ foreach ($res in $resources) {
     }
 }
 
-# Step 6b: If using Log Analytics, bulk-fetch Activity Log + Resource Health data.
-# Activity Log events are used directly; Resource Health transitions from LA
-# complement REST API data in hybrid mode (LA covers pre-30-day, REST provides
-# curated authoritative data for the last ~30 days).
+#endregion
+
+#region Step 6b: Investigate the suspect minutes
+# With -SourceWorkspaceId, Activity Log events and Resource Health history are fetched
+# in bulk from Log Analytics and combined with the REST history (see "Resource Health history" in the README).
+# The workspace is also asked about every SQL database: one whose history shows a platform health event
+# is investigated even without a zero minute, to report the brief failures the metric does not count.
 $logAnalyticsData = $null
-if ($SourceWorkspaceId -and $suspectCandidates.Count -gt 0) {
+$sqlResources = @($resources | Where-Object { $_.Kind -eq 'AzureSqlDatabase' -and $metricResults.ContainsKey($_.ResourceId.ToLowerInvariant()) -and
+        -not $metricResults[$_.ResourceId.ToLowerInvariant()].ExcludeFromAvailability })
+if ($SourceWorkspaceId -and ($suspectCandidates.Count -gt 0 -or $sqlResources.Count -gt 0)) {
     Write-Host -NoNewline 'Fetching Activity Log + Resource Health history from Log Analytics... '
+    # One bulk query fetches the Activity Log and the Resource Health history of every candidate.
     $laTokenStr = Get-PlainToken 'https://api.loganalytics.io'
+    $laResourceIds = @(@($suspectCandidates | ForEach-Object { $_.ResourceId }) + @($sqlResources | ForEach-Object { $_.ResourceId }))
     $logAnalyticsData = Get-LogAnalyticsData -WorkspaceId $SourceWorkspaceId `
-        -SubscriptionIds $subIds -ResourceIds @($suspectCandidates.ResourceId) `
+        -SubscriptionIds $subIds -ResourceIds $laResourceIds `
         -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -ArmToken $laTokenStr
     $laTokenStr = $null
+
+    # Add the SQL databases that had a platform health event but no suspect minute.
+    $investigated = [System.Collections.Generic.HashSet[string]]::new([string[]]@($suspectCandidates | ForEach-Object { $_.ResourceId.ToLowerInvariant() }))
+    foreach ($res in $sqlResources) {
+        $key = $res.ResourceId.ToLowerInvariant()
+        if ($investigated.Contains($key) -or -not $logAnalyticsData.ContainsKey($key)) { continue }
+        $platformEvent = @($logAnalyticsData[$key].HealthRaw | Where-Object { $_.State -in 'Unavailable', 'Degraded' -and $_.Cause -ne 'UserInitiated' })
+        if ($platformEvent.Count -eq 0) { continue }
+        $suspectCandidates.Add([PSCustomObject]@{
+            Name = $res.Name; Kind = $res.Kind; ResourceId = $res.ResourceId; SubscriptionId = $res.SubscriptionId
+            CreationTime = $res.CreationTime; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @(); DegradedTicks = @(); DegradedValues = @()
+        })
+    }
 }
 
+# The investigation attributes every suspect minute (VM and SQL algorithms).
 $suspectResults = $null
 if ($suspectCandidates.Count -gt 0) {
     $suspectResults = Invoke-SuspectGapInvestigation -Candidates @($suspectCandidates) `
         -PeriodStart $utcStart -PeriodEnd $utcEnd -ThrottleLimit $Parallelism `
-        -GraceMinutes $ActivityGraceMinutes -ArmToken $armToken `
+        -GraceMinutes $ActivityGraceMinutes -FaultWindowMinutes $FaultWindowMinutes -HealthLeadMinutes $HealthLeadMinutes -ArmToken $armToken `
         -HealthCoverageStart $healthCoverageStart `
         -LogAnalyticsData $logAnalyticsData
 }
 
-# Step 7: Assemble final results
+#endregion
+
+#region Step 7: Assemble the final results
 # Wires investigation outcomes into each resource's eligibility record:
 #   - Subtracts excused minutes from EligibleMinutes
 #   - Computes AvailableMinutes, ConfirmedDowntimeMinutes, UnexplainedSuspectMinutes
-#   - Excludes zero-transaction storage minutes from eligibility
 #   - Prints per-resource classification narration
+# Storage accounts were already completed by their own algorithm (Step 5c) and have no metric result here.
 foreach ($res in $resources) {
     $key  = $res.ResourceId.ToLowerInvariant()
     $elig = $eligByRes[$key]
@@ -2573,6 +4342,7 @@ foreach ($res in $resources) {
 
     if (-not $mr) { continue }
 
+    # No numeric datapoint at all: the resource cannot be judged and is N/A.
     if ($mr.ExcludeFromAvailability) {
         $elig.EligibleMinutes = 0
         $elig.AvailableMinutes = 0
@@ -2587,12 +4357,17 @@ foreach ($res in $resources) {
     # Skip perpetually-deallocated VMs — already handled in Step 5b
     if ($perpetuallyDeallocated.Contains($res.ResourceId)) { continue }
 
-    $activityLogExcludedGapMinutes = 0
-    $healthExplainedGapMinutes = 0
-    $metricIssueNullMinutes = 0
-    $excludedDegradedMinutes = 0
+    $gc = $suspectResults ? $suspectResults[$key] : $null
 
-    $gc = if ($suspectResults) { $suspectResults[$key] } else { $null }
+    # Counters from the investigation (all zero when the resource had no suspect minutes).
+    $activityLogExcludedGapMinutes = $gc ? $gc.ActivityLogExcludedGapMinutes : 0
+    $healthExplainedGapMinutes     = $gc ? $gc.HealthExplainedGapMinutes : 0
+    $metricIssueNullMinutes        = $gc ? $gc.MetricIssueNullMinutes : 0
+    $excludedDegradedMinutes       = $gc ? $gc.CustomerExcusedDegradedMinutes : 0
+
+    # Excused minutes leave the eligible total, which never goes below zero.
+    $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes -
+        ($activityLogExcludedGapMinutes + $healthExplainedGapMinutes + $metricIssueNullMinutes + $excludedDegradedMinutes))
 
     if ($gc) {
         $totalSuspectMinutes = $mr.SuspectMinutes
@@ -2600,9 +4375,10 @@ foreach ($res in $resources) {
         # Count contiguous suspect gaps for narration by sorting all suspect
         # ticks and counting boundaries where consecutive ticks are >1 min apart.
         $allSuspectTicks = [System.Collections.Generic.List[long]]::new()
-        foreach ($t in @($mr.GapTicks))       { $allSuspectTicks.Add([long]$t) }
-        foreach ($t in @($mr.ZeroAvailTicks))  { $allSuspectTicks.Add([long]$t) }
-        foreach ($t in @($mr.DegradedTicks))   { $allSuspectTicks.Add([long]$t) }
+        $allSuspectTicks.AddRange([long[]]@($mr.GapTicks))
+        $allSuspectTicks.AddRange([long[]]@($mr.ZeroAvailTicks))
+        $allSuspectTicks.AddRange([long[]]@($mr.DegradedTicks))
+        # A new gap starts wherever consecutive suspect minutes are more than one minute apart.
         $suspectGapCount = 0
         if ($allSuspectTicks.Count -gt 0) {
             $allSuspectTicks.Sort()
@@ -2618,113 +4394,64 @@ foreach ($res in $resources) {
 
         if ($totalSuspectMinutes -gt 0) {
             Write-Host "  [$($res.Name)] metric scan found $totalSuspectMinutes suspect min across $suspectGapCount suspect gaps (null or <100% availability values)"
-
-            $activityExplainedSuspectMinutes = $gc.ActivityLogExcludedGapMinutes + $gc.ActivityLogDegradedMinutes
-            $remainingAfterActivity = $totalSuspectMinutes - $activityExplainedSuspectMinutes
-            if ($remainingAfterActivity -gt 0) {
-                Write-Host "  [$($res.Name)] checked against Activity Log: $activityExplainedSuspectMinutes suspect min explained by admin lifecycle events, $remainingAfterActivity remain for Health History / fallback rules"
-            } else {
-                Write-Host "  [$($res.Name)] checked against Activity Log: $activityExplainedSuspectMinutes suspect min explained by admin lifecycle events"
-            }
-
-            if ($remainingAfterActivity -gt 0 -and $gc.HealthHistoryApplied) {
-                $healthExplainedSuspectMinutes = $gc.HealthExplainedGapMinutes + ($gc.CustomerExcusedDegradedMinutes - $gc.ActivityLogDegradedMinutes)
-                Write-Host "  [$($res.Name)] checked remaining suspect min against Health History: $($gc.PlatformFaultGapMinutes) gap min confirmed as platform issues, $healthExplainedSuspectMinutes suspect min explained as Unknown / customer-initiated"
-            } elseif ($remainingAfterActivity -gt 0) {
-                Write-Host "  [$($res.Name)] Health History skipped for remaining suspect min (outside current retention window); applying fallback rules directly"
-            }
+            # One line with what decided the suspect minutes, then the evidence.
+            Write-Host "  [$($res.Name)] $($gc.OutcomeLabel) classified suspect min: $($gc.OutcomeText)"
+            foreach ($line in $gc.Evidence) { Write-Host "  [$($res.Name)]   $line" }
         }
-
-        if ($gc.ActivityLogExcludedGapMinutes -gt 0) {
-            $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes - $gc.ActivityLogExcludedGapMinutes)
-            $activityLogExcludedGapMinutes = $gc.ActivityLogExcludedGapMinutes
-        }
-        if ($gc.HealthExplainedGapMinutes -gt 0) {
-            $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes - $gc.HealthExplainedGapMinutes)
-            $healthExplainedGapMinutes = $gc.HealthExplainedGapMinutes
-        }
-        if ($gc.MetricIssueNullMinutes -gt 0) {
-            $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes - $gc.MetricIssueNullMinutes)
-            $metricIssueNullMinutes = $gc.MetricIssueNullMinutes
-            Write-Host "  [$($res.Name)] $($gc.MetricIssueNullMinutes) unresolved null suspect min treated as metric issues and excluded from eligibility"
-        }
-        if ($gc.CustomerExcusedDegradedMinutes -gt 0) {
-            $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes - $gc.CustomerExcusedDegradedMinutes)
-            $excludedDegradedMinutes = $gc.CustomerExcusedDegradedMinutes
-            $healthExcusedDegradedMinutes = $gc.CustomerExcusedDegradedMinutes - $gc.ActivityLogDegradedMinutes
-            $degradedReasons = [System.Collections.Generic.List[string]]::new()
-            if ($gc.ActivityLogDegradedMinutes -gt 0) {
-                $degradedReasons.Add("$($gc.ActivityLogDegradedMinutes) matched in Activity Log")
-            }
-            if ($healthExcusedDegradedMinutes -gt 0) {
-                $degradedReasons.Add("$healthExcusedDegradedMinutes matched customer-initiated Health History")
-            }
-            Write-Host "  [$($res.Name)] $($gc.CustomerExcusedDegradedMinutes) degraded suspect min excluded from eligibility ($($degradedReasons -join ', '))"
-        }
-        if ($gc.PlatformFaultGapMinutes -gt 0) {
-            Write-Host "  [$($res.Name)] $($gc.PlatformFaultGapMinutes) gap min confirmed as downtime (Health History platform issue)"
-        }
-        if ($gc.HealthConfirmedDegradedMinutes -gt 0) {
-            Write-Host "  [$($res.Name)] $($gc.HealthConfirmedDegradedMinutes) degraded suspect min confirmed as downtime (Health History platform issue)"
-        }
-        if ($gc.UnresolvedZeroDowntimeMinutes -gt 0) {
-            Write-Host "  [$($res.Name)] $($gc.UnresolvedZeroDowntimeMinutes) unresolved 0% suspect min trusted as downtime"
+        elseif ($gc.Evidence) {
+            # Investigated without any suspect minute (a SQL database with a platform health event): evidence only.
+            foreach ($line in $gc.Evidence) { Write-Host "  [$($res.Name)] $line" }
         }
     }
 
     # Total confirmed downtime = platform fault gap minutes + degraded minutes
     # confirmed by Health History as platform issues.
-    $confirmedHealthDowntimeMinutes = if ($gc) { $gc.PlatformFaultGapMinutes + $gc.HealthConfirmedDegradedMinutes } else { 0 }
+    $confirmedHealthDowntimeMinutes = $gc ? $gc.PlatformFaultGapMinutes + $gc.HealthConfirmedDegradedMinutes : 0
 
     # Unexplained degraded = total degraded - excused by customer/activity - confirmed by health.
     # These stay eligible and contribute their fractional availability.
-    $unexplainedPositiveDegradedMinutes = if ($gc) {
-        [math]::Max(0, $mr.DegradedMinutes - $gc.CustomerExcusedDegradedMinutes - $gc.HealthConfirmedDegradedMinutes)
-    } else { $mr.DegradedMinutes }
+    $unexplainedPositiveDegradedMinutes = $gc ?
+        [math]::Max(0, $mr.DegradedMinutes - $gc.CustomerExcusedDegradedMinutes - $gc.HealthConfirmedDegradedMinutes) :
+        $mr.DegradedMinutes
 
     # Unresolved suspect = zero-value downtime + unexplained degraded.
-    $unexplainedSuspectMinutes = if ($gc) {
-        $gc.UnresolvedZeroDowntimeMinutes + $unexplainedPositiveDegradedMinutes
-    } else { $mr.SuspectMinutes }
-
-    # Zero-tx storage exclusion — minutes where the storage account had
-    # zero transactions have no availability signal and are excluded.
-    $zeroTxExcludedMinutes = 0
-    if ($mr.ZeroTxMin -gt 0 -and $res.Kind -eq 'StorageAccount') {
-        $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes - $mr.ZeroTxMin)
-        $zeroTxExcludedMinutes = $mr.ZeroTxMin
-    }
+    $unexplainedSuspectMinutes = $gc ?
+        $gc.UnresolvedZeroDowntimeMinutes + $unexplainedPositiveDegradedMinutes :
+        $mr.SuspectMinutes
 
     # Wire final totals into the eligibility record.
     # Invariant: Suspect = Faults + Excused + Unresolved
-    $elig.SuspectMinutes = $mr.SuspectMinutes + $zeroTxExcludedMinutes
+    $elig.SuspectMinutes = $mr.SuspectMinutes
     $elig.ConfirmedDowntimeMinutes = $confirmedHealthDowntimeMinutes
     $elig.ExcusedMinutes = $activityLogExcludedGapMinutes + $healthExplainedGapMinutes +
-        $metricIssueNullMinutes + $excludedDegradedMinutes + $zeroTxExcludedMinutes
+        $metricIssueNullMinutes + $excludedDegradedMinutes
     $elig.UnexplainedSuspectMinutes = $unexplainedSuspectMinutes
 
+    # Show how the eligible minutes were reduced.
     if ($activityLogExcludedGapMinutes -gt 0 -or $healthExplainedGapMinutes -gt 0 -or
-        $metricIssueNullMinutes -gt 0 -or $excludedDegradedMinutes -gt 0 -or $zeroTxExcludedMinutes -gt 0) {
+        $metricIssueNullMinutes -gt 0 -or $excludedDegradedMinutes -gt 0) {
         $adjustments = [System.Collections.Generic.List[string]]::new()
         if ($activityLogExcludedGapMinutes -gt 0) { $adjustments.Add("$activityLogExcludedGapMinutes gap min excluded by Activity Log") }
         if ($healthExplainedGapMinutes -gt 0)     { $adjustments.Add("$healthExplainedGapMinutes gap min excluded by Health History") }
         if ($metricIssueNullMinutes -gt 0)        { $adjustments.Add("$metricIssueNullMinutes null suspect min treated as metric issues") }
         if ($excludedDegradedMinutes -gt 0)       { $adjustments.Add("$excludedDegradedMinutes customer-excused degraded min") }
-        if ($zeroTxExcludedMinutes -gt 0)         { $adjustments.Add("$zeroTxExcludedMinutes zero-tx min") }
         Write-Host "  [$($res.Name)] eligible min = $totalMinutes - $($adjustments -join ' - ') = $($elig.EligibleMinutes)"
     }
 
     # Compute final availability: subtract the fractional available sum from
     # customer-excused degraded minutes (they were excluded from eligibility,
     # so their contribution must also leave the available sum).
-    $customerExcusedAvail = if ($gc) { $gc.CustomerExcusedDegradedAvailableSum } else { 0 }
+    $customerExcusedAvail = $gc ? $gc.CustomerExcusedDegradedAvailableSum : 0
     $elig.AvailableMinutes = [math]::Round([math]::Max(0, $mr.AvailableSum - $customerExcusedAvail), 2)
-    $elig.AvailabilityPct = if ($elig.EligibleMinutes -gt 0) {
-        [math]::Round($elig.AvailableMinutes / $elig.EligibleMinutes * 100, 5).ToString('F5')
-    } else { 'N/A' }
+    $elig.AvailabilityPct = $elig.EligibleMinutes -gt 0 ?
+        [math]::Round($elig.AvailableMinutes / $elig.EligibleMinutes * 100, 5).ToString('F5') :
+        'N/A'
 }
 
-# Step 8: Output — sort results and print table + per-subscription summaries
+#endregion
+
+#region Step 8: Print the results table and summaries
+# Sort the results and print the table plus the per-subscription summaries.
 $sorted = @($eligByRes.Values |
     Sort-Object SubscriptionName, Kind, Name)
 $summaries = @(Get-AvailabilitySummaries $sorted)
@@ -2732,7 +4459,9 @@ $summaries = @(Get-AvailabilitySummaries $sorted)
 Write-ResultsTable $sorted
 Write-SubscriptionSummaries $summaries
 
-# Step 9: Optional Log Analytics ingestion
+#endregion
+
+#region Step 9: Optional Log Analytics ingestion
 if ($sendToLogAnalytics) {
     Write-Host -NoNewline 'Sending results to Log Analytics... '
 
@@ -2802,6 +4531,9 @@ if ($sendToLogAnalytics) {
     $monitorToken = $null
     Write-Host "OK (RunId: $runId, $($resourcePayload.Count) resource rows, $($summaryPayload.Count) summary rows)"
 }
+#endregion
 
 $sw.Stop()
 Write-Host "Completed in $($sw.Elapsed.ToString('hh\:mm\:ss\.ff'))"
+
+#endregion
