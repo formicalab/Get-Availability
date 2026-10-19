@@ -76,23 +76,14 @@ The console output includes the observation window, any Resource Health coverage
 
 Resources with zero eligible minutes are shown as `N/A`.
 
-## Classification model
+## How it works
 
-1. Resource inventory comes from Azure Resource Graph.
-2. Azure Monitor metrics are collected for every resource (granularity and aggregation depend on the kind, see [Algorithms](#algorithms)).
-3. Suspect minutes are classified. Every resource kind follows its own algorithm, described in [Algorithms](#algorithms).
-4. Final availability is computed from eligible minutes and available minutes.
+1. The resource inventory comes from Azure Resource Graph.
+2. Each resource kind is measured from its own Azure Monitor signal and turned into *suspect minutes* (minutes that may count against availability).
+3. Every suspect minute is attributed with the Activity Log and Resource Health (VMs and SQL databases also use the metric itself), and ends as a fault, an excused minute or an unresolved minute.
+4. Availability is computed from the eligible minutes and the available minutes.
 
-Metric sources by resource type:
-
-| Resource type | Metrics |
-|---|---|
-| Virtual Machine | `VmAvailabilityMetric` (see [Virtual machines](#virtual-machines)) |
-| Azure SQL Database | `availability`, plus the connection metrics as evidence (see [Azure SQL databases](#azure-sql-databases)) |
-| Storage Account | `Transactions` split by `ResponseType` (see [Storage accounts](#storage-accounts)) |
-| Web App | `Requests` and `Http5xx` (see [Web Apps](#web-apps)) |
-
-When `-SourceWorkspaceId` is set, Activity Log data is queried from Log Analytics in bulk. For every resource kind, Resource Health history from the REST API and from the workspace is combined for the whole period (see [Resource Health history](#resource-health-history)).
+Steps 2 and 3 are different for each resource kind, and each algorithm is described only in [Algorithms](#algorithms): [virtual machines](#virtual-machines), [Azure SQL databases](#azure-sql-databases), [storage accounts](#storage-accounts) and [Web Apps](#web-apps). With `-SourceWorkspaceId` the Activity Log and the Resource Health events are read in bulk from Log Analytics (see [Resource Health history](#resource-health-history)).
 
 ## Log Analytics ingestion
 
