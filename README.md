@@ -38,6 +38,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 | `-Resource` | all | Limit the run to one resource |
 | `-Parallelism` | auto | Max concurrent API calls |
 | `-ActivityGraceMinutes` | `10` | Grace window after lifecycle events |
+| `-FaultWindowMinutes` | `30` | VMs only: how long a platform health note can explain suspect minutes the metric does not attribute itself |
 | `-Batch` | off | Use the Metrics Batch API |
 | `-BatchSize` | `10` | Batch size when `-Batch` is enabled |
 | `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and older Resource Health history |
@@ -217,3 +218,90 @@ Save-Module -Name Az.ResourceGraph -Path Functions/GetAvail/Modules -Repository 
 cd Functions/GetAvail
 func azure functionapp publish fn-getavail-itn-001 --powershell
 ```
+
+## Algorithms
+
+This section describes, step by step, how each resource kind is turned into the numbers in the results table. Every algorithm answers the same question for each suspect minute: *did this minute count against availability, and why?*
+
+### Virtual machines
+
+#### What the signal means
+
+The signal is `VmAvailabilityMetric` (aggregation `Minimum`, one-minute grain):
+
+| Value | Meaning |
+|---|---|
+| `1` | The VM is running and available |
+| `0` | The VM is unavailable: stopped, rebooting, or shut down from inside the guest |
+| null | The state is unknown. A VM stopped from the portal, CLI or PowerShell stops emitting the metric at once |
+
+The metric has a `Context` dimension that says who caused the state: `Platform` (Azure), `User` (the customer) or `Unknown`. It reports the VM as the host sees it. It does not see a hung guest, an unreachable application or a network-path problem, so a VM that is up but unreachable still reads `1`.
+
+A minute that is not `1` is a **suspect minute**. The algorithm decides, for every suspect minute, whether it is a fault, is excused, or stays unresolved.
+
+#### Step 1: collect the evidence
+
+1. **Metric.** Read the unsplit series. It is the base signal: every minute is available, null, zero or fractional.
+2. **Context.** Only if the VM has zero minutes, read the metric again split by `Context` and tag each zero minute with the contexts that report zero (`Platform`, `User`, `Unknown`). A zero with no `Context` information is `Unknown`.
+3. **Power-state guard.** If every minute of the period is suspect and the VM is currently `stopped` or `deallocated`, the whole period is excused and the VM is reported as `N/A`.
+4. **Activity Log.** Collect start, deallocate, power-off and restart operations, with all non-failed statuses (`Start`, `Accept`, `Success`). The first event marks when the affected minutes begin, so none of the statuses can be dropped. Events are grouped by operation and correlation ID; each group becomes a lifecycle window from its first event to its last event plus one minute plus `-ActivityGraceMinutes`. Overlapping windows are merged. The period before the VM's creation time is a separate *did not exist* window.
+5. **Resource Health.** Read the REST history (about the last 30 days) and, when `-SourceWorkspaceId` is set, the workspace history for older periods. Classify every note by what it says, not by whether its state changed:
+
+| Class | Examples | Role |
+|---|---|---|
+| Customer | Stopping and deallocating, Started by user, Rebooted by user, Machine crashed | Carries a state forward |
+| Platform outage | Redeploying due to host failure, VM Network dataplane down, Unavailable | Carries a state forward |
+| Planned, Spot eviction, Unknown, Recovery | Planned maintenance, Low priority machine preempted, Unknown, Available, Live Migration Succeeded | Carries a state forward |
+| Evidence only | Root Cause Analysis, `Down: ... unavailable for 15 minutes`, Accelerated Networking notes, degraded hardware or performance notes | Never decides a minute |
+
+A note classified as *evidence only* is kept for context but never starts or changes a state. In particular, the `Down: ... unavailable for 15 minutes` note is raised after the VM went down, so it cannot supersede the action that took it down, and Accelerated Networking and live-migration-succeeded notes are not outages even though Azure labels them `Unplanned`.
+
+#### Step 2: decide each suspect minute
+
+Rules are applied in order; the first match wins.
+
+| # | Rule | Verdict |
+|---|---|---|
+| 1 | The VM did not exist yet | Excused |
+| 2 | Zero, and `Context` includes `Platform` | **Fault** |
+| 3 | Zero, and `Context` is `User` only | Excused (customer) |
+| 4 | Inside a lifecycle window | Excused (lifecycle operation) |
+| 5 | Null, directly continuing a minute already explained as customer-caused | Excused (the gap is explained by what started it) |
+| 6 | A platform-outage note within `-FaultWindowMinutes` before the minute, with no customer action since | **Fault** |
+| 7 | The latest note is Customer, Planned or Spot eviction, or is Unknown and the minute is null | Excused |
+| 8 | Null, and nothing explains it | Excused as a *metric gap* |
+| 9 | Zero or fractional, and nothing explains it | **Unresolved** (counts against availability) |
+
+Three details matter in practice:
+
+- A `Recovery` or `Unknown` note logged seconds after a platform-outage note does not hide it (rule 6). Only a later customer action does.
+- A measured zero is attributed before lifecycle windows are consulted (rules 2 and 3), so a platform failure that happens during a customer restart is still a fault.
+- Rule 8 is deliberately generous: a missing sample is not evidence of downtime. The console narration lists metric gaps separately so they stay visible.
+
+#### Step 3: compute the result
+
+- **Suspect** = every non-`1` minute = Faults + Excused + Unresolved.
+- **Faults** = minutes decided by rules 2 and 6.
+- **Excused** = minutes decided by rules 1, 3, 4, 5, 7 and 8.
+- **Unresolved** = minutes decided by rule 9.
+- **Eligible minutes** = minutes in the period − Excused.
+- **Availability %** = available minutes ÷ eligible minutes, or `N/A` when no minute is eligible. Fractional minutes contribute their value.
+
+#### Worked examples
+
+| Situation | What the evidence shows | Result |
+|---|---|---|
+| Host failure | One zero minute with `Context = Platform`, and a "Redeploying due to host failure" note seconds earlier | 1 fault minute |
+| Daily start and stop by the customer | Zero minutes with `Context = User`, lifecycle windows around the operations, then nulls while the VM is deallocated | All excused; the nulls continue the customer stop |
+| Weekend deallocation after an Accelerated Networking note | The note is evidence only; the customer stop explains the nulls | Excused, no fault |
+| VM stopped by the customer for most of the month | Thousands of zero minutes with `Context = User` | Excused; availability is computed over the minutes the VM was meant to run |
+| Network dataplane down with no metric impact | A platform-outage note but every metric minute is `1` | No suspect minute, so no fault |
+
+#### Limits
+
+- Faults are only as good as the evidence: a platform event that leaves the metric at `1` is not counted.
+- Rule 6 can count null minutes that happen to fall inside the window after a platform note.
+- `-FaultWindowMinutes` and `-ActivityGraceMinutes` are tunables; the defaults (30 and 10) were validated on a limited set of subscriptions.
+- Resource Health REST history covers about 30 days. Older periods rely on the metric's `Context` and on `-SourceWorkspaceId`.
+
+The algorithms for Storage accounts, Azure SQL databases and Web Apps will be added here.
