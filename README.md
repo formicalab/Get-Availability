@@ -420,15 +420,18 @@ Two properties of the metric shape the algorithm:
 
 - **A zero minute is the only downtime signal, and the metric hides partial failures.** If some connections of a minute succeed, the minute reads `100` even when others failed. Short platform events (Resource Health reports about two seconds of impact) therefore leave no trace in `availability`. The companion metrics `connection_failed` (with an `Error` dimension) and `connection_successful` show them.
 - **A serverless database with auto-pause produces zero minutes by design.** The first connection to a paused database resumes it and fails with error `40613` ("database not currently available") until the resume completes. The platform logs each resume in the Activity Log as `Microsoft.Sql/servers/databases/resume` (a `Started` and a `Succeeded` event, about a minute apart) with an **all-zero correlation ID**. The metric reads `0` for the first minute and can read `100` for the following minutes while connections keep failing, so it also under-reports the length of a resume.
+- **A paused database is not operational, but the metric does not say so.** It reads `100` for every paused minute. The SLA counts only the minutes a database has been *operational* (its Deployment Minutes), so those minutes must leave the denominator. A serverless database bills no compute while it is paused, and the `app_cpu_billed` metric then has no value, which tells the paused minutes apart.
 
 In a September sample of 181 databases, every one of the 375 zero minutes had error `40613` and no successful connection in the minute, and 97% of them sat inside a resume operation.
 
 #### Step 1: collect the evidence
 
 1. **Metric.** Read `availability` for the whole period. Count the zero and null minutes.
-2. **Resume windows.** Collect the `resume` operations of the Activity Log, including the ones the platform logs itself (`Microsoft.Sql/servers/databases/resume`) and the ones triggered by a user (`.../resume/action`). Group the events of one operation by proximity: consecutive events at most 5 minutes apart belong together, and a window never exceeds 15 minutes. A window runs from the minute of its first event to one minute after the minute of its last event. Grouping by correlation ID would join every resume of the period into one window, because the platform's own events share a zero ID. A failed operation leaves a lone `Started` event that explains a single minute. Pause operations are not used: no zero minute was ever explained by a pause alone.
-3. **Creation time.** Minutes before the creation time of the database are excused.
-4. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history) and turn it into windows, as for storage accounts: a window opens at an `Unavailable` or `Degraded` note and closes at the next `Available` note. Windows of customer-caused events are customer windows. A platform window starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
+2. **Resume windows.** Collect the `resume` operations of the Activity Log, including the ones the platform logs itself (`Microsoft.Sql/servers/databases/resume`) and the ones triggered by a user (`.../resume/action`). Group the events of one operation by proximity: consecutive events at most 5 minutes apart belong together, and a window never exceeds 15 minutes. A window runs from the minute of its first event to one minute after the minute of its last event. Grouping by correlation ID would join every resume of the period into one window, because the platform's own events share a zero ID. A failed operation leaves a lone `Started` event that explains a single minute. Pause operations are not used to explain zero minutes: no zero minute was ever explained by a pause alone.
+3. **Failover windows.** Collect the `failover` operations of the Activity Log (`.../failover/action`), which the customer starts. They are grouped into windows like the resume operations.
+4. **Creation time.** Minutes before the creation time of the database are not Deployment Minutes.
+5. **Billed compute (serverless databases only, SKU name containing `_S_`).** Read `app_cpu_billed` (aggregation `Total`, one-minute grain). A run of at least 5 consecutive minutes without a value is a pause. Shorter holes are gaps in the telemetry, not pauses. The latest 15 minutes of a period that ends now have no data yet and are not judged. The zero minutes that count against availability (Faults and Unresolved) are never treated as paused, so a failure cannot hide as a pause.
+6. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history) and turn it into windows, as for storage accounts: a window opens at an `Unavailable` or `Degraded` note and closes at the next `Available` note. Windows of customer-caused events are customer windows, and windows of planned maintenance (reason `Planned`, or details saying "planned maintenance") are planned windows. A platform window starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
 
 #### Step 2: decide each suspect minute
 
@@ -436,27 +439,47 @@ Rules are applied in order; the first match wins.
 
 | # | Rule | Verdict |
 |---|---|---|
-| 1 | The database did not exist yet | Excused |
+| 1 | The database did not exist yet | Not a Deployment Minute |
 | 2 | Zero or null, inside a resume window | Excused (auto-resume is the customer-configured behaviour of the serverless tier) |
-| 3 | Zero, inside a customer Resource Health window | Excused |
-| 4 | Zero, inside a platform Resource Health window | **Fault** |
-| 5 | Null, and nothing explains it | Excused as a *metric gap* |
-| 6 | Zero, and nothing explains it | **Unresolved** (counts against availability) |
+| 3 | Zero, inside a failover window | Excused (the customer's own operation) |
+| 4 | Zero, inside a customer Resource Health window | Excused |
+| 5 | Zero, inside a planned-maintenance Resource Health window | Excused (the SLA's Scheduled Downtime) |
+| 6 | Zero, inside a platform Resource Health window | **Fault** |
+| 7 | Null, and nothing explains it | Excused as a *metric gap* |
+| 8 | Zero, and nothing explains it | **Unresolved** (counts against availability) |
 
 Resume is decided before Resource Health on purpose: on serverless databases most `Unavailable` health events are a by-product of the resume itself.
 
 #### Step 3: compute the result
 
-- **Suspect** = every zero or null minute = Faults + Excused + Unresolved.
-- **Faults** = minutes decided by rule 4. **Excused** = rules 1, 2, 3 and 5. **Unresolved** = rule 6.
-- **Eligible minutes** = minutes in the period − Excused. Paused time stays eligible: it is not downtime, and the metric itself reads `100` there.
-- **Availability %** = available minutes ÷ eligible minutes, or `N/A` when no minute is eligible.
+- **Suspect** = every zero or null minute = Faults + Excused + Unresolved (the minutes before creation are in the Excused column).
+- **Faults** = minutes decided by rule 6. **Excused** = rules 1, 2, 3, 4, 5 and 7. **Unresolved** = rule 8.
+- **Eligible minutes** are the SLA's *Maximum Available Minutes* (the database's *Deployment Minutes*) = minutes in the period − minutes before creation − paused minutes. Every other excused minute stays eligible: the SLA excludes those from Downtime, not from the denominator.
+- **Downtime** = Faults + Unresolved.
+- **Availability %** is the Uptime Percentage = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when no minute is eligible.
+
+#### Differences from the official SLA
+
+The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services) defines Azure SQL Database downtime as a minute in which all continuous connection attempts fail, and the Uptime Percentage as `(Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`, with Maximum Available Minutes the sum of the Deployment Minutes of the Databases of a subscription. The script follows that formula. It differs in these ways:
+
+| Official SLA | This script | Why |
+|---|---|---|
+| A minute is unavailable when all connection attempts of the minute fail | A minute is down when the `availability` metric reads `0` (every attempt failed with a system error) | The metric follows the same definition. It is the closest measure a customer can read |
+| Microsoft decides which downtime is excluded (customer operations, Scheduled Downtime, throttling, faulty input) | The script uses the Activity Log (resume, failover) and Resource Health (customer, planned) to excuse minutes | Microsoft's internal attribution is not available to customers. Changes of the service objective (scaling) are `databases/write` events like the many configuration writes of the same name, so they cannot be told apart and are not excused unless Resource Health says they were customer-caused |
+| Scheduled Downtime needs a notice of 5 days | A Resource Health note of planned maintenance counts as Scheduled Downtime, without checking the notice | The notice is not visible to customers. Resource Health only says that the event was planned |
+| A paused database is not operational and is not a Deployment Minute | Serverless databases: the minutes without billed compute (runs of at least 5) leave the denominator. The SLA text never mentions serverless or auto-pause, so this is an interpretation of "operational" | Azure Monitor has no pause state. The billed-compute metric is the only per-minute signal. Provisioned databases never pause |
+| Zero minutes are downtime unless excluded | A zero minute that nothing explains is **Unresolved** and counts as downtime | The script cannot tell who caused it, so it is conservative. Unresolved minutes are reported apart from Faults |
+| Maximum Available Minutes are summed over the Databases of a subscription | Minutes are summed per subscription and region | The report needs a regional split, and one subscription can hold databases in several regions |
+| The Applicable Period of pay-as-you-go services is the 30 days up to the incident | The period is a calendar month (UTC) | A monthly report is what the script produces |
+| Service levels depend on the tier and on zone redundancy, with Service Credits | No comparison with a target | Not in scope: the script reports the measured availability only |
+| The SLA covers Azure SQL Database only | The inventory excludes the system database and dedicated SQL pools (Azure Synapse). Managed Instance is a separate service and is not read | Their SLAs are different |
+| Geo-replication RPO and RTO | Not measured | Azure Monitor does not expose them |
 
 #### Evidence for the minutes that count
 
 For the Fault and Unresolved minutes, the narration lists the first five: the error codes of `connection_failed` with their counts, the number of successful connections of the same minute, the verdict and the Resource Health event that explained it. This needs one pair of metric calls per day that has such minutes (at most six days).
 
-The narration also counts the Resource Health platform events that produced **no zero minute** and do not overlap a resume: brief failures that the metric does not count. With `-SourceWorkspaceId` every database is checked; without it, only the databases that already have suspect minutes can be.
+The narration also counts the Resource Health platform events that produced **no zero minute** and do not overlap a resume or a failover: brief failures that the metric does not count. Planned maintenance is not counted. With `-SourceWorkspaceId` every database is checked; without it, only the databases that already have suspect minutes can be.
 
 #### Worked examples
 
@@ -466,11 +489,17 @@ The narration also counts the Resource Health platform events that produced **no
 | Provisioned database, one minute with every connection failing | The minute reads `0`, `40613` three times, no successful connection, no resume, no Resource Health event | Unresolved: downtime by the definition of the metric |
 | Failover with about two seconds of impact | Resource Health reports `Unavailable`; the metric stays at `100` because other connections succeeded | No suspect minute; counted as a brief platform event |
 | Health event raised by a resume | `Unavailable` note overlapping a resume operation | Excused; not counted as a platform event |
+| Monthly maintenance of the platform | One zero minute with error `40613`; the Resource Health note says "unavailable due to planned maintenance" | Excused (Scheduled Downtime) |
+| Serverless database that pauses every night | `app_cpu_billed` has no value for about 12 hours a day, the metric reads `100` | Those minutes are not Deployment Minutes; in one sample databases were paused 49% to 98% of the month |
+| One minute without billed compute in a running database | A hole of 1 to 3 minutes in the telemetry | Not a pause (a pause is at least 5 minutes) |
 
 #### Limits
 
 - Treating auto-resume as expected behaviour is a policy choice: the Microsoft documentation describes the `40613` behaviour, but the documentation reviewed does not state how the SLA counts it. The resume minutes are reported separately in the narration (`auto-resume N`) so that a stricter figure can be recomputed.
-- A real outage that starts in the same minutes as a resume is excused, because minutes are attributed by time only.
+- Treating a paused serverless database as not operational is also an interpretation: the SLA does not mention serverless. Counting those minutes as available instead would raise the eligible minutes and leave the downtime unchanged.
+- A real outage that starts in the same minutes as a resume, a failover or a planned-maintenance note is excused, because minutes are attributed by time only.
+- A failover is excused only when the Activity Log holds it. A failover started inside Azure (not by the customer) is a platform event and is attributed through Resource Health.
+- A change of the service objective is not excused unless Resource Health reports it as customer-caused (see the table above).
 - Partial failures are not downtime by the definition of the metric, so they are reported but not scored.
 - `-HealthLeadMinutes` (5) and the one-minute grace after a resume were validated on two subscriptions over two months.
 - Without `-SourceWorkspaceId` the Activity Log and Resource Health evidence cover only what the REST APIs retain (about 30 days).

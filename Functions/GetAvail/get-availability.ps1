@@ -20,9 +20,10 @@
         Context dimension (Platform / User / Unknown), Resource Health notes are classified by what
         they say, platform notes explain minutes only within -FaultWindowMinutes, and a gap stays
         explained by what started it. Activity Log: start/deallocate/power off/restart, creation.
-      - Azure SQL databases: the availability metric. A zero minute is excused inside a resume window
-        of the Activity Log (auto-resume of a paused serverless database), and the others are
-        matched with Resource Health.
+      - Azure SQL databases: the availability metric. A zero minute is excused inside a resume or
+        failover window of the Activity Log or a customer or planned-maintenance Resource Health
+        window, and the others are matched with Resource Health. The minutes of a paused serverless
+        database are not Deployment Minutes.
       - Storage accounts: the hourly server-failure rate, attributed to Resource Health.
       - Web Apps (no availability metric): a minute is down when every request failed with a 5xx; the
         down minutes are matched with the stop/start/restart operations of the Activity Log and with
@@ -307,7 +308,7 @@ function Get-HealthSources {
     foreach ($entry in ($LogAnalyticsData ?? @{}).GetEnumerator()) {
         $list = [System.Collections.Generic.List[HealthNote]]::new()
         foreach ($raw in $entry.Value.HealthRaw) {
-            $list.Add([HealthHistory]::FromWorkspace($raw.Timestamp.UtcTicks, $raw.State, $raw.Title, $raw.Cause))
+            $list.Add([HealthHistory]::FromWorkspace($raw.Timestamp.UtcTicks, $raw.State, $raw.Title, $raw.Cause, $raw.Details))
         }
         $workspaceNotes[$entry.Key] = $list
     }
@@ -789,10 +790,10 @@ public sealed class HealthFetch
 public static class HealthHistory
 {
     /// <summary>Builds a note from an Activity Log row: UserInitiated is the customer, PlatformInitiated maps to "Unplanned".</summary>
-    public static HealthNote FromWorkspace(long ticks, string state, string title, string cause)
+    public static HealthNote FromWorkspace(long ticks, string state, string title, string cause, string details = "")
         => new HealthNote
         {
-            Ticks = ticks, State = state ?? "", Title = title ?? "",
+            Ticks = ticks, State = state ?? "", Title = title ?? "", Summary = details ?? "",
             Reason = string.Equals(cause, "PlatformInitiated", StringComparison.Ordinal) ? "Unplanned" : "",
             Customer = string.Equals(cause, "UserInitiated", StringComparison.Ordinal)
         };
@@ -855,7 +856,7 @@ public static class HealthHistory
     /// state, Degraded title) are progress updates of the open event: neither an opening nor a closing note.
     /// An event that never resolves explains at most openCapTicks. The REST history and the workspace describe
     /// the same events, so windows that touch (within mergeTicks) and have the same cause are merged.
-    /// A throttling note is customer-caused whatever its recorded reason.
+    /// A throttling note is customer-caused whatever its recorded reason; a note whose reason is "Planned" is planned maintenance.
     /// </summary>
     public static List<HealthWindow> BuildWindows(List<HealthNote> notes, long openCapTicks, long mergeTicks)
     {
@@ -884,7 +885,7 @@ public static class HealthHistory
         foreach (var w in raw)
         {
             var last = windows.Count > 0 ? windows[windows.Count - 1] : null;
-            if (last != null && w.Start <= last.End + mergeTicks && w.Customer == last.Customer)
+            if (last != null && w.Start <= last.End + mergeTicks && w.Customer == last.Customer && w.Planned == last.Planned)
             {
                 if (w.End > last.End) last.End = w.End;
                 if (last.Summary.Length == 0) last.Summary = w.Summary;
@@ -899,8 +900,12 @@ public static class HealthHistory
         => new HealthWindow
         {
             Start = open.Ticks, End = end, Title = open.Title, Summary = open.Summary,
-            Customer = open.Customer || open.Title.IndexOf("Throttl", StringComparison.OrdinalIgnoreCase) >= 0
+            Customer = open.Customer || open.Title.IndexOf("Throttl", StringComparison.OrdinalIgnoreCase) >= 0,
+            Planned = open.Reason.Equals("Planned", StringComparison.OrdinalIgnoreCase) || PlannedText.IsMatch(open.Summary)
         };
+
+    /// <summary>The wording of a note that says the event was planned maintenance (and not "unplanned").</summary>
+    private static readonly Regex PlannedText = new Regex("(?<!un)planned maintenance", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 }
 
 /// <summary>A period during which Resource Health reported the resource degraded or unavailable.</summary>
@@ -908,6 +913,7 @@ public sealed class HealthWindow
 {
     public long   Start, End;     // UTC ticks
     public bool   Customer;       // caused by the customer
+    public bool   Planned;        // planned maintenance (the SLA's Scheduled Downtime)
     public string Title   = "";
     public string Summary = "";
 }
@@ -977,6 +983,26 @@ public static class StorageParser
     /// <summary>Adds a minute (PT1M) response into the per-minute arrays of the period.</summary>
     public static void AddMinutes(JsonDocument doc, long startTicks, double[] failed, double[] counted)
         => Accumulate(doc, startTicks, TimeSpan.TicksPerMinute, failed, counted);
+}
+
+/// <summary>
+/// Reads the billed minutes of a serverless SQL database. A paused database bills nothing and the metric has
+/// no value for its minutes, so a minute without a value is a minute in which the database was not operational.
+/// </summary>
+public static class ServerlessParser
+{
+    /// <summary>Marks every minute (indexed from startTicks) that has an app_cpu_billed value.</summary>
+    public static void AddBilledMinutes(JsonDocument doc, long startTicks, bool[] billed)
+    {
+        foreach (var metric in doc.RootElement.GetProperty("value").EnumerateArray())
+        foreach (var series in metric.GetProperty("timeseries").EnumerateArray())
+        foreach (var dp in series.GetProperty("data").EnumerateArray())
+        {
+            if (!dp.TryGetProperty("total", out var total) || total.ValueKind != JsonValueKind.Number) continue;
+            long minute = (AzTime.Ticks(dp.GetProperty("timeStamp").GetString()!) - startTicks) / TimeSpan.TicksPerMinute;
+            if (minute >= 0 && minute < billed.Length) billed[minute] = true;
+        }
+    }
 }
 
 /// <summary>A start, stop or restart of a Web App, from the Activity Log.</summary>
@@ -1560,8 +1586,8 @@ public static class VmGapClassifier
 
 .OUTPUTS
     PSCustomObject[] with Name, Kind, ResourceId, SubscriptionId, SubscriptionName,
-    ResourceGroupName, Location, CreationTime and Tier (the App Service plan tier, Web Apps only),
-    sorted by subscription, kind and name.
+    ResourceGroupName, Location, CreationTime, Tier (the App Service plan tier, Web Apps only) and
+    SkuName (SQL databases only), sorted by subscription, kind and name.
 #>
 function Get-ResourceInventory {
     param(
@@ -1593,7 +1619,7 @@ function Get-ResourceInventory {
         $nameFilter = "| where displayName =~ '$escaped' or name =~ '$escaped'`n"
     }
 
-    # The query drops SQL system databases and Function Apps, names SQL databases 'server/database',
+    # The query drops the SQL system database and dedicated SQL pools (not Azure SQL Databases in the SLA) and Function Apps, names SQL databases 'server/database',
     # joins Web Apps to their App Service plan (for the tier) and picks the creation time of each kind.
     $query = @"
 resources
@@ -1601,7 +1627,7 @@ resources
 | extend idParts = split(id, '/')
 | extend sqlServerName = iff(type =~ 'microsoft.sql/servers/databases', tostring(idParts[8]), '')
 | extend databaseName = iff(type =~ 'microsoft.sql/servers/databases', tostring(idParts[10]), '')
-| where not(type =~ 'microsoft.sql/servers/databases' and databaseName =~ 'master')
+| where not(type =~ 'microsoft.sql/servers/databases' and (databaseName =~ 'master' or tostring(sku.tier) =~ 'DataWarehouse'))
 | extend displayName = iff(type =~ 'microsoft.sql/servers/databases', strcat(sqlServerName, '/', databaseName), name)
 ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functionapp')
 | extend planId = tolower(tostring(properties.serverFarmId))
@@ -1614,7 +1640,7 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
     'Other'
 )
 | project id, name, displayName, type, subscriptionId, resourceGroup, location, resourceKind,
-          sqlServerName, databaseName, planTier,
+          sqlServerName, databaseName, planTier, skuName = tostring(sku.name),
           creationTime=case(
               type =~ 'microsoft.compute/virtualmachines', tostring(properties.timeCreated),
               type =~ 'microsoft.storage/storageaccounts', tostring(properties.creationTime),
@@ -1666,6 +1692,8 @@ ${nameFilter}| where not(type =~ 'microsoft.web/sites' and kind contains 'functi
                 Location          = [string]$row.location
                 CreationTime      = $creationTime
                 Tier              = [string]$row.planTier
+                # The SKU name tells a serverless SQL database (GP_S_Gen5, HS_S_Gen5, ...) from a provisioned one.
+                SkuName           = [string]$row.skuName
             })
         }
         $skipToken = [string]::IsNullOrWhiteSpace($response.SkipToken) ? $null : $response.SkipToken
@@ -1746,6 +1774,7 @@ let actOps = dynamic([
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/RESTART/ACTION',
   'MICROSOFT.SQL/SERVERS/DATABASES/RESUME',
   'MICROSOFT.SQL/SERVERS/DATABASES/RESUME/ACTION',
+  'MICROSOFT.SQL/SERVERS/DATABASES/FAILOVER/ACTION',
   'MICROSOFT.WEB/SITES/STOP/ACTION',
   'MICROSOFT.WEB/SITES/START/ACTION',
   'MICROSOFT.WEB/SITES/RESTART/ACTION',
@@ -1879,12 +1908,19 @@ actData | union healthData
                     $rawTitle = [string]$props.title
                 }
 
+                # The details say, for example, that the database was unavailable due to planned maintenance.
+                $rawDetails = ''
+                if ($props.PSObject.Properties['details']) {
+                    $rawDetails = [string]$props.details
+                }
+
                 if ($state) {
                     $entry.HealthRaw.Add([PSCustomObject]@{
                         Timestamp = $ts
                         State     = $state
                         Cause     = $rawCause
                         Title     = $rawTitle
+                        Details   = $rawDetails
                     })
                 }
             }
@@ -2323,8 +2359,9 @@ function Get-AvailabilityMetrics {
     notes are classified by what they say, platform notes explain minutes only within a bounded window,
     and a gap stays explained by what started it.
 
-    SQL databases: a zero minute is excused inside a resume window or a customer Resource Health
-    window, is a Fault inside a platform window and is Unresolved otherwise.
+    SQL databases: a zero minute is excused inside a resume window, a failover window or a customer or planned
+    Resource Health window, is a Fault inside a platform window and is Unresolved otherwise. The minutes in
+    which a serverless database is paused (no billed compute) are not Deployment Minutes.
 
     Resource Health notes come from the REST history and the workspace combined, exactly as for the
     other kinds (see Get-HealthSources). When Log Analytics data is provided, the Activity Log uses
@@ -2476,7 +2513,7 @@ function Invoke-SuspectGapInvestigation {
 
         <#
         .SYNOPSIS
-            Builds the auto-resume windows of an Azure SQL database from its Activity Log resume events.
+            Builds the windows of the operations of an Azure SQL database (auto-resume, failover) from their Activity Log events.
         .DESCRIPTION
             Events are grouped into one window per operation by proximity, not by correlation ID: the
             platform logs the resume of a paused serverless database with an all-zero correlation ID, so
@@ -2526,7 +2563,8 @@ function Invoke-SuspectGapInvestigation {
         # zero is attributed before lifecycle windows are consulted.
         $lifecycleIntervals    = @()
         $nonExistenceIntervals = @()
-
+        # SQL: the failover windows of the customer's own operations (the resume windows are the lifecycle ones).
+        $operationIntervals    = @()
         if ($c.AllGapTicks.Count -gt 0 -or $c.Kind -eq 'AzureSqlDatabase') {
             try {
                 # VM lifecycle: each operation explains the minutes around it, with the grace window.
@@ -2536,10 +2574,12 @@ function Invoke-SuspectGapInvestigation {
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/poweroff/action', 'power off virtual machine') }
                     @{ ApplyGrace = $true;  Tokens = @('microsoft.compute/virtualmachines/restart/action', 'restart virtual machine') }
                 )
-                # SQL lifecycle: only the resume of a paused serverless database explains failed connections.
+                # SQL lifecycle: the resume of a paused serverless database explains failed connections, and so does
+                # a failover started by the customer (the SLA excludes the customer's own operations).
                 # No zero minute was ever explained by a pause alone, so pause events are not used.
                 $sqlRules = @(
                     @{ ApplyGrace = $false; Tokens = @('microsoft.sql/servers/databases/resume', 'resume sql database', 'resume database') }
+                    @{ ApplyGrace = $false; Tokens = @('microsoft.sql/servers/databases/failover', 'failover sql database') }
                 )
                 $rules = switch ($c.Kind) {
                     'VirtualMachine'   { $vmRules }
@@ -2635,13 +2675,14 @@ function Invoke-SuspectGapInvestigation {
                     }
                 }
 
-                # Build time intervals from events. SQL resume events become one window per operation
-                # (see NewResumeIntervals). The other kinds group events by operation+correlationId
+                # Build time intervals from events. SQL resume and failover events become one window per operation
+                # (see NewResumeIntervals), kept apart so that the two can be told in the report. The other kinds group events by operation+correlationId
                 # so that events belonging to the same action collapse into a single interval.
                 # Compute from/to per group, apply the grace window for
                 # operations that have trailing transition time, then merge overlaps.
                 if ($c.Kind -eq 'AzureSqlDatabase') {
-                    $activityIntervals = NewResumeIntervals $events
+                    $activityIntervals  = NewResumeIntervals @($events | Where-Object { $_.OperationKey -match 'resume' })
+                    $operationIntervals = NewResumeIntervals @($events | Where-Object { $_.OperationKey -match 'failover' })
                 }
                 elseif ($events.Count -gt 0) {
                     # Group events by operation key + correlation ID.  Events without
@@ -2865,6 +2906,15 @@ function Invoke-SuspectGapInvestigation {
                 HealthExplainedGapMin        = $gap[4] + $gap[6] + $gap[7] + $gap[8] + $gap[9] + $gap[12]
                 MetricIssueNullMin           = $gap[10]
                 UnresolvedZeroDowntimeMin    = $gap[11]
+                # Every excused VM minute leaves the Maximum Available Minutes (the VM is not running, or did not exist).
+                EligibleReductionMin         = $gap[3] + $gap[5] + $gap[4] + $gap[6] + $gap[7] + $gap[8] + $gap[9] + $gap[12] + $gap[10]
+                EligibleReductions           = @(
+                    if ($gap[3] + $gap[5] -gt 0) { "$($gap[3] + $gap[5]) gap min excluded by Activity Log" }
+                    if ($gap[4] + $gap[6] + $gap[7] + $gap[8] + $gap[9] + $gap[12] -gt 0) {
+                        "$($gap[4] + $gap[6] + $gap[7] + $gap[8] + $gap[9] + $gap[12]) gap min excluded by Health History"
+                    }
+                    if ($gap[10] -gt 0) { "$($gap[10]) null suspect min treated as metric issues" }
+                )
             }
 
             # One-line breakdown of what decided the suspect minutes, for the console narration.
@@ -2882,8 +2932,12 @@ function Invoke-SuspectGapInvestigation {
             # the minute failed with a system error and 100 otherwise (never null in practice), so a zero minute
             # is the only downtime signal. Decision order for a zero minute:
             #   before creation -> excused; inside a resume window -> excused (auto-resume is by design);
-            #   inside a customer health window -> excused; inside a platform health window -> Fault;
-            #   anything else -> Unresolved. A null minute is a metric gap unless creation or a resume explains it.
+            #   inside a failover window of the customer -> excused; inside a customer health window -> excused;
+            #   inside a planned-maintenance health window -> excused (Scheduled Downtime);
+            #   inside a platform health window -> Fault; anything else -> Unresolved.
+            # A null minute is a metric gap unless creation or a resume explains it.
+            # The excused minutes stay in the Deployment Minutes (the SLA excludes them from Downtime only); the
+            # minutes before creation and, for a serverless database, the paused minutes are not Deployment Minutes.
             $tpm = 600000000L
             $leadTicks  = $leadMin * $tpm
             $graceTicks = 2 * $tpm
@@ -2894,43 +2948,96 @@ function Invoke-SuspectGapInvestigation {
                 $false
             }
             $lifecycle = @($lifecycleIntervals)
+            $operation = @($operationIntervals)
             $nonExist  = @($nonExistenceIntervals)
-            $n = @{ NotExists = 0; Resume = 0; Customer = 0; Fault = 0; Unresolved = 0; Gap = 0 }
+            $n = @{ NotExists = 0; Resume = 0; Operation = 0; Customer = 0; Scheduled = 0; Fault = 0; Unresolved = 0; Gap = 0 }
             $badMinutes = [System.Collections.Generic.List[object]]::new()   # Fault and Unresolved minutes, for the evidence
+            # The minutes already removed as "before creation", so that the paused minutes do not count them again.
+            $notExistTicks = [System.Collections.Generic.HashSet[long]]::new()
 
             foreach ($t in [long[]]@($c.ZeroTicksArray)) {
                 # Zero minute: apply the decision order described above.
-                if (& $inAny $nonExist $t)  { $n.NotExists++; continue }
+                if (& $inAny $nonExist $t)  { $n.NotExists++; [void]$notExistTicks.Add($t); continue }
                 if (& $inAny $lifecycle $t) { $n.Resume++; continue }
+                if (& $inAny $operation $t) { $n.Operation++; continue }
                 $win = $null
                 foreach ($w in $healthWindows) {
                     if ($t -ge $w.Start - $leadTicks -and $t -le $w.End + $graceTicks) { $win = $w; break }
                 }
                 if ($win -and $win.Customer) { $n.Customer++ }
+                elseif ($win -and $win.Planned) { $n.Scheduled++ }
                 elseif ($win) { $n.Fault++;      $badMinutes.Add([PSCustomObject]@{ Ticks = $t; Verdict = 'Fault'; Title = $win.Title }) }
                 else          { $n.Unresolved++; $badMinutes.Add([PSCustomObject]@{ Ticks = $t; Verdict = 'Unresolved'; Title = '' }) }
             }
             # Null minute: excused by creation or a resume, otherwise a metric gap.
             foreach ($t in [long[]]@($c.NullTicksArray)) {
-                if (& $inAny $nonExist $t)  { $n.NotExists++ }
+                if (& $inAny $nonExist $t)  { $n.NotExists++; [void]$notExistTicks.Add($t) }
                 elseif (& $inAny $lifecycle $t) { $n.Resume++ }
                 else { $n.Gap++ }
             }
 
-            # The same record shape as the VM branch, so Step 7 treats both kinds alike.
+            # Serverless: a paused database is not operational, so its minutes are not Deployment Minutes. A paused
+            # database bills nothing and app_cpu_billed has no value for its minutes. The zero minutes that count
+            # against availability stay in the Deployment Minutes, so a failure never hides as a pause.
+            $pausedMin = 0
+            if ($c.SkuName -match '_S_') {
+                $nMin = [int]($pEnd - $pStart).TotalMinutes
+                $startTicks = $pStart.UtcTicks
+                $billed = [bool[]]::new($nMin)
+                # Spans of 10 days; MetricSpans splits a span that the service refuses as too large.
+                $spanBounds = [System.Collections.Generic.List[long]]::new()
+                for ($m = 0; $m -lt $nMin; $m += 14400) {
+                    $spanBounds.Add($startTicks + $m * $tpm)
+                    $spanBounds.Add($startTicks + [math]::Min($m + 14400, $nMin) * $tpm)
+                }
+                $billedUri = "https://management.azure.com$($c.ResourceId)/providers/Microsoft.Insights/metrics?api-version=2024-02-01" +
+                             '&metricnamespace=Microsoft.Sql%2Fservers%2Fdatabases&metricnames=app_cpu_billed&aggregation=Total&interval=PT1M'
+                $billedError = [MetricSpans]::Read($client, $billedUri, $spanBounds.ToArray(), [Action[System.Text.Json.JsonDocument]]{
+                    param($doc) [ServerlessParser]::AddBilledMinutes($doc, $startTicks, $billed)
+                })
+                if ($billedError) { Write-Warning "Billed-compute metric failed for '$($c.Name)'; paused minutes stay eligible: $billedError" }
+                else {
+                    $counted = [System.Collections.Generic.HashSet[long]]::new($notExistTicks)
+                    foreach ($b in $badMinutes) { [void]$counted.Add([long]$b.Ticks) }
+                    # The latest minutes of a period that ends now have no data yet: they are not judged.
+                    $limit = $pEnd -gt [DateTimeOffset]::UtcNow.AddMinutes(-15) ? $nMin - 15 : $nMin
+                    # A pause lasts many minutes; a shorter run without data is a hole in the telemetry, not a pause.
+                    $run = 0; $runPaused = 0
+                    for ($i = 0; $i -le $limit; $i++) {
+                        if ($i -lt $limit -and -not $billed[$i]) {
+                            $run++
+                            if (-not $counted.Contains($startTicks + $i * $tpm)) { $runPaused++ }
+                        }
+                        else {
+                            if ($run -ge 5) { $pausedMin += $runPaused }
+                            $run = 0; $runPaused = 0
+                        }
+                    }
+                }
+            }
+
+            # The same record shape as the VM branch, so Step 7 treats both kinds alike. Only the minutes before
+            # creation and the paused ones leave the Deployment Minutes.
             $cr = [PSCustomObject]@{
                 PlatformFaultGapMin          = $n.Fault
-                ActivityLogExcludedGapMin    = $n.NotExists + $n.Resume
-                HealthExplainedGapMin        = $n.Customer
+                ActivityLogExcludedGapMin    = $n.NotExists + $n.Resume + $n.Operation
+                HealthExplainedGapMin        = $n.Customer + $n.Scheduled
                 MetricIssueNullMin           = $n.Gap
                 UnresolvedZeroDowntimeMin    = $n.Unresolved
+                EligibleReductionMin         = $n.NotExists + $pausedMin
+                EligibleReductions           = @(
+                    if ($n.NotExists -gt 0) { "$($n.NotExists) min before creation" }
+                    if ($pausedMin   -gt 0) { "$pausedMin min paused (no billed compute)" }
+                )
             }
             # One-line summary of what decided the suspect minutes, for the console narration.
             $outcomeLabel = 'SQL algorithm'
             $outcomeText = (@(
                 if ($n.NotExists   -gt 0) { "before creation $($n.NotExists)" }
                 if ($n.Resume      -gt 0) { "auto-resume $($n.Resume)" }
+                if ($n.Operation   -gt 0) { "customer failover $($n.Operation)" }
                 if ($n.Customer    -gt 0) { "customer (health note) $($n.Customer)" }
+                if ($n.Scheduled   -gt 0) { "planned maintenance (health note) $($n.Scheduled)" }
                 if ($n.Fault       -gt 0) { "platform fault (health note) $($n.Fault)" }
                 if ($n.Gap         -gt 0) { "metric gap $($n.Gap)" }
                 if ($n.Unresolved  -gt 0) { "unresolved 0% $($n.Unresolved)" }
@@ -3005,11 +3112,11 @@ function Invoke-SuspectGapInvestigation {
             $zeroTicksAll = [long[]]@($c.ZeroTicksArray)
             foreach ($w in $healthWindows) {
                 # A brief event is a platform event inside the period that overlaps neither a resume nor a zero minute.
-                if ($w.Customer -or $w.End -lt $pStart.UtcTicks -or $w.Start -ge $pEnd.UtcTicks) { continue }
+                if ($w.Customer -or $w.Planned -or $w.End -lt $pStart.UtcTicks -or $w.Start -ge $pEnd.UtcTicks) { continue }
                 $from = $w.Start - $leadTicks; $to = $w.End + $graceTicks
-                # A resume that overlaps the event explains it; a zero minute inside it means the metric did count it.
+                # A resume or failover that overlaps the event explains it; a zero minute inside it means the metric did count it.
                 $overlapsResume = $false
-                foreach ($r in $lifecycle) { if ($r.FromTicks -lt $to -and $r.ToTicks -gt $from) { $overlapsResume = $true; break } }
+                foreach ($r in @($lifecycle) + @($operation)) { if ($r.FromTicks -lt $to -and $r.ToTicks -gt $from) { $overlapsResume = $true; break } }
                 if ($overlapsResume) { continue }
                 $hasZero = $false
                 foreach ($t in $zeroTicksAll) { if ($t -ge $from -and $t -le $to) { $hasZero = $true; break } }
@@ -3029,6 +3136,8 @@ function Invoke-SuspectGapInvestigation {
             MetricIssueNullMinutes            = $cr.MetricIssueNullMin
             PlatformFaultGapMinutes           = $cr.PlatformFaultGapMin
             UnresolvedZeroDowntimeMinutes     = $cr.UnresolvedZeroDowntimeMin
+            EligibleReductionMinutes          = $cr.EligibleReductionMin
+            EligibleReductions                = @($cr.EligibleReductions)
             OutcomeText                       = $outcomeText
             OutcomeLabel                      = $outcomeLabel
             LossSpans                         = $lossSpans
@@ -4432,7 +4541,7 @@ if ($Batch) {
 #endregion
 
 #region Step 4: Build the initial eligibility records
-# Every minute starts as eligible; the later steps subtract the excused minutes.
+# Every minute starts as eligible; the later steps subtract the minutes that are not Maximum Available Minutes.
 $eligByRes = @{}
 foreach ($res in $resources) {
     $eligByRes[$res.ResourceId.ToLowerInvariant()] = [PSCustomObject]@{
@@ -4565,6 +4674,7 @@ foreach ($res in $resources) {
                 ResourceId     = $res.ResourceId
                 SubscriptionId = $res.SubscriptionId
                 CreationTime   = $res.CreationTime
+                SkuName        = $res.SkuName
                 AllGapTicks    = @($allTicks)
                 NullTicksArray = @($mr.GapTicks)
                 ZeroTicksArray = @($mr.ZeroAvailTicks)
@@ -4603,9 +4713,20 @@ if ($SourceWorkspaceId -and ($suspectCandidates.Count -gt 0 -or $sqlResources.Co
         if ($platformEvent.Count -eq 0) { continue }
         $suspectCandidates.Add([PSCustomObject]@{
             Name = $res.Name; Kind = $res.Kind; ResourceId = $res.ResourceId; SubscriptionId = $res.SubscriptionId
-            CreationTime = $res.CreationTime; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @()
+            CreationTime = $res.CreationTime; SkuName = $res.SkuName; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @()
         })
     }
+}
+
+# Every serverless SQL database is investigated, with or without suspect minutes: its paused minutes are not
+# Deployment Minutes and only the billed-compute metric tells them.
+$investigated = [System.Collections.Generic.HashSet[string]]::new([string[]]@($suspectCandidates | ForEach-Object { $_.ResourceId.ToLowerInvariant() }))
+foreach ($res in $sqlResources) {
+    if ($res.SkuName -notmatch '_S_' -or $investigated.Contains($res.ResourceId.ToLowerInvariant())) { continue }
+    $suspectCandidates.Add([PSCustomObject]@{
+        Name = $res.Name; Kind = $res.Kind; ResourceId = $res.ResourceId; SubscriptionId = $res.SubscriptionId
+        CreationTime = $res.CreationTime; SkuName = $res.SkuName; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @()
+    })
 }
 
 # The investigation attributes every suspect minute (VM and SQL algorithms).
@@ -4622,7 +4743,7 @@ if ($suspectCandidates.Count -gt 0) {
 
 #region Step 7: Assemble the final results
 # Wires investigation outcomes into each resource's eligibility record:
-#   - Subtracts excused minutes from EligibleMinutes
+#   - Subtracts the minutes that are not Maximum Available Minutes from EligibleMinutes
 #   - Computes AvailableMinutes, ConfirmedDowntimeMinutes, UnexplainedSuspectMinutes
 #   - Prints per-resource classification narration
 # Storage accounts were already completed by their own algorithm (Step 5b) and have no metric result here.
@@ -4654,10 +4775,12 @@ foreach ($res in $resources) {
     $activityLogExcludedGapMinutes = $gc ? $gc.ActivityLogExcludedGapMinutes : 0
     $healthExplainedGapMinutes     = $gc ? $gc.HealthExplainedGapMinutes : 0
     $metricIssueNullMinutes        = $gc ? $gc.MetricIssueNullMinutes : 0
+    # The minutes that are not Maximum Available Minutes (the SLA's Deployment Minutes): a VM that was not running or
+    # did not exist; a SQL database before its creation or paused. The other excused minutes stay in the denominator.
+    $eligibleReductionMinutes      = $gc ? $gc.EligibleReductionMinutes : 0
 
-    # Excused minutes leave the eligible total, which never goes below zero.
-    $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes -
-        ($activityLogExcludedGapMinutes + $healthExplainedGapMinutes + $metricIssueNullMinutes))
+    # They leave the eligible total, which never goes below zero.
+    $elig.EligibleMinutes = [math]::Max(0, $elig.EligibleMinutes - $eligibleReductionMinutes)
 
     if ($gc) {
         $totalSuspectMinutes = $mr.SuspectMinutes
@@ -4719,12 +4842,8 @@ foreach ($res in $resources) {
         )
     }
     # Show how the eligible minutes were reduced.
-    if ($activityLogExcludedGapMinutes -gt 0 -or $healthExplainedGapMinutes -gt 0 -or $metricIssueNullMinutes -gt 0) {
-        $adjustments = [System.Collections.Generic.List[string]]::new()
-        if ($activityLogExcludedGapMinutes -gt 0) { $adjustments.Add("$activityLogExcludedGapMinutes gap min excluded by Activity Log") }
-        if ($healthExplainedGapMinutes -gt 0)     { $adjustments.Add("$healthExplainedGapMinutes gap min excluded by Health History") }
-        if ($metricIssueNullMinutes -gt 0)        { $adjustments.Add("$metricIssueNullMinutes null suspect min treated as metric issues") }
-        Write-Host "  [$($res.Name)] eligible min = $totalMinutes - $($adjustments -join ' - ') = $($elig.EligibleMinutes)"
+    if ($eligibleReductionMinutes -gt 0) {
+        Write-Host "  [$($res.Name)] eligible min = $totalMinutes - $(@($gc.EligibleReductions) -join ' - ') = $($elig.EligibleMinutes)"
     }
 
     # The SLA formula: Uptime Percentage = (Maximum Available Minutes - Downtime) / Maximum Available Minutes x 100,
