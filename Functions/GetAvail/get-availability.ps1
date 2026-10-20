@@ -3651,7 +3651,7 @@ function Set-StorageEligibility {
     $Record.AvailabilityPct           = [math]::Round($Result.Percent, 5).ToString('F5')
 
     if ($Record.SuspectMinutes -gt 0) {
-        Write-Host ("  [$name] storage: {0:N0} server failure(s) in {1:N0} counted request(s) (own error rate {2:P4}); {3} failing min = {4} confirmed by Resource Health + {5} customer-excused + {6} unresolved (worth {7:N2} min of the pool)" -f
+        Write-Host ("  [$name] storage: {0:N0} failed request(s) of {1:N0} (own error rate {2:P4}) in {3} failing min = {4} confirmed by Resource Health + {5} customer-excused + {6} unresolved; worth {7:N2} min of the availability of its group" -f
             $Result.FailedRequests, $Result.CountedRequests, ($Result.FailedRequests / [math]::Max(1, $Result.CountedRequests)),
             $Record.SuspectMinutes, $Result.Fault, $Result.Excused, $Result.Unresolved, $Result.LostMinutes)
         # The three heaviest incidents are listed; the rest is counted.
@@ -3678,21 +3678,30 @@ function Set-StorageEligibility {
             }
             $minutes = ($counted | Measure-Object Minutes -Sum).Sum
             $failed  = ($counted | Measure-Object Failed -Sum).Sum
-            $what = ('{0:N0} failing {1}, {2:N0} failed {3}' -f $minutes, ($minutes -eq 1 ? 'minute' : 'minutes'), $failed, ($failed -eq 1 ? 'request' : 'requests'))
+            $what = ('{0:N0} failed {1} in {2:N0} failing {3}' -f $failed, ($failed -eq 1 ? 'request' : 'requests'), $minutes, ($minutes -eq 1 ? 'minute' : 'minutes'))
             if ($counted.Count -gt 1) {
                 $from = $Result.PeriodStart.AddMinutes(($counted | Measure-Object StartMinute -Minimum).Minimum)
                 $to   = $Result.PeriodStart.AddMinutes(($counted | Measure-Object EndMinute -Maximum).Maximum)
                 # Isolated minutes are "scattered"; longer runs are counted as incidents.
                 $spread = $counted.Count -eq $minutes ? 'scattered' : "in $($counted.Count) incidents"
-                $what += " $spread between $(Format-Occurrence $from) and $(Format-Occurrence $to)"
+                $what += ", $spread between $(Format-Occurrence $from) and $(Format-Occurrence $to)"
             }
             $when = @($counted | Select-Object -First 3 |
                 ForEach-Object { Format-Occurrence $Result.PeriodStart.AddMinutes($_.StartMinute) $_.Minutes })
             New-LossCause $lost $g.Name "$what; $because" $when ($counted.Count -gt 1 ? 'largest:' : 'at')
         })
         $notes = [System.Collections.Generic.List[string]]::new()
-        $notes.Add(('scored as in the SLA, per subscription and region: the pool of {0} account(s) has an Uptime Percentage of {1:N5}%, and this account carries its share of the pool''s loss ({2:N2} min)' -f
-            $Result.PoolAccounts, $Result.PoolUptime, $Result.LostMinutes))
+        $where = "$($Record.SubscriptionName), $($Record.Location)"
+        if ($Result.PoolAccounts -gt 1) {
+            $notes.Add(('as in the SLA, this account is counted together with the {0} other storage accounts of {1}: as a group they are {2:N5}% available' -f
+                ($Result.PoolAccounts - 1), $where, $Result.PoolUptime))
+            $notes.Add(('on its own this account failed {0:P4} of its {1:N0} requests; measured against the traffic of all these accounts the failures are worth {2:N2} min' -f
+                ($Result.FailedRequests / [math]::Max(1, $Result.CountedRequests)), $Result.CountedRequests, $Result.LostMinutes))
+        }
+        else {
+            $notes.Add(('this is the only storage account of {0}, so it is scored on its own: {1:P4} of its {2:N0} requests failed' -f
+                $where, ($Result.FailedRequests / [math]::Max(1, $Result.CountedRequests)), $Result.CountedRequests))
+        }
         if ($Result.LowVolume) { $notes.Add(('low volume: only {0:N0} counted request(s) in the period, the percentage rests on very few requests' -f $Result.CountedRequests)) }
         if (-not $Result.DetailComplete) { $notes.Add('minute detail incomplete: some failing minutes are not classified') }
         $Record.Notes = $notes.ToArray()
@@ -4386,7 +4395,7 @@ function Write-TopImpact([object[]]$Sorted, [int]$Top) {
         $rank++
         Write-Host ("{0,2}. {1}  ({2}, {3}, {4})" -f $rank, $r.Name, (Get-ShortKind $r.Kind), $r.Location, $r.SubscriptionName)
         # Storage loses availability as a share of the hourly error rate of its pool, not as minutes down.
-        $lossWording = $r.Kind -eq 'StorageAccount' ? 'failure rate worth' : 'lost'
+        $lossWording = $r.Kind -eq 'StorageAccount' ? 'failures worth' : 'lost'
         Write-Host ("    {0}% available: {4} {1:N2} of {2:N0} eligible min ({3:P1} of all lost minutes)" -f
             $r.AvailabilityPct, $r.LostMinutes, $r.EligibleMinutes, ($r.LostMinutes / $totalLost), $lossWording)
         # One line per cause, the heaviest first, with where it happened; what the causes do not add up to is shown too.
