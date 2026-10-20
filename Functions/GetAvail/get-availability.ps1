@@ -24,7 +24,8 @@
         failover window of the Activity Log or a customer or planned-maintenance Resource Health
         window, and the others are matched with Resource Health. The minutes of a paused serverless
         database are not Deployment Minutes.
-      - Storage accounts: the hourly server-failure rate, attributed to Resource Health.
+      - Storage accounts: the Error Rate of each hour over the accounts of a subscription and region,
+        as in the SLA, shared among the accounts and attributed to Resource Health.
       - Web Apps (no availability metric): a minute is down when every request failed with a 5xx; the
         down minutes are matched with the stop/start/restart operations of the Activity Log and with
         Resource Health.
@@ -918,35 +919,48 @@ public sealed class HealthWindow
     public string Summary = "";
 }
 
-/// <summary>Hourly request counts of a storage account: server failures and counted requests.</summary>
+/// <summary>Hourly request counts of a storage account: the failed transactions and the Total Storage Transactions.</summary>
 public sealed class StorageHourly
 {
     public double[] Failed;    // ServerOtherError + ServerTimeoutError per hour
-    public double[] Counted;   // Success + failed per hour
+    public double[] Counted;   // every transaction that is not an Excluded Transaction, failed ones included, per hour
 }
 
 /// <summary>
 /// Parsers for the Azure Storage availability algorithm (README, "Algorithms"). Requests are
-/// counted per ResponseType: Success and the server failures (ServerOtherError, ServerTimeoutError)
-/// make up the counted requests; every other response type is not requested at all, so throttling,
-/// network, client and authentication errors never reach the score.
+/// counted per ResponseType, following the Azure Storage SLA: the Total Storage Transactions are all the
+/// transactions except the Excluded Transactions that a ResponseType shows (authentication failures and
+/// throttling because a quota was exceeded), and the failed ones are the server errors.
 /// </summary>
 public static class StorageParser
 {
-    /// <summary>Returns 1 for Success, 2 for a server failure, 0 for anything else.</summary>
+    /// <summary>Server errors: the transactions that the service did not complete.</summary>
+    private static readonly HashSet<string> FailedTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "ServerOtherError", "ServerTimeoutError"
+    };
+
+    /// <summary>Excluded Transactions that a ResponseType shows: authentication failures and quota throttling.</summary>
+    private static readonly HashSet<string> ExcludedTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "AuthenticationError", "AuthorizationError", "ServerBusyError", "ClientThrottlingError",
+        "ClientAccountRequestThrottlingError", "ClientAccountBandwidthThrottlingError",
+        "ClientShareEgressThrottlingError", "ClientShareIngressThrottlingError", "ClientShareIopsThrottlingError"
+    };
+
+    /// <summary>Returns 2 for a failed transaction, 1 for any other counted one, 0 for an Excluded Transaction.</summary>
     private static int Classify(JsonElement series)
     {
-        if (!series.TryGetProperty("metadatavalues", out var mv)) return 0;
-        // The ResponseType dimension says whether the series holds successes or server failures.
+        if (!series.TryGetProperty("metadatavalues", out var mv)) return 1;
+        // The ResponseType dimension says what kind of transactions the series holds.
         foreach (var m in mv.EnumerateArray())
         {
             if (!string.Equals(m.GetProperty("name").GetProperty("value").GetString(), "responsetype", StringComparison.OrdinalIgnoreCase)) continue;
             string v = m.GetProperty("value").GetString() ?? "";
-            if (v.Equals("Success", StringComparison.OrdinalIgnoreCase)) return 1;
-            if (v.Equals("ServerOtherError", StringComparison.OrdinalIgnoreCase) ||
-                v.Equals("ServerTimeoutError", StringComparison.OrdinalIgnoreCase)) return 2;
+            if (FailedTypes.Contains(v)) return 2;
+            if (ExcludedTypes.Contains(v)) return 0;
         }
-        return 0;
+        return 1;
     }
 
     /// <summary>Accumulates a Transactions response split by ResponseType into per-slot arrays.</summary>
@@ -3162,12 +3176,14 @@ function Invoke-SuspectGapInvestigation {
 #region Storage algorithm
 # Storage accounts do not use the PT1M Availability metric: its Minimum is the worst single
 # ApiName/Authentication/GeoType series of the minute, so one failed request can cost a full minute.
-# Instead the score follows the Azure Storage SLA: failed / counted requests per hour, averaged over
-# the hours of the period, idle hours counting as available (README, "Algorithms > Storage accounts").
+# Instead the score follows the Azure Storage SLA: the Error Rate of an hour is failed / Total Storage
+# Transactions over all the accounts of a pool (subscription and region), the Average Error Rate is
+# the mean over the hours, and every account carries its share of it, idle hours counting as available
+# (README, "Algorithms > Storage accounts").
 
-# Only these response types are requested: counted = Success + server failures. Throttling, network,
-# client and authentication errors are therefore never part of the score.
-$StorageResponseFilter = "ResponseType eq 'Success' or ResponseType eq 'ServerOtherError' or ResponseType eq 'ServerTimeoutError'"
+# Transactions are read split by ResponseType: StorageParser tells the failed ones, the Excluded
+# Transactions (authentication failures, quota throttling) and the other counted ones.
+$StorageResponseFilter = "ResponseType eq '*'"
 
 # Accounts with fewer counted requests than this in the period are flagged as low-volume.
 $StorageLowVolumeRequests = 10000
@@ -3178,8 +3194,8 @@ $StorageLowVolumeRequests = 10000
     Gets the hourly counted and failed request totals of storage accounts for the whole period.
 
 .DESCRIPTION
-    One Azure Monitor call per account (Transactions, PT1H, Total, filtered to Success and server
-    failures). A failed query yields a null result, which excludes the account from availability.
+    One Azure Monitor call per account (Transactions, PT1H, Total, split by ResponseType). A failed
+    query yields a null result, which excludes the account from availability.
 
 .PARAMETER Resources
     Storage account descriptors from Get-ResourceInventory.
@@ -3247,14 +3263,14 @@ function Get-StorageHourlyCounts {
     Attributes the server failures of the given storage accounts minute by minute.
 
 .DESCRIPTION
-    For each account: (1) reads the PT1M Success and server-failure counts of the days that had failures
+    For each account: (1) reads the PT1M counts (split by ResponseType) of the days that had failures
     (one call per day when there are few, otherwise 10-day spans, halved again when the response is too
     large); (2) builds the platform and customer Resource Health windows from the REST history combined
     with Log Analytics when a workspace is used; (3) classifies every minute that had failures. A minute inside a
     platform window (starting HealthLeadMinutes before the event, because Resource Health raises it after
     the first failures, and ending two minutes after it is resolved) is a Fault, inside a customer window
-    (for example "Throttled") is Excused, anything else is Unresolved. Excused requests then leave the
-    hourly error rates, and the sum of the hourly error rates is returned.
+    (for example "Throttled") is Excused, anything else is Unresolved. The excused requests per hour and the
+    verdict of each hour are returned: they leave the hourly error rates when the pool is computed.
 
 .PARAMETER Candidates
     Objects with Resource, Hourly (StorageHourly) and FirstMinute (first minute after the account was created).
@@ -3279,7 +3295,7 @@ function Get-StorageHourlyCounts {
 
 .OUTPUTS
     Hashtable keyed by lowercase resource ID; each value has the failing-minute counts per class, the
-    sum of the hourly error rates and the evidence (incidents, health windows).
+    excused requests per hour, the verdict of each failing hour and the evidence (incidents, health windows).
 #>
 function Invoke-StorageInvestigation {
     param(
@@ -3393,29 +3409,15 @@ function Invoke-StorageInvestigation {
             }
         }
         if ($cur) { $incidents.Add($cur) }
-        # Hourly error rates, after removing the excused requests from both counts; every hour that loses
-        # availability is kept, with the verdict of its failing minutes, for the report.
-        $firstHour = [int][math]::Floor($c.FirstMinute / 60)
-        $errorSum = 0.0
-        $hourRates = [System.Collections.Generic.List[object]]::new()
-        for ($h = $firstHour; $h -lt $hours; $h++) {
-            $f = $hourly.Failed[$h] - $excusedByHour[$h]
-            $n = $hourly.Counted[$h] - $excusedByHour[$h]
-            if ($f -gt 0 -and $n -gt 0) {
-                $errorSum += $f / $n
-                $hc = $hourClass.ContainsKey($h) ? $hourClass[$h] : @{ Fault = 0; Unresolved = 0; Title = '' }
-                $hourRates.Add([PSCustomObject]@{ Hour = $h; Failed = $f; Counted = $n; Rate = $f / $n
-                                                  Fault = $hc.Fault; Unresolved = $hc.Unresolved; Title = $hc.Title })
-            }
-        }
 
-        # The result of the account: counts per class, the sum of the hourly error rates and the heaviest incidents first.
+        # The result of the account: counts per class, what the pool needs (the excused requests and the verdict
+        # of each failing hour) and the heaviest incidents first.
         [PSCustomObject]@{
             Key = $key; Fault = $count.Fault; Excused = $count.Excused; Unresolved = $count.Unresolved
-            Weighted = $weighted; ErrorSum = $errorSum; DetailComplete = $detailComplete
+            Weighted = $weighted; DetailComplete = $detailComplete
             Windows = $windows.Count; PeriodStart = $pStart
+            ExcusedByHour = $excusedByHour; HourClass = $hourClass
             Incidents = @($incidents | Sort-Object Weighted -Descending)
-            LossHours = @($hourRates | Sort-Object Rate -Descending)
         }
     } | ForEach-Object { $byRes[$_.Key] = $_ }
 
@@ -3433,8 +3435,10 @@ function Invoke-StorageInvestigation {
     1. Hourly request totals for every account (Get-StorageHourlyCounts).
     2. The accounts that had server failures are investigated minute by minute against Resource Health
        (Invoke-StorageInvestigation); with -SourceWorkspaceId the older health history comes from Log Analytics.
-    3. Availability % = 100 - average hourly error rate over the hours since the account was created. Idle
-       hours count as available; an account with no counted request in the period is excluded (N/A).
+    3. The Error Rate of every hour is computed over all the accounts of a pool (subscription and region), as in the
+       SLA. Each account carries its share of it, so that the average of the accounts' availability is the pool's
+       Uptime Percentage. Idle hours count as available; an account with no counted request in the period is
+       excluded (N/A).
 
 .PARAMETER Resources
     Storage account descriptors from Get-ResourceInventory.
@@ -3514,25 +3518,27 @@ function Invoke-StorageAvailability {
             -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken -HealthLeadMinutes $HealthLeadMinutes -LogAnalyticsData $logAnalyticsData
     }
 
-    # One result per account.
+    # One result per account. The Error Rate of an hour is the failed over the counted transactions of all the
+    # accounts of the pool (subscription and region), as in the SLA, and every account carries its share of
+    # it: its failed requests over the pool's counted requests of the hour, times the accounts of the pool,
+    # so that the average of the accounts is the Uptime Percentage of the pool (see the README).
+    $hours  = [int][math]::Ceiling(($PeriodEnd - $PeriodStart).TotalHours)
     $results = @{}
+    $members = [System.Collections.Generic.List[object]]::new()
     foreach ($res in $Resources) {
         $key    = $res.ResourceId.ToLowerInvariant()
         $hourly = $hourlyByRes[$key]
         $first  = $firstMinuteByRes[$key]
-        $hours  = [int][math]::Ceiling(($PeriodEnd - $PeriodStart).TotalHours)
-        # The percentage is 100 minus the average hourly error rate over the hours since the account was created.
-        $firstHour = [int][math]::Floor($first / 60)
         $counted = $hourly ? ($hourly.Counted | Measure-Object -Sum).Sum : 0
         $failed  = $hourly ? ($hourly.Failed  | Measure-Object -Sum).Sum : 0
         $inv     = $investigation[$key]
-        $errorSum = $inv ? $inv.ErrorSum : 0.0
         $eligibleMinutes = $TotalMinutes - $first
 
         $results[$key] = [PSCustomObject]@{
             Excluded        = (-not $hourly) -or $counted -le 0 -or $eligibleMinutes -le 0
             EligibleMinutes = $eligibleMinutes
-            Percent         = 100 - 100 * $errorSum / [math]::Max(1, $hours - $firstHour)
+            Percent         = 100.0
+            LostMinutes     = 0.0
             CountedRequests = $counted
             FailedRequests  = $failed
             Fault           = $inv ? $inv.Fault : 0
@@ -3541,9 +3547,62 @@ function Invoke-StorageAvailability {
             Weighted        = $inv ? $inv.Weighted : 0.0
             DetailComplete  = $inv ? $inv.DetailComplete : $true
             Incidents       = $inv ? $inv.Incidents : @()
-            LossHours       = $inv ? $inv.LossHours : @()
+            LossHours       = @()
+            PoolAccounts    = 1
+            PoolUptime      = 100.0
             PeriodStart     = $PeriodStart.UtcDateTime
             LowVolume       = $counted -lt $StorageLowVolumeRequests
+        }
+        if (-not $results[$key].Excluded) {
+            $members.Add([PSCustomObject]@{ Resource = $res; Key = $key; Hourly = $hourly; FirstHour = [int][math]::Floor($first / 60); Inv = $inv })
+        }
+    }
+
+    foreach ($pool in ($members | Group-Object { "$($_.Resource.SubscriptionId)|$($_.Resource.Location.ToLowerInvariant())" })) {
+        $accounts = @($pool.Group)
+        $lost = @{}; $lossHours = @{}
+        foreach ($a in $accounts) { $lost[$a.Key] = 0.0; $lossHours[$a.Key] = [System.Collections.Generic.List[object]]::new() }
+        $poolEligible = 0.0; $poolLost = 0.0
+        for ($h = 0; $h -lt $hours; $h++) {
+            # The minutes of the hour (the last one can be shorter when the period ends now).
+            $minutes = [math]::Min(60, $TotalMinutes - 60 * $h)
+            if ($minutes -le 0) { break }
+            # The accounts that existed in this hour, with their transactions after the excused requests are removed.
+            $live = [System.Collections.Generic.List[object]]::new()
+            $poolFailed = 0.0; $poolCounted = 0.0
+            foreach ($a in $accounts) {
+                if ($a.FirstHour -gt $h) { continue }
+                $excused = $a.Inv ? $a.Inv.ExcusedByHour[$h] : 0.0
+                $n = [math]::Max(0, $a.Hourly.Counted[$h] - $excused)
+                $f = [math]::Max(0, $a.Hourly.Failed[$h] - $excused)
+                $live.Add([PSCustomObject]@{ Account = $a; Failed = $f; Counted = $n })
+                $poolFailed += $f; $poolCounted += $n
+            }
+            if ($live.Count -eq 0) { continue }
+            $poolEligible += $minutes * $live.Count
+            # An hour without transactions has an error rate of 0%.
+            if ($poolCounted -le 0 -or $poolFailed -le 0) { continue }
+            foreach ($x in $live) {
+                if ($x.Failed -le 0) { continue }
+                $loss = $minutes * $live.Count * $x.Failed / $poolCounted
+                $lost[$x.Account.Key] += $loss
+                $poolLost += $loss
+                $hc = ($x.Account.Inv -and $x.Account.Inv.HourClass.ContainsKey($h)) ? $x.Account.Inv.HourClass[$h] : @{ Fault = 0; Unresolved = 0; Title = '' }
+                $lossHours[$x.Account.Key].Add([PSCustomObject]@{ Hour = $h; Failed = $x.Failed; Counted = $x.Counted; Lost = $loss
+                    PoolFailed = $poolFailed; PoolCounted = $poolCounted; Fault = $hc.Fault; Unresolved = $hc.Unresolved; Title = $hc.Title })
+            }
+        }
+        $poolUptime = $poolEligible -gt 0 ? 100 - 100 * $poolLost / $poolEligible : 100.0
+        $sample = $accounts[0].Resource
+        Write-Host ("  Storage pool {0}, {1} [{2} account(s)]: Uptime Percentage {3:N5}% (Average Error Rate {4:N5}%)" -f
+            $sample.SubscriptionName, $sample.Location, $accounts.Count, $poolUptime, (100 - $poolUptime))
+        foreach ($a in $accounts) {
+            $r = $results[$a.Key]
+            $r.LostMinutes  = $lost[$a.Key]
+            $r.Percent      = 100 - 100 * $lost[$a.Key] / $r.EligibleMinutes
+            $r.LossHours    = @($lossHours[$a.Key] | Sort-Object Lost -Descending)
+            $r.PoolAccounts = $accounts.Count
+            $r.PoolUptime   = $poolUptime
         }
     }
     $results
@@ -3557,8 +3616,8 @@ function Invoke-StorageAvailability {
 
 .DESCRIPTION
     Suspect = Faults + Excused + Unresolved holds, counted in failing minutes (minutes with at least one
-    server failure). AvailableMinutes is the eligible minutes scaled by the hourly availability, so
-    AvailabilityPct equals the hourly SLA figure.
+    server failure). AvailableMinutes is the eligible minutes less the minutes the account carries of its
+    pool's loss, so the accounts of a pool add up to the pool's Uptime Percentage.
 
 .PARAMETER Record
     The eligibility record of the account (see Step 4).
@@ -3582,18 +3641,19 @@ function Set-StorageEligibility {
         return
     }
 
-    # Suspect minutes are the failing minutes; the available minutes follow the hourly percentage.
+    # Suspect minutes are the failing minutes; the available minutes follow from the account's share of the pool's loss.
     $Record.EligibleMinutes           = $Result.EligibleMinutes
     $Record.SuspectMinutes            = $Result.Fault + $Result.Excused + $Result.Unresolved
     $Record.ConfirmedDowntimeMinutes  = $Result.Fault
     $Record.ExcusedMinutes            = $Result.Excused
     $Record.UnexplainedSuspectMinutes = $Result.Unresolved
-    $Record.AvailableMinutes          = [math]::Round($Result.EligibleMinutes * $Result.Percent / 100, 2)
+    $Record.AvailableMinutes          = [math]::Round($Result.EligibleMinutes - $Result.LostMinutes, 2)
     $Record.AvailabilityPct           = [math]::Round($Result.Percent, 5).ToString('F5')
 
     if ($Record.SuspectMinutes -gt 0) {
-        Write-Host ("  [$name] storage: {0:N0} server failure(s) in {1:N0} counted request(s); {2} failing min = {3} confirmed by Resource Health + {4} customer-excused + {5} unresolved (weighted loss {6:N2} min)" -f
-            $Result.FailedRequests, $Result.CountedRequests, $Record.SuspectMinutes, $Result.Fault, $Result.Excused, $Result.Unresolved, $Result.Weighted)
+        Write-Host ("  [$name] storage: {0:N0} server failure(s) in {1:N0} counted request(s) (own error rate {2:P4}); {3} failing min = {4} confirmed by Resource Health + {5} customer-excused + {6} unresolved (worth {7:N2} min of the pool)" -f
+            $Result.FailedRequests, $Result.CountedRequests, ($Result.FailedRequests / [math]::Max(1, $Result.CountedRequests)),
+            $Record.SuspectMinutes, $Result.Fault, $Result.Excused, $Result.Unresolved, $Result.LostMinutes)
         # The three heaviest incidents are listed; the rest is counted.
         foreach ($i in ($Result.Incidents | Select-Object -First 3)) {
             $when = $Result.PeriodStart.AddMinutes($i.StartMinute).ToString('u')
@@ -3604,11 +3664,12 @@ function Set-StorageEligibility {
         if (-not $Result.DetailComplete) { Write-Host "  [$name]   WARNING: minute detail incomplete, some failing minutes are not classified" }
 
         # The causes of the "most impact" report: the failing minutes that count, split by who explains them.
-        # The minutes lost are weighted per hour (see the note below), so they differ from the number of failing minutes.
+        # The minutes lost are the account's share of its pool's hourly error rates (see the note below), so they
+        # differ from the number of failing minutes.
         $Record.Causes = @(foreach ($g in (@($Result.LossHours) | Group-Object { $_.Fault -gt $_.Unresolved ? 'platform fault' : 'unresolved' })) {
             $isFault = $g.Name -eq 'platform fault'
             $because = $isFault ? "Resource Health '$(($g.Group | Where-Object Title | Select-Object -First 1).Title)'" : 'no Resource Health event'
-            $lost = ($g.Group | Measure-Object Rate -Sum).Sum * 60
+            $lost = ($g.Group | Measure-Object Lost -Sum).Sum
             # The incidents (runs of failing minutes) behind this verdict, the largest first.
             $counted = @($Result.Incidents | Where-Object { $_.Class -eq ($isFault ? 'Fault' : 'Unresolved') })
             if ($counted.Count -eq 0) {
@@ -3630,10 +3691,8 @@ function Set-StorageEligibility {
             New-LossCause $lost $g.Name "$what; $because" $when ($counted.Count -gt 1 ? 'largest:' : 'at')
         })
         $notes = [System.Collections.Generic.List[string]]::new()
-        $failingMinutes = $Result.Fault + $Result.Unresolved
-        $notes.Add(('storage is scored per hour: an hour loses (failed / counted requests) x 60 min, so {0} worth {1:N2} min' -f
-            ($failingMinutes -eq 1 ? 'this failing minute is' : ('these {0:N0} failing minutes are' -f $failingMinutes)),
-            ($Record.EligibleMinutes - $Record.AvailableMinutes)))
+        $notes.Add(('scored as in the SLA, per subscription and region: the pool of {0} account(s) has an Uptime Percentage of {1:N5}%, and this account carries its share of the pool''s loss ({2:N2} min)' -f
+            $Result.PoolAccounts, $Result.PoolUptime, $Result.LostMinutes))
         if ($Result.LowVolume) { $notes.Add(('low volume: only {0:N0} counted request(s) in the period, the percentage rests on very few requests' -f $Result.CountedRequests)) }
         if (-not $Result.DetailComplete) { $notes.Add('minute detail incomplete: some failing minutes are not classified') }
         $Record.Notes = $notes.ToArray()
@@ -4326,7 +4385,7 @@ function Write-TopImpact([object[]]$Sorted, [int]$Top) {
     foreach ($r in ($withLoss | Select-Object -First $Top)) {
         $rank++
         Write-Host ("{0,2}. {1}  ({2}, {3}, {4})" -f $rank, $r.Name, (Get-ShortKind $r.Kind), $r.Location, $r.SubscriptionName)
-        # Storage loses availability as a failure rate (each hour loses its error rate times 60 min), not as minutes down.
+        # Storage loses availability as a share of the hourly error rate of its pool, not as minutes down.
         $lossWording = $r.Kind -eq 'StorageAccount' ? 'failure rate worth' : 'lost'
         Write-Host ("    {0}% available: {4} {1:N2} of {2:N0} eligible min ({3:P1} of all lost minutes)" -f
             $r.AvailabilityPct, $r.LostMinutes, $r.EligibleMinutes, ($r.LostMinutes / $totalLost), $lossWording)
@@ -4587,8 +4646,8 @@ $metricsToken = $null
 #endregion
 
 #region Step 5b: Storage accounts
-# The storage algorithm (README, "Algorithms > Storage accounts") scores the hourly server-failure rate
-# and attributes the failing minutes to Resource Health. It fills the eligibility records directly.
+# The storage algorithm (README, "Algorithms > Storage accounts") scores the hourly Error Rate of each pool
+# (subscription and region) and attributes the failing minutes to Resource Health. It fills the eligibility records directly.
 $storageResources = @($resources | Where-Object { $_.Kind -eq 'StorageAccount' })
 if ($storageResources.Count -gt 0) {
     $storageResults = Invoke-StorageAvailability -Resources $storageResources -PeriodStart $utcStart -PeriodEnd $utcEnd `

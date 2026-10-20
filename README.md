@@ -91,7 +91,7 @@ A cause line gives the minutes it cost, the verdict that counts against availabi
 
 - VMs: the Resource Health note of the fault, the metric Context, or "zero availability that nothing explains" for an unresolved zero;
 - SQL databases: the Resource Health event or its absence, with the failed connections summed by error code and the successful connections of the same minutes;
-- storage accounts: storage is scored per hour, not as minutes down (an hour loses failed / counted requests x 60 min), so the header reads "failure rate worth N min" and a `note:` says how many failing minutes that is worth. A cause gives the failing minutes that count and the failed requests, the span and number of incidents (runs of failing minutes) when there are several, the largest incidents with their start, and the Resource Health event or its absence;
+- storage accounts: storage is scored per pool (subscription and region), not as minutes down: an account loses its share of the pool's hourly Error Rate, so the header reads "failure rate worth N min" and a `note:` gives the pool's Uptime Percentage. A cause gives the failing minutes that count and the failed requests, the span and number of incidents (runs of failing minutes) when there are several, the largest incidents with their start, and the Resource Health event or its absence;
 - Web Apps: the down minutes that count, with their incidents and failed requests, and the Resource Health event or its absence.
 
 `note:` lines follow when the figure rests on little data (low volume, many down minutes with fewer than 5 requests, a tier outside the SLA, incomplete minute detail). The size of the list is set with `-TopImpact`.
@@ -340,20 +340,20 @@ The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-
 
 #### What the signal means
 
-The portal's storage `Availability` metric is the share of billable requests that succeeded, but its `Minimum` aggregation is the *worst single series* of the minute (one `ApiName`, `Authentication` and `GeoType` combination), whatever its volume. A single failed request can therefore turn a whole minute into 0%, and a quiet account looks much worse than a busy one with the same failure count. The algorithm does not use it. It follows the definition of the [Azure Storage SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services): the **Error Rate of an hour** is failed requests ÷ counted requests, and availability is the Uptime Percentage: 100% minus the Average Error Rate, the sum of the hourly Error Rates divided by the hours of the Applicable Period (here, the period of the run). An hour with no traffic has a 0% Error Rate, so idle time counts as available.
+The portal's storage `Availability` metric is the share of billable requests that succeeded, but its `Minimum` aggregation is the *worst single series* of the minute (one `ApiName`, `Authentication` and `GeoType` combination), whatever its volume. A single failed request can therefore turn a whole minute into 0%, and a quiet account looks much worse than a busy one with the same failure count. The algorithm does not use it. It follows the definition of the [Azure Storage SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services): the **Error Rate of an hour** is Failed Storage Transactions ÷ Total Storage Transactions, taken over all the storage accounts, and availability is the Uptime Percentage: 100% minus the Average Error Rate, the sum of the hourly Error Rates divided by the hours of the Applicable Period (here, the period of the run). An hour with no transactions has a 0% Error Rate, so idle time counts as available. The SLA pools all the accounts of a subscription. The script pools the accounts of a subscription **and region** (a *pool*) and gives every account its share of the pool's loss (see Step 4), so that each account keeps its own row and the rows of a pool add up to the SLA figure.
 
-Requests are read from `Transactions` split by `ResponseType`, and only three response types are requested:
+Transactions are read from `Transactions` split by `ResponseType`:
 
 | Response type | Role |
 |---|---|
-| `Success` | Counted |
-| `ServerOtherError`, `ServerTimeoutError` | Counted and **failed** |
-| `ServerBusyError`, client throttling errors | Not requested: throttling is excluded from the score, as in the SLA |
-| `NetworkError`, `ClientOtherError`, authentication and authorization errors | Not requested: caused by the client, excluded from the score |
+| `ServerOtherError`, `ServerTimeoutError` | Counted and **failed**: the service did not complete the transaction |
+| `AuthenticationError`, `AuthorizationError` | Excluded Transactions (authentication failures) |
+| `ServerBusyError` and the `Client…ThrottlingError` types | Excluded Transactions (the account was over its quota or was throttled) |
+| Every other type: `Success`, `SuccessWith…Throttling`, `ClientOtherError`, `ClientTimeoutError`, `NetworkError` | Counted, not failed: the transaction completed, or the client caused the failure |
 
-#### Step 1: hourly error rates (every account)
+#### Step 1: hourly counts (every account)
 
-One call per account returns the counted and failed requests of every hour of the period. This single series gives the score; the rest of the algorithm only explains it.
+One call per account returns the counted and failed transactions of every hour of the period. These series give the score; the rest of the algorithm only explains it.
 
 #### Step 2: find the failing minutes (accounts with failures)
 
@@ -377,28 +377,56 @@ Both Fault and Unresolved count against availability: a failed request is a fail
 
 #### Step 4: compute the result
 
-- **Suspect** = failing minutes = Faults + Excused + Unresolved.
+For every pool (subscription × region) and every hour:
+
+- **Error Rate** = failed ÷ counted transactions of all the accounts of the pool that existed in that hour, after removing the excused requests. It is 0% when the pool had no transaction.
+- The pool's **Uptime Percentage** = 100% − the average of the hourly Error Rates, with each hour weighted by its minutes. This is the SLA formula, and the console prints it for every pool.
+
+Every account of the pool carries its share of that loss:
+
+- **Suspect** = failing minutes = Faults + Excused + Unresolved (minutes with at least one failed request, in the account).
 - **Eligible minutes** = minutes in the period since the account was created.
-- **Availability %** = 100 − average hourly error rate over the eligible hours, after removing the excused requests. **Available minutes** = eligible minutes × availability %.
+- **Lost minutes** = the sum over the hours of 60 × (accounts in the pool) × (the account's failed requests ÷ the pool's counted requests of the hour).
+- **Available minutes** = eligible − lost; **Availability %** = available ÷ eligible.
+- The rows of a pool therefore add up to the pool's Uptime Percentage: the sums of available and eligible minutes per subscription, kind and region, in the report and in Log Analytics, give the SLA figure. The multiplication by the number of accounts makes each account weigh as one resource. It also means that an account that causes all the failures of a 35-account pool shows 35 times the pool's Average Error Rate.
+- A busy pool dilutes the failures of a small account: five failed requests on an account with little traffic cost almost nothing when the pool serves millions of transactions in that hour. The narration gives the account's **own error rate** (its failed ÷ counted requests), which is what an operator should look at to see how the account itself behaves.
 - An account with no counted request in the period is reported as `N/A`.
-- An account with fewer than 10,000 counted requests in the period is flagged **low volume** in the narration: a handful of failed requests can then move the percentage a lot.
+- An account with fewer than 10,000 counted requests in the period is flagged **low volume** in the narration: its own error rate then rests on few requests.
 
 The narration also lists the largest incidents (failing minutes less than six minutes apart): when it started, how many requests failed out of how many, the peak share of a minute, the verdict, and the Resource Health event and summary that explained it.
+
+#### Differences from the official SLA
+
+The SLA defines the Uptime Percentage as 100% − Average Error Rate, with the Error Rate of an hour computed over all the storage accounts of a subscription. The script follows that formula. It differs in these ways:
+
+| Official SLA | This script | Why |
+|---|---|---|
+| Total Storage Transactions are counted across all the accounts of the subscription | They are counted across the accounts of a subscription and region | The report needs a regional split, and one subscription can hold accounts in several regions |
+| A transaction fails when it is not completed within its Maximum Processing Time (for example 2 seconds per MB for blobs) | A transaction fails when the service returns `ServerOtherError` or `ServerTimeoutError` | Azure Monitor gives the number of transactions per response type, but not the processing time of each one. The average server latency cannot tell a slow transaction from the others |
+| Authentication failures and transactions over the quota are Excluded Transactions | They are excluded by response type | These response types show them |
+| Creating or deleting containers, shares, tables and queues, clearing queues and copying between accounts are Excluded Transactions | They are counted | Telling them apart needs a split by `ApiName`, which multiplies the metric calls. They are few compared with the other transactions |
+| Failed transactions do not include throttling caused by not backing off, timeouts set lower than the maximum time, secondary-region reads of RA-GRS and RA-GZRS accounts, or reads that fail because of geo-replication lag | Throttling is excluded by response type and client timeouts (`ClientTimeoutError`) are not failures. The other cases cannot be told apart from the response type | The metric does not say whether the client backed off or which region served the read |
+| Customer-caused failures do not count | Failures inside a customer Resource Health window (for example `Throttled`) are excused. Every other failure counts, Fault or Unresolved | Azure does not say who caused a failed transaction. Resource Health is the only attribution available to a customer |
+| One Uptime Percentage per subscription | One row per account that carries its share of the pool's loss | The rows are needed for diagnosis, in the report and in the Log Analytics tables |
+| The Applicable Period of pay-as-you-go services is the 30 days up to the incident | The period is a calendar month (UTC) | A monthly report is what the script produces |
+| Service levels depend on the redundancy and the access tier, for reads and for writes, with Service Credits | No comparison with a target | Not in scope: the script reports the measured availability only |
 
 #### Worked examples
 
 | Situation | What the evidence shows | Result |
 |---|---|---|
 | Storage backend incident | 1,312 server timeouts in one minute of a busy account; Resource Health raises `Degraded` two minutes later and resolves it after seven | Fault. The minutes before the event are included thanks to `-HealthLeadMinutes` |
-| Background noise | 1 to 10 timeouts among tens of thousands of requests, no health event | Unresolved, but each minute costs a few thousandths of a percent |
-| Busy account, one failed request | The `Availability` metric can read 0% for the minute; the request is one among tens of thousands | Hourly error rate of a few thousandths of a percent at most |
-| Throttling | `ServerBusyError` and client throttling in the thousands | Not part of the score |
-| Idle weekends | No requests for days | Hours count as available (SLA rule) |
-| Account with a handful of requests | Two requests, both failing, in some hours | Real error rate, flagged low volume |
+| Background noise | 1 to 10 timeouts among tens of thousands of requests, no health event | Unresolved, but each minute costs a few thousandths of a percent of the pool's hour |
+| Small account in a busy pool | Five of its ten requests of an hour fail while the pool serves 200,000 transactions in that hour | The Error Rate of the hour is 0.0025%; the account's own error rate (50%) is in the narration |
+| Throttling and authentication errors | `ServerBusyError`, client throttling and `AuthorizationError` in the thousands | Excluded Transactions: not part of the score |
+| Client errors | `ClientOtherError` (for example 404) | Counted as transactions, never failed: they enlarge the denominator |
+| Idle weekends | No transactions for days | Hours count as available (SLA rule) |
+| Account with a handful of requests | Two requests, both failing, in some hours | Own error rate high, flagged low volume; its share of the pool's loss stays small |
 
 #### Limits
 
 - Failures that do not reach the `Server*` response types are not counted, including requests that time out on the client side.
+- A transaction that completes but takes longer than its Maximum Processing Time is not a failure here: the processing time of each transaction is not available.
 - Resource Health events that cause no failed request are not counted.
 - A failing minute is attributed by time only: a platform event and an unrelated failure in the same window are both Faults.
 - `-HealthLeadMinutes` (5) and the two-minute grace after resolution were validated on a limited set of subscriptions.
