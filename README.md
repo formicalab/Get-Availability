@@ -42,6 +42,7 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 | `-HealthLeadMinutes` | `5` | Storage accounts, SQL databases and Web Apps: how many minutes before a platform health event its failures are still attributed to it |
 | `-Batch` | off | Use the Metrics Batch API |
 | `-BatchSize` | `10` | Batch size when `-Batch` is enabled |
+| `-TopImpact` | `10` | How many resources the closing "most impact" section lists (`0` turns it off) |
 | `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and Resource Health history |
 | `-DceEndpoint` | none | Data Collection Endpoint for ingestion |
 | `-DcrImmutableId` | none | Data Collection Rule immutable ID for ingestion |
@@ -72,9 +73,28 @@ The observation window is a UTC calendar month. Past months use the full month; 
 
 ### Output
 
-The console output includes the observation window, any Resource Health coverage warning, a per-resource table, and aggregated summaries. The PowerShell version also emits objects to the pipeline so you can export to CSV or JSON.
+The console output includes the observation window, any Resource Health coverage warning, a per-resource table, aggregated summaries and, at the end, the resources with the most impact. The PowerShell version also emits objects to the pipeline so you can export to CSV or JSON.
 
 Resources with zero eligible minutes are shown as `N/A`.
+
+#### Resources with most impact
+
+The last section ranks, across all subscriptions, the resources that lost the most minutes (eligible minutes minus available minutes). Because every summary is the sum of those minutes, the lost minutes are also the weight of the resource in the aggregate figures. Each resource takes a header line (its availability, the lost minutes and its share of all the lost minutes) and one line per cause, the heaviest first:
+
+```
+ 3. tmonrenvm01azne  (VM, northeurope, POSTE-BANCOPOSTA-SVILUPPO)
+    99,99305% available: lost 3,00 of 43.186 eligible min (3,7% of all lost minutes)
+           3,00 min  platform fault  Resource Health 'Remote disk disconnected' - at 2026-09-20 10:32Z
+```
+
+A cause line gives the minutes it cost, the verdict that counts against availability (`platform fault` or `unresolved`; excused minutes are not shown, they are not a loss), what happened with its evidence, and where it happened (start times, three at most; when a cause has several occurrences each one also shows its length):
+
+- VMs: the Resource Health note of the fault, the metric Context, or "zero availability that nothing explains" for an unresolved zero;
+- SQL databases: the Resource Health event or its absence, with the failed connections summed by error code and the successful connections of the same minutes;
+- storage accounts: storage is scored per hour, not as minutes down (an hour loses failed / counted requests x 60 min), so the header reads "failure rate worth N min" and a `note:` says how many failing minutes that is worth. A cause gives the failing minutes that count and the failed requests, the span and number of incidents (runs of failing minutes) when there are several, the largest incidents with their start, and the Resource Health event or its absence;
+- Web Apps: the down minutes that count, with their incidents and failed requests, and the Resource Health event or its absence.
+
+`note:` lines follow when the figure rests on little data (low volume, many down minutes with fewer than 5 requests, a tier outside the SLA, incomplete minute detail). The size of the list is set with `-TopImpact`.
 
 ## How it works
 
@@ -112,7 +132,7 @@ The Function App settings are auto-wired from the deployed resources, so after i
 
 ### Networking modes
 
-The template now supports two network modes controlled by `usePrivateEndpoints`:
+The template supports two network modes controlled by `usePrivateEndpoints`:
 
 | `usePrivateEndpoints` | Behavior |
 |---|---|
@@ -230,11 +250,11 @@ The signal is `VmAvailabilityMetric` (aggregation `Minimum`, one-minute grain):
 
 The metric has a `Context` dimension that says who caused the state: `Platform` (Azure), `User` (the customer) or `Unknown`. It reports the VM as the host sees it. It does not see a hung guest, an unreachable application or a network-path problem, so a VM that is up but unreachable still reads `1`.
 
-A minute that is not `1` is a **suspect minute**. The algorithm decides, for every suspect minute, whether it is a fault, is excused, or stays unresolved.
+Downtime is binary, as in the Microsoft SLA, where a minute is either down or not. A minute is **suspect** when the metric is `0` or null. The algorithm decides, for every suspect minute, whether it is a fault, is excused, or stays unresolved. A fractional value (above `0` and below `1`) is not downtime: the VM still had connectivity in part of the minute. Those minutes stay eligible and available, and the console reports how many there were.
 
 #### Step 1: collect the evidence
 
-1. **Metric.** Read the unsplit series. It is the base signal: every minute is available, null, zero or fractional.
+1. **Metric.** Read the unsplit series. It is the base signal: every minute is available, null, zero or fractional (fractional minutes are only counted, never classified).
 2. **Context.** Only if the VM has zero minutes, read the metric again split by `Context` and tag each zero minute with the contexts that report zero (`Platform`, `User`, `Unknown`). A zero with no `Context` information is `Unknown`.
 3. **Power-state guard.** If every minute of the period is suspect and the VM is currently `stopped` or `deallocated`, the whole period is excused and the VM is reported as `N/A`.
 4. **Activity Log.** Collect start, deallocate, power-off and restart operations, with all non-failed statuses (`Start`, `Accept`, `Success`). The first event marks when the affected minutes begin, so none of the statuses can be dropped. Events are grouped by operation and correlation ID; each group becomes a lifecycle window from its first event to its last event plus one minute plus `-ActivityGraceMinutes`. Overlapping windows are merged. The period before the VM's creation time is a separate *did not exist* window.
@@ -263,7 +283,7 @@ Rules are applied in order; the first match wins.
 | 6 | A platform-outage note within `-FaultWindowMinutes` before the minute, with no customer action since | **Fault** |
 | 7 | The latest note is Customer, Planned or Spot eviction, or is Unknown and the minute is null | Excused |
 | 8 | Null, and nothing explains it | Excused as a *metric gap* |
-| 9 | Zero or fractional, and nothing explains it | **Unresolved** (counts against availability) |
+| 9 | Zero, and nothing explains it | **Unresolved** (counts against availability) |
 
 Three details matter in practice:
 
@@ -273,12 +293,31 @@ Three details matter in practice:
 
 #### Step 3: compute the result
 
-- **Suspect** = every non-`1` minute = Faults + Excused + Unresolved.
+- **Suspect** = every zero or null minute = Faults + Excused + Unresolved.
 - **Faults** = minutes decided by rules 2 and 6.
 - **Excused** = minutes decided by rules 1, 3, 4, 5, 7 and 8.
 - **Unresolved** = minutes decided by rule 9.
 - **Eligible minutes** = minutes in the period − Excused.
-- **Availability %** = available minutes ÷ eligible minutes, or `N/A` when no minute is eligible. Fractional minutes contribute their value.
+- **Downtime** = Faults + Unresolved.
+- **Availability %** = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when no minute is eligible.
+
+This is the SLA formula, `Uptime Percentage = (Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`, with the eligible minutes as *Maximum Available Minutes*. The script's **Availability %** is that Uptime Percentage.
+
+#### Differences from the official SLA
+
+The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services) defines Virtual Machines downtime as a minute with no connectivity to the VM, and Uptime Percentage as `(Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`. The script follows that formula, but it cannot see what Microsoft sees, so it differs in these ways:
+
+| Official SLA | This script | Why |
+|---|---|---|
+| Downtime is a minute with no connectivity to the VM | Downtime is a minute where `VmAvailabilityMetric` is `0` | Azure gives customers no connectivity measure. The metric is the host's view of the VM: it misses a hung guest or a network-path problem, and it can differ from what the SLA would count |
+| Microsoft decides which minutes are caused by the platform and which are excluded (maintenance, customer actions, throttling) | The script attributes each minute from the metric `Context`, the Activity Log and Resource Health, with a grace window (`-ActivityGraceMinutes`) and a fault window (`-FaultWindowMinutes`) | Microsoft's internal telemetry and its cause attribution are not available to customers, so the script uses heuristics on the public evidence |
+| A minute the platform cannot measure is not discussed | A null minute that nothing explains is excused as a *metric gap* | A missing sample is not evidence of downtime. The console lists these minutes so they stay visible |
+| Only platform-caused downtime counts | A zero minute that nothing explains is **Unresolved** and counts as downtime | The script cannot tell who caused it, so it is conservative and keeps the minute visible in the report. Unresolved minutes are reported separately from Faults |
+| The SLA depends on the deployment: zones, availability sets, dedicated host groups, or a single instance with Premium or Standard disks | Each VM is measured on its own, with no class distinction | Redundancy and disk type are out of scope for now. A VM in an availability set or zone is still scored as a single VM |
+| Uptime Percentage is pooled per subscription | Results are reported per subscription and region, and each VM has its own figure | The report needs a regional split, and one subscription can hold VMs in several regions |
+| Compares the result with the SLA target and defines service credits | No comparison with a target | Not in scope: the script reports the measured availability only |
+| Maximum Available Minutes counts the minutes the VM is deployed and running | Eligible minutes = period minutes − Excused minutes (before creation, customer stops, lifecycle operations, planned events) | The metric and the Activity Log show only the customer-caused and planned stops they can see |
+| A partial minute is not discussed | A fractional metric value is not downtime and the minute stays available | The SLA counts only a minute with no connectivity, so a partly available minute is not downtime. The console reports how many there were |
 
 #### Worked examples
 
@@ -301,7 +340,7 @@ Three details matter in practice:
 
 #### What the signal means
 
-The portal's storage `Availability` metric is the share of billable requests that succeeded, but its `Minimum` aggregation is the *worst single series* of the minute (one `ApiName`, `Authentication` and `GeoType` combination), whatever its volume. A single failed request can therefore turn a whole minute into 0%, and a quiet account looks much worse than a busy one with the same failure count. The algorithm does not use it. It follows the definition of the [Azure Storage SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services): the **error rate of an hour** is failed requests ÷ counted requests, and availability is 100% minus the average error rate over the hours of the period. An hour with no traffic has a 0% error rate, so idle time counts as available.
+The portal's storage `Availability` metric is the share of billable requests that succeeded, but its `Minimum` aggregation is the *worst single series* of the minute (one `ApiName`, `Authentication` and `GeoType` combination), whatever its volume. A single failed request can therefore turn a whole minute into 0%, and a quiet account looks much worse than a busy one with the same failure count. The algorithm does not use it. It follows the definition of the [Azure Storage SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services): the **Error Rate of an hour** is failed requests ÷ counted requests, and availability is the Uptime Percentage: 100% minus the Average Error Rate, the sum of the hourly Error Rates divided by the hours of the Applicable Period (here, the period of the run). An hour with no traffic has a 0% Error Rate, so idle time counts as available.
 
 Requests are read from `Transactions` split by `ResponseType`, and only three response types are requested:
 
@@ -452,7 +491,7 @@ Other signals were evaluated and rejected:
 
 | Signal | Why it is not used |
 |---|---|
-| `MemoryWorkingSet` (the previous signal) | It is `0` whenever the process is not running: stopped apps, Free tier, and Always On disabled after the idle timeout. In a September sample 99.95% of the 511,806 zero minutes had no request at all, so idle apps were reported as down (one subscription: 526,318 unresolved minutes, 11 of 154 apps below 50%) while real failures with the process up were invisible |
+| `MemoryWorkingSet` | It is `0` whenever the process is not running: stopped apps, Free tier, and Always On disabled after the idle timeout. In a September sample 99.95% of the 511,806 zero minutes had no request at all, so idle apps would be reported as down (in one subscription: 526,318 unresolved minutes, 11 of 154 apps below 50%) while real failures with the process up would be invisible |
 | `HealthCheckStatus` | Needs a health-check path configured on the app and has a 5-minute grain; none of the 20 apps sampled had data |
 | Resource Health | In the sampled estate Web Apps had no health events since June and a REST history made of a single baseline row (`Available`, sometimes `Unknown`) |
 
@@ -494,7 +533,7 @@ For an app with down minutes the narration shows how many of its minutes with tr
 
 | Situation | What the evidence shows | Result |
 |---|---|---|
-| Idle Free-tier app, Always On disabled | No requests in the period; `MemoryWorkingSet` reads `0` | `N/A` (the previous signal reported downtime) |
+| Idle Free-tier app, Always On disabled | No requests in the period; `MemoryWorkingSet` reads `0` | `N/A` (`MemoryWorkingSet` would report downtime) |
 | App stopped for a week by the customer | Stop and start operations in the Activity Log; no requests in between | Seven days leave the eligible minutes |
 | Restart during deployment | 3 minutes with every request failing at the time of a `restart` | Excused (recycle window) |
 | Always-failing internal app | 602 of 634 minutes with traffic down, 3,513 requests in the month, 573 of the down minutes with fewer than 5 requests | 98.6%, Unresolved, flagged low volume |
