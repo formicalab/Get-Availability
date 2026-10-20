@@ -402,17 +402,35 @@ function Get-PlainToken([string]$ResourceUrl) {
 #region Report formatting helpers
 <#
 .SYNOPSIS
+    Names the platform evidence behind a window or a note from its title.
+
+.DESCRIPTION
+    A Service Health incident is given a title that starts with "Service Health: " (see
+    Get-ServiceIssueWindowMap); every other title comes from a Resource Health note.
+
+.PARAMETER Title
+    The title of the window or note.
+
+.OUTPUTS
+    System.String, for example "Resource Health 'Unavailable'" or "Service Health incident 'App Service ... West Europe'".
+#>
+function Get-HealthLabel([string]$Title) {
+    $Title.StartsWith('Service Health: ') ? "Service Health incident '$($Title.Substring(16))'" : "Resource Health '$Title'"
+}
+
+<#
+.SYNOPSIS
     Describes the Resource Health event behind an incident.
 
 .PARAMETER Window
-    The Resource Health window that covers the incident, or $null when none does.
+    The Resource Health or Service Health window that covers the incident, or $null when none does.
 
 .OUTPUTS
     System.String, for example "Resource Health 'Degraded': <summary>" or "no Resource Health event".
 #>
 function Get-WindowCause($Window) {
     if (-not $Window) { return 'no Resource Health event' }
-    "Resource Health '$($Window.Title)'$($Window.Summary ? ': ' + $Window.Summary : '')"
+    "$(Get-HealthLabel $Window.Title)$($Window.Summary ? ': ' + $Window.Summary : '')"
 }
 
 <#
@@ -503,7 +521,8 @@ function Get-VmLossCauses([object[]]$Spans) {
         $first = $g.Group[0]
         $what = switch ($first.Outcome) {
             1 { 'the metric Context says Platform' }
-            2 { "Resource Health '$($first.Title)'" }
+            2 { Get-HealthLabel $first.Title }
+            13 { Get-HealthLabel $first.Title }
             default { 'zero availability that nothing explains' }
         }
         $verdict = $first.Outcome -eq 11 ? 'unresolved' : 'platform fault'
@@ -547,7 +566,7 @@ function Get-SqlLossCauses([object[]]$Minutes) {
                 $codes[$code] = [int]$codes[$code] + [int]$n
             }
         }
-        $what = $isFault ? "Resource Health '$($first.Title)'" : 'no Resource Health event'
+        $what = $isFault ? (Get-HealthLabel $first.Title) : 'no Resource Health event'
         if ($withDetail -gt 0) {
             $failed = ($codes.GetEnumerator() | Sort-Object Name | ForEach-Object { "error $($_.Name) x$($_.Value)" }) -join ', '
             $what += "; failed connections: $failed, $ok successful in those minutes"
@@ -1336,14 +1355,14 @@ public sealed class VmLossSpan
 {
     public long   StartTicks;   // first minute of the run (UTC ticks)
     public int    Minutes;      // number of minutes in the run (each one is a minute of downtime)
-    public int    Outcome;      // outcome code: 1 or 2 platform fault, 11 unresolved
-    public string Title;        // the Resource Health note behind a health-note fault, otherwise empty
+    public int    Outcome;      // outcome code: 1, 2 or 13 platform fault, 11 unresolved
+    public string Title;        // the Resource Health note or Service Health incident behind a fault, otherwise empty
 }
 
 /// <summary>Outcome counts of the VM algorithm for one VM.</summary>
 public sealed class VmClassifyResult
 {
-    public int[]  GapCounts = new int[13];   // null + zero minutes, indexed by outcome code
+    public int[]  GapCounts = new int[14];   // null + zero minutes, indexed by outcome code
     public List<VmLossSpan> LossSpans = new List<VmLossSpan>();   // the minutes that count against availability, in time order
 }
 
@@ -1396,6 +1415,7 @@ public static class VmGapClassifier
     //  1 FaultPlatformContext   2 FaultPlatformHealth   3 ExcusedNotExists     4 ExcusedCustomerContext
     //  5 ExcusedActivityLog     6 ExcusedCustomerHealth 7 ExcusedPlanned       8 ExcusedSpotEviction
     //  9 ExcusedHealthUnknown  10 ExcusedMetricGap     11 Unresolved          12 ExcusedInheritedCustomer
+    // 13 FaultServiceHealth
     // Context mask bits: 2 Platform, 4 User, 8 Unknown.
 
     /// <summary>
@@ -1484,11 +1504,13 @@ public static class VmGapClassifier
     /// Classifies every suspect minute (null or zero) of one VM. Rules are applied in
     /// order and the first match wins; see README, "Algorithms". The minutes that count against
     /// availability (platform faults and unresolved zeros) are also returned as spans for the report.
+    /// The Service Health incidents of the VM service in the region of the VM are given as time ranges.
     /// </summary>
     public static VmClassifyResult Classify(
         long[] nullTicks, long[] zeroTicks, int[] zeroMasks,
         long[] actFrom, long[] actTo, long[] nxFrom, long[] nxTo,
-        long[] entryTicks, int[] entryClasses, string[] entryTitles, long faultWindowTicks)
+        long[] entryTicks, int[] entryClasses, string[] entryTitles, long faultWindowTicks,
+        long[] incidentFrom, long[] incidentTo, string[] incidentTitles)
     {
         var act = Expand(actFrom, actTo);
         var nx  = Expand(nxFrom, nxTo);
@@ -1559,6 +1581,13 @@ public static class VmGapClassifier
                 else if (c == VmHealthClassifier.Unknown && it.kind == 0) outcome = 9;
             }
 
+            // A measured zero inside a Service Health incident of the VM service in its region is a platform fault.
+            if (outcome == 0 && it.kind == 1)
+            {
+                for (int k = 0; k < incidentFrom.Length; k++)
+                    if (t >= incidentFrom[k] && t < incidentTo[k]) { outcome = 13; noteTitle = incidentTitles[k]; break; }
+            }
+
             // Nothing explains it: a missing sample is a metric gap, a measured zero is downtime.
             if (outcome == 0) outcome = it.kind == 0 ? 10 : 11;
 
@@ -1566,7 +1595,7 @@ public static class VmGapClassifier
 
             // A minute that counts against availability (platform fault or unresolved) extends the current
             // span when it follows it directly with the same explanation, otherwise it opens a new one.
-            if (outcome == 1 || outcome == 2 || outcome == 11)
+            if (outcome == 1 || outcome == 2 || outcome == 11 || outcome == 13)
             {
                 var last = res.LossSpans.Count > 0 ? res.LossSpans[res.LossSpans.Count - 1] : null;
                 if (last != null && last.Outcome == outcome && last.Title == noteTitle &&
@@ -1956,6 +1985,157 @@ actData | union healthData
 
     Write-Host "Log Analytics: fetched $($rows.Count) events for $($dataByRes.Count) resource(s)"
     $dataByRes
+}
+#endregion
+
+#region Get-ServiceIssues
+<#
+.SYNOPSIS
+    Reads the Azure Service Health incidents that touched the period.
+
+.DESCRIPTION
+    Service Health records a platform incident (event type ServiceIssue) for every subscription that has
+    resources of an impacted service in an impacted region, with the time it started and the time it was
+    mitigated. The incidents come from the servicehealthresources table of Azure Resource Graph, which
+    needs only the Reader role. Each result is one incident for one subscription, service and region.
+    An incident longer than 24 hours is not used: it is a long-running event, and by time alone it would
+    explain every failure of the period. An incident that is still open lasts at most 24 hours from its start.
+
+.PARAMETER SubscriptionIds
+    Subscription IDs to query.
+
+.PARAMETER PeriodStart
+    Start of the observation window.
+
+.PARAMETER PeriodEnd
+    End of the observation window.
+
+.OUTPUTS
+    PSCustomObject[] with Id, SubscriptionId, Service, Region (lower case, without spaces), StartTicks,
+    EndTicks and Title. Empty when Service Health cannot be read (a warning says so).
+#>
+function Get-ServiceIssues {
+    param(
+        [string[]]$SubscriptionIds,
+        [DateTimeOffset]$PeriodStart,
+        [DateTimeOffset]$PeriodEnd
+    )
+    $maxTicks = 24 * [TimeSpan]::TicksPerHour
+    $nowTicks = [DateTimeOffset]::UtcNow.UtcTicks
+    # Resource Graph returns the times as .NET ticks or as ISO text; both become UTC ticks.
+    $toTicks = {
+        param($value)
+        if ($null -eq $value -or "$value" -eq '') { return $null }
+        if ("$value" -match '^\d+$') { return ("$value".Length -ge 15 ? [long]$value : $null) }
+        if ($value -is [datetime]) { return ([DateTimeOffset]$value).UtcTicks }
+        $parsed = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse([string]$value, [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $parsed.UtcTicks }
+        $null
+    }
+    $query = "servicehealthresources | where type =~ 'microsoft.resourcehealth/events' | where tostring(properties.EventType) == 'ServiceIssue' | project subscriptionId, incidentId = name, properties"
+    $issues = [System.Collections.Generic.List[object]]::new()
+    try {
+        $skipToken = $null
+        do {
+            $params = @{ Query = $query; First = 1000; Subscription = $SubscriptionIds }
+            if ($skipToken) { $params.SkipToken = $skipToken }
+            $response = Search-AzGraph @params
+            foreach ($row in $response.Data) {
+                $p = $row.properties
+                # Optional fields may be missing; strict mode would fail on a direct access.
+                $startValue = $p.PSObject.Properties['ImpactStartTime']?.Value
+                $endValue   = $p.PSObject.Properties['ImpactMitigationTime']?.Value
+                $title      = [string]$p.PSObject.Properties['Title']?.Value
+                $impacts    = @($p.PSObject.Properties['Impact']?.Value)
+                $start = & $toTicks $startValue
+                if ($null -eq $start) { continue }
+                $end = & $toTicks $endValue
+                if ($null -eq $end) { $end = [math]::Min($nowTicks, $start + $maxTicks) }
+                # Only incidents that overlap the period and last at most 24 hours are used.
+                if ($end -lt $PeriodStart.UtcTicks -or $start -ge $PeriodEnd.UtcTicks -or $end -le $start -or ($end - $start) -gt $maxTicks) { continue }
+                foreach ($impact in $impacts) {
+                    foreach ($region in @($impact.ImpactedRegions)) {
+                        $issues.Add([PSCustomObject]@{
+                            Id             = [string]$row.incidentId
+                            SubscriptionId = [string]$row.subscriptionId
+                            Service        = [string]$impact.ImpactedService
+                            Region         = ([string]$region.ImpactedRegion -replace '\s', '').ToLowerInvariant()
+                            StartTicks     = $start
+                            EndTicks       = $end
+                            Title          = $title
+                        })
+                    }
+                }
+            }
+            $skipToken = [string]::IsNullOrWhiteSpace($response.SkipToken) ? $null : $response.SkipToken
+        } while ($skipToken)
+    }
+    catch {
+        Write-Warning "Service Health incidents could not be read; only Resource Health evidence is used: $_"
+        return @()
+    }
+    @($issues)
+}
+
+<#
+.SYNOPSIS
+    Turns the Service Health incidents into platform windows for one resource kind, by subscription and region.
+
+.DESCRIPTION
+    An incident applies to a resource when its subscription, its region and its impacted service match those
+    of the resource: Virtual Machines, SQL Database, Storage or App Service. Each incident becomes a window
+    whose title starts with "Service Health: ", so that the report can tell it from a Resource Health note.
+    The incidents used are printed, once each.
+
+.PARAMETER Issues
+    Output of Get-ServiceIssues.
+
+.PARAMETER Resources
+    Resources of the kind, with SubscriptionId and Location.
+
+.PARAMETER Kind
+    VirtualMachine, AzureSqlDatabase, StorageAccount or WebApp.
+
+.OUTPUTS
+    Hashtable keyed by "subscriptionId|region" (region in lower case); each value is a list of HealthWindow.
+#>
+function Get-ServiceIssueWindowMap {
+    param(
+        [object[]]$Issues,
+        [object[]]$Resources,
+        [string]$Kind
+    )
+    # The impacted service names of Service Health that belong to each resource kind.
+    $service = switch ($Kind) {
+        'VirtualMachine'   { '^Virtual Machines$' }
+        'AzureSqlDatabase' { '^SQL Database$' }
+        'StorageAccount'   { '^Storage' }
+        'WebApp'           { '^App Service' }
+    }
+    $map = @{}
+    $printed = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($res in $Resources) {
+        $region = ([string]$res.Location).ToLowerInvariant()
+        $key = "$($res.SubscriptionId)|$region"
+        if ($map.ContainsKey($key)) { continue }
+        $windows = [System.Collections.Generic.List[HealthWindow]]::new()
+        foreach ($issue in $Issues) {
+            if ($issue.SubscriptionId -ne $res.SubscriptionId -or $issue.Region -ne $region -or $issue.Service -notmatch $service) { continue }
+            $window = [HealthWindow]::new()
+            $window.Start = $issue.StartTicks
+            $window.End   = $issue.EndTicks
+            $window.Title = "Service Health: $($issue.Title)"
+            $windows.Add($window)
+            if ($printed.Add("$($issue.Id)|$($issue.Service)|$region")) {
+                Write-Host ("Service Health incident affecting {0} in {1}: {2:u} - {3:HH:mm}Z: {4}" -f
+                    $issue.Service, $region, [DateTime]::new($issue.StartTicks, [DateTimeKind]::Utc),
+                    [DateTime]::new($issue.EndTicks, [DateTimeKind]::Utc), $issue.Title)
+            }
+        }
+        $map[$key] = $windows
+    }
+    $map
 }
 #endregion
 
@@ -2426,6 +2606,10 @@ function Get-AvailabilityMetrics {
 .PARAMETER LogAnalyticsData
     Optional output of Get-LogAnalyticsData.
 
+.PARAMETER ServiceIssues
+    Output of Get-ServiceIssues: the Service Health incidents of the period. A zero minute of a VM or a SQL
+    database inside an incident of its service in its region is a platform fault.
+
 .OUTPUTS
     Hashtable keyed by lowercase resource ID with one classification record per resource.
 #>
@@ -2440,7 +2624,8 @@ function Invoke-SuspectGapInvestigation {
         [int]$HealthLeadMinutes = 5,
         [string]$ArmToken,
         [DateTimeOffset]$HealthCoverageStart,
-        [hashtable]$LogAnalyticsData
+        [hashtable]$LogAnalyticsData,
+        [object[]]$ServiceIssues = @()
     )
     Write-Host "Investigating suspect gaps for $($Candidates.Count) resource(s)..."
 
@@ -2449,6 +2634,11 @@ function Invoke-SuspectGapInvestigation {
     $resultByRes = @{}
 
     $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
+    # The Service Health incidents as platform windows, by resource kind, subscription and region.
+    $serviceWindows = @{
+        VirtualMachine   = Get-ServiceIssueWindowMap -Issues $ServiceIssues -Resources @($Candidates | Where-Object Kind -eq 'VirtualMachine') -Kind VirtualMachine
+        AzureSqlDatabase = Get-ServiceIssueWindowMap -Issues $ServiceIssues -Resources @($Candidates | Where-Object Kind -eq 'AzureSqlDatabase') -Kind AzureSqlDatabase
+    }
 
     # Shared HttpClient for the REST calls within the parallel block: Resource Health (combined with
     # the workspace history), the metric Context split, and the Activity Log when no workspace is used.
@@ -2468,6 +2658,8 @@ function Invoke-SuspectGapInvestigation {
         $hcStart     = $using:HealthCoverageStart
         $laData      = $using:LogAnalyticsData
         $healthSources = $using:healthSources
+        # The Service Health incidents of this resource's service in its subscription and region.
+        $incidentWindows = @(($using:serviceWindows)[$c.Kind]["$($c.SubscriptionId)|$($c.Location.ToLowerInvariant())"] | Where-Object { $_ })
 
         # Pre-fetched Log Analytics data for this resource (if available)
         $resLaData = $null
@@ -2872,6 +3064,10 @@ function Invoke-SuspectGapInvestigation {
             }
         }
 
+        # SQL databases: the Service Health incidents are platform windows too. They come after the Resource Health
+        # windows, so that a window of the resource itself decides first.
+        if ($c.Kind -eq 'AzureSqlDatabase') { $healthWindows = @($healthWindows) + @($incidentWindows) }
+
         # Virtual machines and SQL databases each follow their own algorithm (README, "Algorithms").
         # Both fill $cr (counts per outcome), $outcomeText (one-line summary) and $evidence.
         $outcomeText  = $null
@@ -2921,14 +3117,17 @@ function Invoke-SuspectGapInvestigation {
                 [long[]]@($sortedNotes | ForEach-Object { $_.Ticks }),
                 [int[]]@($sortedNotes  | ForEach-Object { $_.Class }),
                 [string[]]@($sortedNotes | ForEach-Object { $_.Title }),
-                ([long]$faultWinMin * 600000000L))
+                ([long]$faultWinMin * 600000000L),
+                [long[]]@($incidentWindows | ForEach-Object { $_.Start }),
+                [long[]]@($incidentWindows | ForEach-Object { $_.End }),
+                [string[]]@($incidentWindows | ForEach-Object { $_.Title }))
 
             # Map outcomes to the record the final assembly step consumes:
-            #   1,2 platform fault | 3,5 lifecycle | 4,6,7,8,9,12 explained | 10 metric gap | 11 unresolved
+            #   1,2,13 platform fault | 3,5 lifecycle | 4,6,7,8,9,12 explained | 10 metric gap | 11 unresolved
             $gap = $vr.GapCounts
             $lossSpans = @($vr.LossSpans)
             $cr = [PSCustomObject]@{
-                PlatformFaultGapMin          = $gap[1] + $gap[2]
+                PlatformFaultGapMin          = $gap[1] + $gap[2] + $gap[13]
                 ActivityLogExcludedGapMin    = $gap[3] + $gap[5]
                 HealthExplainedGapMin        = $gap[4] + $gap[6] + $gap[7] + $gap[8] + $gap[9] + $gap[12]
                 MetricIssueNullMin           = $gap[10]
@@ -2947,9 +3146,10 @@ function Invoke-SuspectGapInvestigation {
             # One-line breakdown of what decided the suspect minutes, for the console narration.
             $outcomeNames = 'platform fault (metric Context)', 'platform fault (health note)', 'before creation',
                 'customer (metric Context)', 'lifecycle operation', 'customer (health note)', 'planned maintenance',
-                'spot eviction', 'health unknown', 'metric gap', 'unresolved 0%', 'continues customer stop'
+                'spot eviction', 'health unknown', 'metric gap', 'unresolved 0%', 'continues customer stop',
+                'platform fault (Service Health)'
             $outcomeLabel = 'VM algorithm'
-            $outcomeText = (@(foreach ($k in 1..12) {
+            $outcomeText = (@(foreach ($k in 1..13) {
                 $n = $gap[$k]
                 if ($n -gt 0) { "$($outcomeNames[$k - 1]) $n" }
             })) -join '; '
@@ -3116,7 +3316,9 @@ function Invoke-SuspectGapInvestigation {
                 foreach ($b in ($badMinutes | Select-Object -First 5)) {
                     $d = $detail[[long]$b.Ticks]
                     $what = $d ? "$($d.Errors -join ', ') failed connection(s), $($d.Ok) successful" : 'no connection metric data for the minute'
-                    $why  = $b.Verdict -eq 'Fault' ? "Resource Health '$($b.Title)'" : 'no Resource Health event'
+                    # (Get-HealthLabel is not visible in the parallel runspace, so the same wording is built here.)
+                    $why  = $b.Verdict -ne 'Fault' ? 'no Resource Health event' :
+                        ($b.Title.StartsWith('Service Health: ') ? "Service Health incident '$($b.Title.Substring(16))'" : "Resource Health '$($b.Title)'")
                     $evidence.Add("minute $([DateTime]::new([long]$b.Ticks, [DateTimeKind]::Utc).ToString('u')): $what -> $($b.Verdict) ($why)")
                 }
                 if ($badMinutes.Count -gt 5) { $evidence.Add("... and $($badMinutes.Count - 5) more minute(s) counted against availability") }
@@ -3139,7 +3341,7 @@ function Invoke-SuspectGapInvestigation {
             $zeroTicksAll = [long[]]@($c.ZeroTicksArray)
             foreach ($w in $healthWindows) {
                 # A brief event is a platform event inside the period that overlaps neither a resume nor a zero minute.
-                if ($w.Customer -or $w.Planned -or $w.End -lt $pStart.UtcTicks -or $w.Start -ge $pEnd.UtcTicks) { continue }
+                if ($w.Customer -or $w.Planned -or $w.Title.StartsWith('Service Health: ') -or $w.End -lt $pStart.UtcTicks -or $w.Start -ge $pEnd.UtcTicks) { continue }
                 $from = $w.Start - $leadTicks; $to = $w.End + $graceTicks
                 # A resume or failover that overlaps the event explains it; a zero minute inside it means the metric did count it.
                 $overlapsResume = $false
@@ -3318,7 +3520,8 @@ function Invoke-StorageInvestigation {
         [int]$ThrottleLimit,
         [string]$ArmToken,
         [int]$HealthLeadMinutes,
-        [hashtable]$LogAnalyticsData
+        [hashtable]$LogAnalyticsData,
+        [hashtable]$ServiceWindows = @{}
     )
 
     $filter = [uri]::EscapeDataString($StorageResponseFilter)
@@ -3334,6 +3537,7 @@ function Invoke-StorageInvestigation {
         $c      = $_
         $res    = $c.Resource
         $hourly = $c.Hourly
+        $serviceWindows = $using:ServiceWindows
         $client = $using:client
         $pStart = ($using:PeriodStart).UtcDateTime
         $pEnd   = ($using:PeriodEnd).UtcDateTime
@@ -3377,6 +3581,9 @@ function Invoke-StorageInvestigation {
         $fetch = [HealthHistory]::Collect($client, $res.ResourceId, $healthSources.WorkspaceNotes[$key], $healthSources.UseRest)
         if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($res.Name)': $($fetch.Error)" }
         $windows = [HealthHistory]::BuildWindows($fetch.Notes, 30 * $tpm, $graceTicks)
+        # The Service Health incidents of Storage in the region of the account are platform windows too; they come last,
+        # so a Resource Health window that covers the minute decides first.
+        foreach ($w in @($serviceWindows["$($res.SubscriptionId)|$($res.Location.ToLowerInvariant())"])) { if ($w) { $windows.Add($w) } }
         # Each minute that had server failures is a Fault (platform window), Excused (customer window)
         # or Unresolved. Consecutive failing minutes (gap of at most 5) form one incident for the evidence.
         $count = @{ Fault = 0; Excused = 0; Unresolved = 0 }
@@ -3480,6 +3687,9 @@ function Invoke-StorageInvestigation {
 .PARAMETER SubscriptionIds
     Subscription IDs queried in the workspace.
 
+.PARAMETER ServiceIssues
+    Output of Get-ServiceIssues: the Service Health incidents of the period.
+
 .OUTPUTS
     Hashtable keyed by lowercase resource ID with one result per account.
 #>
@@ -3493,7 +3703,8 @@ function Invoke-StorageAvailability {
         [string]$ArmToken,
         [int]$HealthLeadMinutes,
         [string]$SourceWorkspaceId,
-        [string[]]$SubscriptionIds
+        [string[]]$SubscriptionIds,
+        [object[]]$ServiceIssues = @()
     )
     Write-Host "Querying hourly request counts for $($Resources.Count) storage account(s) with parallelism $ThrottleLimit..."
     $hourlyByRes = Get-StorageHourlyCounts -Resources $Resources -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
@@ -3528,7 +3739,8 @@ function Invoke-StorageAvailability {
                 -ArmToken $logAnalyticsToken
         }
         $investigation = Invoke-StorageInvestigation -Candidates @($candidates) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
-            -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken -HealthLeadMinutes $HealthLeadMinutes -LogAnalyticsData $logAnalyticsData
+            -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken -HealthLeadMinutes $HealthLeadMinutes -LogAnalyticsData $logAnalyticsData `
+            -ServiceWindows (Get-ServiceIssueWindowMap -Issues $ServiceIssues -Resources @($candidates.Resource) -Kind StorageAccount)
     }
 
     # One result per account. The Error Rate of an hour is the failed over the counted transactions of all the
@@ -3665,7 +3877,7 @@ function Set-StorageEligibility {
 
     if ($Record.SuspectMinutes -gt 0) {
         Write-Host ("  [$name] storage: {0:N0} failed request(s) of {1:N0} (own error rate {2:P4}) in {3} failing min = {4} confirmed by Resource Health + {5} customer-excused + {6} unresolved; worth {7:N2} min of the availability of its group" -f
-            $Result.FailedRequests, $Result.CountedRequests, ($Result.FailedRequests / [math]::Max(1, $Result.CountedRequests)),
+            $Result.FailedRequests, $Result.CountedRequests, ($Result.FailedRequests / [math]::Max(1.0, [double]$Result.CountedRequests)),
             $Record.SuspectMinutes, $Result.Fault, $Result.Excused, $Result.Unresolved, $Result.LostMinutes)
         # The three heaviest incidents are listed; the rest is counted.
         foreach ($i in ($Result.Incidents | Select-Object -First 3)) {
@@ -3681,7 +3893,7 @@ function Set-StorageEligibility {
         # differ from the number of failing minutes.
         $Record.Causes = @(foreach ($g in (@($Result.LossHours) | Group-Object { $_.Fault -gt $_.Unresolved ? 'platform fault' : 'unresolved' })) {
             $isFault = $g.Name -eq 'platform fault'
-            $because = $isFault ? "Resource Health '$(($g.Group | Where-Object Title | Select-Object -First 1).Title)'" : 'no Resource Health event'
+            $because = $isFault ? (Get-HealthLabel (($g.Group | Where-Object Title | Select-Object -First 1).Title)) : 'no Resource Health event'
             $lost = ($g.Group | Measure-Object Lost -Sum).Sum
             # The incidents (runs of failing minutes) behind this verdict, the largest first.
             $counted = @($Result.Incidents | Where-Object { $_.Class -eq ($isFault ? 'Fault' : 'Unresolved') })
@@ -3709,11 +3921,11 @@ function Set-StorageEligibility {
             $notes.Add(('as in the SLA, this account is counted together with the {0} other storage accounts of {1}: as a group they are {2:N5}% available' -f
                 ($Result.PoolAccounts - 1), $where, $Result.PoolUptime))
             $notes.Add(('on its own this account failed {0:P4} of its {1:N0} requests; measured against the traffic of all these accounts the failures are worth {2:N2} min' -f
-                ($Result.FailedRequests / [math]::Max(1, $Result.CountedRequests)), $Result.CountedRequests, $Result.LostMinutes))
+                ($Result.FailedRequests / [math]::Max(1.0, [double]$Result.CountedRequests)), $Result.CountedRequests, $Result.LostMinutes))
         }
         else {
             $notes.Add(('this is the only storage account of {0}, so it is scored on its own: {1:P4} of its {2:N0} requests failed' -f
-                $where, ($Result.FailedRequests / [math]::Max(1, $Result.CountedRequests)), $Result.CountedRequests))
+                $where, ($Result.FailedRequests / [math]::Max(1.0, [double]$Result.CountedRequests)), $Result.CountedRequests))
         }
         if ($Result.LowVolume) { $notes.Add(('low volume: only {0:N0} counted request(s) in the period, the percentage rests on very few requests' -f $Result.CountedRequests)) }
         if (-not $Result.DetailComplete) { $notes.Add('minute detail incomplete: some failing minutes are not classified') }
@@ -3862,7 +4074,8 @@ function Invoke-WebInvestigation {
         [string]$ArmToken,
         [int]$HealthLeadMinutes,
         [int]$GraceMinutes,
-        [hashtable]$LogAnalyticsData
+        [hashtable]$LogAnalyticsData,
+        [hashtable]$ServiceWindows = @{}
     )
 
     $healthSources = Get-HealthSources -LogAnalyticsData $LogAnalyticsData -PeriodEnd $PeriodEnd
@@ -3883,6 +4096,7 @@ function Invoke-WebInvestigation {
         $tpm    = [TimeSpan]::TicksPerMinute
         $key    = $res.ResourceId.ToLowerInvariant()
         $laData = $using:LogAnalyticsData
+        $serviceWindows = $using:ServiceWindows
         $healthSources = $using:healthSources
 
         # Lifecycle operations come from the workspace, or from the REST API when there is none.
@@ -3940,6 +4154,9 @@ function Invoke-WebInvestigation {
             $fetch = [HealthHistory]::Collect($client, $res.ResourceId, $healthSources.WorkspaceNotes[$key], $healthSources.UseRest)
             if ($fetch.Error) { Write-Warning "Resource Health query failed for '$($res.Name)': $($fetch.Error)" }
             $windows = [HealthHistory]::BuildWindows($fetch.Notes, 30 * $tpm, 2 * $tpm)
+            # The Service Health incidents of App Service in the region of the app are platform windows too; they come last,
+            # so a Resource Health window that covers the minute decides first.
+            foreach ($w in @($serviceWindows["$($res.SubscriptionId)|$($res.Location.ToLowerInvariant())"])) { if ($w) { $windows.Add($w) } }
         }
         $result = [WebClassifier]::Classify($requestsMin, $errorsMin, $c.FirstMinute, $pStart.Ticks, $stopped, $recycle,
                                             $windows, $using:HealthLeadMinutes * $tpm, 2 * $tpm)
@@ -4014,7 +4231,8 @@ function Invoke-WebAvailability {
         [int]$HealthLeadMinutes,
         [int]$GraceMinutes,
         [string]$SourceWorkspaceId,
-        [string[]]$SubscriptionIds
+        [string[]]$SubscriptionIds,
+        [object[]]$ServiceIssues = @()
     )
     Write-Host "Querying hourly request counts for $($Resources.Count) web app(s) with parallelism $ThrottleLimit..."
     $hourlyByRes = Get-WebHourlyCounts -Resources $Resources -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
@@ -4054,7 +4272,8 @@ function Invoke-WebAvailability {
         }
         $investigation = Invoke-WebInvestigation -Candidates @($candidates) -PeriodStart $PeriodStart -PeriodEnd $PeriodEnd `
             -ThrottleLimit $ThrottleLimit -ArmToken $ArmToken -HealthLeadMinutes $HealthLeadMinutes -GraceMinutes $GraceMinutes `
-            -LogAnalyticsData $logAnalyticsData
+            -LogAnalyticsData $logAnalyticsData `
+            -ServiceWindows (Get-ServiceIssueWindowMap -Issues $ServiceIssues -Resources @($candidates.Resource) -Kind WebApp)
     }
 
     # One result per app.
@@ -4653,6 +4872,14 @@ foreach ($res in $resources) {
 
 #endregion
 
+#region Step 4b: Read the Service Health incidents
+# Azure Service Health records the platform incidents that touched a service in a region. They are read once and give
+# the algorithms a platform window for the resources of that service in that region (README, "Resource Health windows").
+$serviceIssues = @(Get-ServiceIssues -SubscriptionIds $subIds -PeriodStart $utcStart -PeriodEnd $utcEnd)
+Write-Host "Service Health: $(@($serviceIssues.Id | Select-Object -Unique).Count) incident(s) of up to 24 hours in the period"
+
+#endregion
+
 #region Step 5: Fetch Azure Monitor metrics
 # Storage accounts and Web Apps use their own algorithms (Steps 5b and 5c) and are not part of the PT1M metric fetch.
 $metricResources = @($resources | Where-Object { $_.Kind -notin 'StorageAccount', 'WebApp' })
@@ -4680,7 +4907,8 @@ $storageResources = @($resources | Where-Object { $_.Kind -eq 'StorageAccount' }
 if ($storageResources.Count -gt 0) {
     $storageResults = Invoke-StorageAvailability -Resources $storageResources -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -TotalMinutes $totalMinutes -ThrottleLimit $Parallelism -ArmToken $armToken `
-        -HealthLeadMinutes $HealthLeadMinutes -SourceWorkspaceId $SourceWorkspaceId -SubscriptionIds $subIds
+        -HealthLeadMinutes $HealthLeadMinutes -SourceWorkspaceId $SourceWorkspaceId -SubscriptionIds $subIds `
+        -ServiceIssues $serviceIssues
     foreach ($res in $storageResources) {
         $key = $res.ResourceId.ToLowerInvariant()
         Set-StorageEligibility -Record $eligByRes[$key] -Result $storageResults[$key]
@@ -4697,7 +4925,8 @@ if ($webResources.Count -gt 0) {
     $webResults = Invoke-WebAvailability -Resources $webResources -PeriodStart $utcStart -PeriodEnd $utcEnd `
         -TotalMinutes $totalMinutes -ThrottleLimit $Parallelism -ArmToken $armToken `
         -HealthLeadMinutes $HealthLeadMinutes -GraceMinutes $ActivityGraceMinutes `
-        -SourceWorkspaceId $SourceWorkspaceId -SubscriptionIds $subIds
+        -SourceWorkspaceId $SourceWorkspaceId -SubscriptionIds $subIds `
+        -ServiceIssues $serviceIssues
     foreach ($res in $webResources) {
         $key = $res.ResourceId.ToLowerInvariant()
         Set-WebEligibility -Record $eligByRes[$key] -Result $webResults[$key]
@@ -4762,6 +4991,7 @@ foreach ($res in $resources) {
                 SubscriptionId = $res.SubscriptionId
                 CreationTime   = $res.CreationTime
                 SkuName        = $res.SkuName
+                Location       = $res.Location
                 AllGapTicks    = @($allTicks)
                 NullTicksArray = @($mr.GapTicks)
                 ZeroTicksArray = @($mr.ZeroAvailTicks)
@@ -4800,7 +5030,7 @@ if ($SourceWorkspaceId -and ($suspectCandidates.Count -gt 0 -or $sqlResources.Co
         if ($platformEvent.Count -eq 0) { continue }
         $suspectCandidates.Add([PSCustomObject]@{
             Name = $res.Name; Kind = $res.Kind; ResourceId = $res.ResourceId; SubscriptionId = $res.SubscriptionId
-            CreationTime = $res.CreationTime; SkuName = $res.SkuName; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @()
+            CreationTime = $res.CreationTime; SkuName = $res.SkuName; Location = $res.Location; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @()
         })
     }
 }
@@ -4812,7 +5042,7 @@ foreach ($res in $sqlResources) {
     if ($res.SkuName -notmatch '_S_' -or $investigated.Contains($res.ResourceId.ToLowerInvariant())) { continue }
     $suspectCandidates.Add([PSCustomObject]@{
         Name = $res.Name; Kind = $res.Kind; ResourceId = $res.ResourceId; SubscriptionId = $res.SubscriptionId
-        CreationTime = $res.CreationTime; SkuName = $res.SkuName; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @()
+        CreationTime = $res.CreationTime; SkuName = $res.SkuName; Location = $res.Location; AllGapTicks = @(); NullTicksArray = @(); ZeroTicksArray = @()
     })
 }
 
@@ -4823,7 +5053,8 @@ if ($suspectCandidates.Count -gt 0) {
         -PeriodStart $utcStart -PeriodEnd $utcEnd -ThrottleLimit $Parallelism `
         -GraceMinutes $ActivityGraceMinutes -FaultWindowMinutes $FaultWindowMinutes -HealthLeadMinutes $HealthLeadMinutes -ArmToken $armToken `
         -HealthCoverageStart $healthCoverageStart `
-        -LogAnalyticsData $logAnalyticsData
+        -LogAnalyticsData $logAnalyticsData `
+        -ServiceIssues $serviceIssues
 }
 
 #endregion

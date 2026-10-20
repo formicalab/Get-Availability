@@ -101,7 +101,7 @@ A cause line gives the minutes it cost, the verdict that counts against availabi
 
 1. The resource inventory comes from Azure Resource Graph.
 2. Each resource kind is measured from its own Azure Monitor signal and turned into *suspect minutes* (minutes that may count against availability).
-3. Every suspect minute is attributed with the Activity Log and Resource Health (VMs and SQL databases also use the metric itself), and ends as a fault, an excused minute or an unresolved minute.
+3. Every suspect minute is attributed with the Activity Log, Resource Health and Service Health (VMs and SQL databases also use the metric itself), and ends as a fault, an excused minute or an unresolved minute.
 4. The Uptime Percentage is computed as in the SLA: `(Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`, with the eligible minutes as Maximum Available Minutes. The summaries add up the minutes of the resources of a subscription, a resource kind and a region, so that they are the Uptime Percentage of that group; the SLA pools the resources of a subscription, and the region is added because one subscription can hold resources in several regions.
 
 Steps 2 and 3 are different for each resource kind, and each algorithm is described only in [Algorithms](#algorithms): [virtual machines](#virtual-machines), [Azure SQL databases](#azure-sql-databases), [storage accounts](#storage-accounts) and [Web Apps](#web-apps). With `-SourceWorkspaceId` the Activity Log and the Resource Health events are read in bulk from Log Analytics (see [Resource Health history](#resource-health-history)).
@@ -261,6 +261,15 @@ The SQL database, storage account and Web App algorithms turn the combined histo
 
 Resource Health raises its event a few minutes after the first failures, so a platform window is widened: it starts `-HealthLeadMinutes` before the opening note and ends two minutes after the resolution.
 
+### Service Health incidents
+
+Azure Service Health records the platform incidents (events of type `ServiceIssue`) that touched a service in a region, with the time they started and the time they were mitigated. The script reads them once, from the `servicehealthresources` table of Azure Resource Graph, which needs only the Reader role. An incident applies to a resource when its subscription, its region and its impacted service match: *Virtual Machines*, *SQL Database*, *Storage* or *App Service*. Every applicable incident becomes a platform window of the resource, from its start to its mitigation. The console prints each incident it applies.
+
+- A Service Health window is used after the Resource Health windows of the resource: a Resource Health window that covers the minute decides first.
+- Only incidents of up to 24 hours are used. A longer one is a long-running event that, judged by time alone, would explain every failure of the period.
+- Service Health records an incident only for the subscriptions that have resources of the impacted service in the impacted region.
+- Like every window, an incident explains a minute by time alone: an unrelated failure of a resource in the same region and service during the incident is also taken as a platform fault.
+
 ### Virtual machines
 
 #### What the signal means
@@ -294,6 +303,8 @@ Downtime is binary, as in the Microsoft SLA, where a minute is either down or no
 
 A note classified as *evidence only* is kept for context but never starts or changes a state. In particular, the `Down: ... unavailable for 15 minutes` note is raised after the VM went down, so it cannot supersede the action that took it down, and Accelerated Networking and live-migration-succeeded notes are not outages even though Azure labels them `Unplanned`.
 
+6. **Service Health.** Read the [Service Health incidents](#service-health-incidents) of Virtual Machines in the region of the VM, with the time each one started and the time it was mitigated.
+
 #### Step 2: decide each suspect minute
 
 Rules are applied in order; the first match wins.
@@ -308,20 +319,22 @@ Rules are applied in order; the first match wins.
 | 6 | A platform-outage note within `-FaultWindowMinutes` before the minute, with no customer action since | **Fault** |
 | 7 | The latest note is Customer, Planned or Spot eviction, or is Unknown and the minute is null | Excused |
 | 8 | Null, and nothing explains it | Excused as a *metric gap* |
-| 9 | Zero, and nothing explains it | **Unresolved** (counts against availability) |
+| 9 | Zero, inside a [Service Health incident](#service-health-incidents) of Virtual Machines in the region of the VM | **Fault** |
+| 10 | Zero, and nothing explains it | **Unresolved** (counts as Downtime) |
 
 Three details matter in practice:
 
 - A `Recovery` or `Unknown` note logged seconds after a platform-outage note does not hide it (rule 6). Only a later customer action does.
 - A measured zero is attributed before lifecycle windows are consulted (rules 2 and 3), so a platform failure that happens during a customer restart is still a fault.
 - Rule 8 is deliberately generous: a missing sample is not evidence of downtime. The console narration lists metric gaps separately so they stay visible.
+- Rule 9 comes after every other explanation: an incident of the service in the region explains a zero minute only when nothing else, such as a customer action, does. Both Faults and Unresolved count as Downtime, so the rule changes the verdict that the report shows and not the Uptime Percentage.
 
 #### Step 3: compute the result
 
 - **Suspect** = every zero or null minute = Faults + Excused + Unresolved.
-- **Faults** = minutes decided by rules 2 and 6.
+- **Faults** = minutes decided by rules 2, 6 and 9.
 - **Excused** = minutes decided by rules 1, 3, 4, 5, 7 and 8.
-- **Unresolved** = minutes decided by rule 9.
+- **Unresolved** = minutes decided by rule 10.
 - **Eligible minutes** (Maximum Available Minutes) = minutes in the period − Excused.
 - **Downtime** = Faults + Unresolved.
 - **Uptime Percentage** = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when no minute is eligible.
@@ -333,7 +346,7 @@ The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-
 | Official SLA | This script | Why |
 |---|---|---|
 | Downtime is a minute with no connectivity to the VM | Downtime is a minute where `VmAvailabilityMetric` is `0` | Azure gives customers no connectivity measure. The metric is the host's view of the VM: it misses a hung guest or a network-path problem, and it can differ from what the SLA would count |
-| Microsoft decides which minutes are caused by the platform and which are excluded (maintenance, customer actions, throttling) | The script attributes each minute from the metric `Context`, the Activity Log and Resource Health, with a grace window (`-ActivityGraceMinutes`) and a fault window (`-FaultWindowMinutes`) | Microsoft's internal telemetry and its cause attribution are not available to customers, so the script uses heuristics on the public evidence |
+| Microsoft decides which minutes are caused by the platform and which are excluded (maintenance, customer actions, throttling) | The script attributes each minute from the metric `Context`, the Activity Log, Resource Health and Service Health incidents, with a grace window (`-ActivityGraceMinutes`) and a fault window (`-FaultWindowMinutes`) | Microsoft's internal telemetry and its cause attribution are not available to customers, so the script uses heuristics on the public evidence |
 | A minute the platform cannot measure is not discussed | A null minute that nothing explains is excused as a *metric gap* | A missing sample is not evidence of downtime. The console lists these minutes so they stay visible |
 | Only platform-caused downtime counts | A zero minute that nothing explains is **Unresolved** and counts as downtime | The script cannot tell who caused it, so it is conservative and keeps the minute visible in the report. Unresolved minutes are reported separately from Faults |
 | The SLA depends on the deployment: zones, availability sets, dedicated host groups, or a single instance with Premium or Standard disks | Each VM is measured on its own, with no class distinction | Redundancy and disk type are out of scope for now. A VM in an availability set or zone is still scored as a single VM |
@@ -390,7 +403,7 @@ For the accounts that had at least one failed request, read the per-minute count
 | # | Rule | Verdict |
 |---|---|---|
 | 1 | The account did not exist yet | Not a Deployment Minute (hours before creation are left out) |
-| 2 | Inside a platform window | **Fault** |
+| 2 | Inside a platform window (a Resource Health event or a [Service Health incident](#service-health-incidents) of Storage in the region of the account) | **Fault** |
 | 3 | Inside a customer or planned window | Excused (customer-caused, or Scheduled Downtime) |
 | 4 | Anything else | **Unresolved** |
 
@@ -480,7 +493,7 @@ In a September sample of 181 databases, every one of the 375 zero minutes had er
 3. **Failover windows.** Collect the `failover` operations of the Activity Log (`.../failover/action`), which the customer starts. They are grouped into windows like the resume operations.
 4. **Creation time.** Minutes before the creation time of the database are not Deployment Minutes.
 5. **Billed compute (serverless databases only, SKU name containing `_S_`).** Read `app_cpu_billed` (aggregation `Total`, one-minute grain). A run of at least 5 consecutive minutes without a value is a pause. Shorter holes are gaps in the telemetry, not pauses. The latest 15 minutes of a period that ends now have no data yet and are not judged. The zero minutes that count against availability (Faults and Unresolved) are never treated as paused, so a failure cannot hide as a pause.
-6. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history) and turn it into customer, planned and platform windows as described in [Resource Health windows](#resource-health-windows).
+6. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history) and turn it into customer, planned and platform windows as described in [Resource Health windows](#resource-health-windows). The [Service Health incidents](#service-health-incidents) of SQL Database in the region of the database are platform windows too.
 
 #### Step 2: decide each suspect minute
 
@@ -493,7 +506,7 @@ Rules are applied in order; the first match wins.
 | 3 | Zero, inside a failover window | Excused (the customer's own operation) |
 | 4 | Zero, inside a customer Resource Health window | Excused |
 | 5 | Zero, inside a planned-maintenance Resource Health window | Excused (the SLA's Scheduled Downtime) |
-| 6 | Zero, inside a platform Resource Health window | **Fault** |
+| 6 | Zero, inside a platform Resource Health window or a [Service Health incident](#service-health-incidents) of SQL Database in the region of the database | **Fault** |
 | 7 | Null, and nothing explains it | Excused as a *metric gap* |
 | 8 | Zero, and nothing explains it | **Unresolved** (counts against availability) |
 
@@ -585,7 +598,7 @@ The down minutes this algorithm finds are therefore mostly **application** error
 2. **Minute detail.** For an app with any 5xx, read the same metrics at one-minute grain, in spans of 5 days (halved when Azure Monitor refuses a response as too large).
 3. **Stopped periods and recycle windows.** Collect the customer's operations of the Activity Log: `stop`, `start`, `restart`, the change of the app's configuration (`config/write`, which restarts it) and the slot swap. Events of one kind at most 5 minutes apart belong to one operation (a window never exceeds 15 minutes), because the Activity Log records each operation several times. A *recycle window* covers an operation plus `-ActivityGraceMinutes`. A *stopped period* runs from a stop to the next start or restart, or to the end of the period; a configuration change or a swap does not end it. With `-SourceWorkspaceId` the Activity Log is read from the workspace for all apps; without it, only for the apps that had 5xx.
 4. **Creation time.** Minutes before the app was created are not Deployment Minutes.
-5. **Resource Health.** For an app with 5xx, read the combined history described in [Resource Health history](#resource-health-history) and turn it into customer, planned and platform windows as described in [Resource Health windows](#resource-health-windows).
+5. **Resource Health.** For an app with 5xx, read the combined history described in [Resource Health history](#resource-health-history) and turn it into customer, planned and platform windows as described in [Resource Health windows](#resource-health-windows). The [Service Health incidents](#service-health-incidents) of App Service in the region of the app are platform windows too.
 
 #### Step 2: decide each down minute
 
@@ -597,7 +610,7 @@ Rules are applied in order; the first match wins.
 | 2 | Inside a recycle window of a stop, start, restart, configuration change or slot swap | Excused |
 | 3 | Inside a customer Resource Health window | Excused |
 | 4 | Inside a planned-maintenance Resource Health window | Excused (the SLA's Scheduled Downtime) |
-| 5 | Inside a platform Resource Health window | **Fault** (counts against availability) |
+| 5 | Inside a platform Resource Health window or a [Service Health incident](#service-health-incidents) of App Service in the region of the app | **Fault** (counts against availability) |
 | 6 | Nothing explains it | **Unresolved**: an application error, reported and not counted |
 
 #### Step 3: compute the result
@@ -613,7 +626,7 @@ Rules are applied in order; the first match wins.
 
 | Official SLA | This script | Why |
 |---|---|---|
-| Downtime is a minute with no connectivity between the app and the Internet gateway | Downtime is a down minute (every request failed with a 5xx) that a platform Resource Health event explains | Connectivity to the gateway cannot be observed by a customer. A 5xx proves that the request reached the app, and the metric cannot tell an application error from a platform one. Resource Health is the only platform attribution available |
+| Downtime is a minute with no connectivity between the app and the Internet gateway | Downtime is a down minute (every request failed with a 5xx) that a platform Resource Health event or a Service Health incident of App Service in the region explains | Connectivity to the gateway cannot be observed by a customer. A 5xx proves that the request reached the app, and the metric cannot tell an application error from a platform one. Resource Health and Service Health are the only platform attributions available |
 | An outage that stops requests from reaching the app is Downtime | It is not seen: the minutes have no request and are not judged | A silent minute is Downtime only for an app that normally receives a request every minute. The sampled apps did not |
 | Microsoft decides which downtime is excluded (the customer's operations, maintenance, throttling, faulty input) | The script excuses stop, start, restart, configuration changes and slot swaps from the Activity Log, and the customer and planned-maintenance Resource Health windows | Microsoft's internal attribution is not available to customers. A swap started from a slot may be logged on the slot rather than on the app, and is then not seen. Scheduled Downtime needs a notice of 5 days, which a customer cannot see: a Resource Health note of planned maintenance is taken as the notice |
 | Deployment Minutes: from creation or the customer starting the app to the customer stopping or deleting it | Minutes since creation minus the stopped minutes found in the Activity Log | A stop before the observation period is not seen: those minutes stay eligible (the app has no traffic, so the percentage is unchanged) |
@@ -636,6 +649,7 @@ For an app with down minutes the narration shows how many of its minutes with tr
 | App settings changed | Every request fails for 2 minutes right after a `config/write` | Excused (recycle window) |
 | Monthly platform maintenance | Every request fails for a minute; the Resource Health note says planned maintenance | Excused (Scheduled Downtime) |
 | Platform event | Every request fails for 5 minutes while Resource Health reports the app `Unavailable` | 5 Faults: counted |
+| Platform incident | Every request fails for 20 minutes during a Service Health incident of App Service in the region of the app | 20 Faults: counted |
 | Always-failing internal app | 602 of 634 minutes with traffic down, 3,513 requests in the month, 573 of the down minutes with fewer than 5 requests | 100%: 602 application errors, reported and flagged low volume |
 | Chronic partial errors | 14.8% of the requests fail, never all the requests of a minute | No down minute; reported as partial |
 | Busy app, 5xx burst | 5,739 down minutes of 38,554 with traffic, no stop, no health event | 100%: 5,739 application errors, the number to investigate |
