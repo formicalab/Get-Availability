@@ -36,14 +36,15 @@ The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 | `-Subscriptions` | required | Azure subscription display names to inspect |
 | `-Month` | required | Observation month in UTC, format `YYYYMM` |
 | `-Kinds` | `vm,sql,storage,webapp` | Resource kinds to include |
-| `-Resource` | all | Limit the run to one resource |
-| `-Parallelism` | auto | Max concurrent API calls |
+| `-Resource` | all | Limit the run to one resource. A storage account is still scored over its whole pool (see [Storage accounts](#storage-accounts)): the other accounts of the pool are read but not reported |
+| `-Parallelism` | twice the CPU cores, 4 to 32 | Max concurrent API calls (1 to 64) |
 | `-ActivityGraceMinutes` | `10` | Grace window after lifecycle events |
 | `-FaultWindowMinutes` | `30` | VMs only: how long a platform health note can explain suspect minutes the metric does not attribute itself |
 | `-HealthLeadMinutes` | `5` | Storage accounts, SQL databases and Web Apps: how many minutes before a platform health event its failures are still attributed to it |
 | `-Batch` | off | Use the Metrics Batch API |
 | `-BatchSize` | `10` | Batch size when `-Batch` is enabled |
 | `-TopImpact` | `10` | How many resources the closing "most impact" section lists (`0` turns it off) |
+| `-PassThru` | off | Emit the per-resource result records to the pipeline after the report, for export to CSV or JSON |
 | `-SourceWorkspaceId` | none | Source Log Analytics workspace for bulk Activity Log and Resource Health history |
 | `-DceEndpoint` | none | Data Collection Endpoint for ingestion |
 | `-DcrImmutableId` | none | Data Collection Rule immutable ID for ingestion |
@@ -74,9 +75,17 @@ The observation window is a UTC calendar month. Past months use the full month; 
 
 ### Output
 
-The console output includes the observation window, any Resource Health coverage warning, a per-resource table, aggregated summaries and, at the end, the resources with the most impact. The PowerShell version also emits objects to the pipeline so you can export to CSV or JSON.
+The console output includes the observation window, any Resource Health coverage warning, a per-resource table, a line that reconciles the resources measured with those scored, aggregated summaries, at the end the resources with the most impact, and the statistics and problems of the run. With `-PassThru` the per-resource records are also emitted to the pipeline.
 
-Resources with zero eligible minutes are shown as `N/A`.
+Resources with zero eligible minutes are shown as `N/A`. The reconciliation line says how many resources were measured and scored and why the others have no figure (for example "53 VM: deallocated or stopped for the entire period"). A resource created after the end of the period is not measured at all; the run says how many it left out.
+
+Numbers follow one convention: counts and minutes have no thousands separator (so that `1.202` is never read as 1,2) and decimals follow the culture of the console. The `AvailabilityPct` stored in the records and ingested into Log Analytics always uses a decimal point. A phase of 20 or more items prints a line at every tenth of it, with the time elapsed, so that a long run can be followed in a log.
+
+#### Statistics and problems of the run
+
+Every call to Azure goes through one helper. It sends the latest access token, which it renews shortly before the token expires and after an HTTP 401, so a run longer than the life of its first token goes on. It retries throttling (429), server errors (5xx) and connection failures up to five times, waiting as long as the `Retry-After` header asks (or 2, 4, 8 and 16 seconds) plus a random part so that the parallel workers do not retry together.
+
+At the end the run prints the number of calls, how many were retried, and the problems met, grouped by cause: a failed read is not printed where it happens (a large subscription would give hundreds of lines) but listed once, with the resources it concerns. A read that failed because the resource was deleted during the run (HTTP 404) has nothing to measure. Any other failed read means that the figures of the resources concerned may be incomplete: the script then ends with exit code 3, and the timer function fails its invocation, instead of presenting the figures as complete.
 
 #### Resources with most impact
 
@@ -246,10 +255,12 @@ The SLA also defines Service Levels and Service Credits for each kind. The scrip
 
 Resource Health history is read in exactly the same way for every resource kind. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
 
-- The REST history can omit short events that the Activity Log still holds. The same account has returned a 22-entry history with its recent `Degraded` events and, hours later, a 9-entry history without them.
+- The REST history can omit short events that the Activity Log still holds.
 - The workspace lags behind real time and reaches back only as far as its retention.
 
 The REST history is skipped only when a workspace is set and the whole period predates the REST retention. The two sources describe the same events, so duplicates are expected, and each algorithm is built to tolerate them. Without `-SourceWorkspaceId` only the REST history is available: short events can be missing, and periods older than about 30 days have no health evidence.
+
+The workspace is queried for 150 resources at a time, a few queries at once. The Resource Health events are read from 30 days before the period to two days after it, which gives the state the period starts in and the event that closes a window. A query that Log Analytics reports as partial stops the run: evidence would be missing. The Activity Log of a Web App logs a configuration change on a sub-resource of the app (`.../sites/app/config/appsettings`); the query attributes it to the app, as the Activity Log REST API does.
 
 ### Resource Health windows
 
@@ -290,7 +301,7 @@ Downtime is binary, as in the Microsoft SLA, where a minute is either down or no
 
 1. **Metric.** Read the unsplit series. It is the base signal: every minute is available, null, zero or fractional (fractional minutes are only counted, never classified).
 2. **Context.** Only if the VM has zero minutes, read the metric again split by `Context` and tag each zero minute with the contexts that report zero (`Platform`, `User`, `Unknown`). A zero with no `Context` information is `Unknown`.
-3. **Power-state guard.** If every minute of the period is suspect and the VM is currently `stopped` or `deallocated`, the whole period is excused and the VM is reported as `N/A`.
+3. **Power-state guard.** If every minute of the period is suspect and the VM is currently `stopped` or `deallocated`, the whole period is excused and the VM is reported as `N/A`. The power state comes with the inventory (Resource Graph); the instance view is read only for a VM whose power state Resource Graph does not know.
 4. **Activity Log.** Collect start, deallocate, power-off and restart operations, with all non-failed statuses (`Start`, `Accept`, `Success`). The first event marks when the affected minutes begin, so none of the statuses can be dropped. Events are grouped by operation and correlation ID; each group becomes a lifecycle window from its first event to its last event plus one minute plus `-ActivityGraceMinutes`. Overlapping windows are merged. The period before the VM's creation time is a separate *did not exist* window.
 5. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history). Classify every note by what it says, not by whether its state changed:
 
@@ -349,7 +360,7 @@ The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-
 | Microsoft decides which minutes are caused by the platform and which are excluded (maintenance, customer actions, throttling) | The script attributes each minute from the metric `Context`, the Activity Log, Resource Health and Service Health incidents, with a grace window (`-ActivityGraceMinutes`) and a fault window (`-FaultWindowMinutes`) | Microsoft's internal telemetry and its cause attribution are not available to customers, so the script uses heuristics on the public evidence |
 | A minute the platform cannot measure is not discussed | A null minute that nothing explains is excused as a *metric gap* | A missing sample is not evidence of downtime. The console lists these minutes so they stay visible |
 | Only platform-caused downtime counts | A zero minute that nothing explains is **Unresolved** and counts as downtime | The script cannot tell who caused it, so it is conservative and keeps the minute visible in the report. Unresolved minutes are reported separately from Faults |
-| The SLA depends on the deployment: zones, availability sets, dedicated host groups, or a single instance with Premium or Standard disks | Each VM is measured on its own, with no class distinction | Redundancy and disk type are out of scope for now. A VM in an availability set or zone is still scored as a single VM |
+| The SLA depends on the deployment: zones, availability sets, dedicated host groups, or a single instance with Premium or Standard disks | Each VM is measured on its own, with no class distinction | Redundancy and disk type are out of scope. A VM in an availability set or zone is still scored as a single VM |
 | Uptime Percentage is pooled per subscription | Results are reported per subscription and region, and each VM has its own figure | The report needs a regional split, and one subscription can hold VMs in several regions |
 | Compares the result with the SLA target and defines service credits | No comparison with a target | Not in scope: the script reports the measured availability only |
 | Maximum Available Minutes counts the minutes the VM is deployed and running | Eligible minutes = period minutes − Excused minutes (before creation, customer stops, lifecycle operations, planned events) | The metric and the Activity Log show only the customer-caused and planned stops they can see |
@@ -425,7 +436,9 @@ Every account of the pool carries its share of that loss:
 - The rows of a pool therefore add up to the pool's Uptime Percentage: the sums of available and eligible minutes per subscription, kind and region, in the report and in Log Analytics, give the SLA figure. The multiplication by the number of accounts makes each account weigh as one resource. It also means that an account that causes all the failures of a 35-account pool shows 35 times the pool's Average Error Rate.
 - A busy pool dilutes the failures of a small account: five failed requests on an account with little traffic cost almost nothing when the pool serves millions of transactions in that hour. The narration gives the account's **own error rate** (its failed ÷ counted requests), which is what an operator should look at to see how the account itself behaves.
 - An account with no counted request in the period is reported as `N/A`.
-- An account with fewer than 10,000 counted requests in the period is flagged **low volume** in the narration: its own error rate then rests on few requests.
+- An account with fewer than 10,000 counted requests in the period is flagged **low volume**: its own error rate then rests on few requests. The narration of an account with failures says so; the others are counted in one line.
+- With `-Resource`, the pool is still the whole pool: the script reads the other accounts of the subscription and region too and reports only the requested one, so that its figure is the same as in a full run.
+- In the "most impact" report the loss of an hour is split between its fault minutes and its unresolved minutes, so that each cause lists the same failing minutes as the table.
 
 The narration also lists the largest incidents (failing minutes less than six minutes apart): when it started, how many requests failed out of how many, the peak share of a minute, the verdict, and the Resource Health event and summary that explained it.
 

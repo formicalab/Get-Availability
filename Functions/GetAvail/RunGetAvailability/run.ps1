@@ -102,6 +102,9 @@ if ($env:GETAVAIL_BATCH -eq 'true') {
 $timerStatus = if ($Timer.IsPastDue) { 'past due' } else { 'on time' }
 Write-Information "GetAvail timer trigger fired ($timerStatus). Running for month $previousMonth with $($subscriptions.Count) subscription(s)."
 
+$global:LASTEXITCODE = 0
 & $scriptPath @scriptArgs
+# The script ends with a non-zero exit code when it could not run or when the evidence behind its figures is incomplete.
+if ($global:LASTEXITCODE) { throw "get-availability.ps1 ended with exit code $global:LASTEXITCODE (see its output above)." }
 
 Write-Information "GetAvail completed for month $previousMonth."
