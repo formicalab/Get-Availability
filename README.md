@@ -3,7 +3,7 @@
 [![CI](https://github.com/formicalab/Get-Availability/actions/workflows/ci.yml/badge.svg)](https://github.com/formicalab/Get-Availability/actions/workflows/ci.yml)
 [![Release](https://github.com/formicalab/Get-Availability/actions/workflows/release.yml/badge.svg)](https://github.com/formicalab/Get-Availability/actions/workflows/release.yml)
 
-Get-Availability reports month-scoped availability for Azure Virtual Machines, Azure SQL Databases, Azure Storage Accounts, and Azure Web Apps across one or more Azure subscriptions.
+Get-Availability reports the month-scoped Uptime Percentage of the Azure Service Level Agreement for Azure Virtual Machines, Azure SQL Databases, Azure Storage Accounts, and Azure Web Apps across one or more Azure subscriptions. Each resource kind follows the definition of its own SLA as closely as the data available to a customer allows, and the README says where it cannot.
 
 It runs either as a standalone PowerShell 7.6 script or as a timer-triggered Azure Function. Log Analytics ingestion is optional.
 
@@ -13,7 +13,8 @@ For each resource, the tool reports:
 - confirmed platform faults
 - excused minutes
 - unresolved minutes
-- availability percentage
+- eligible minutes (the SLA's Maximum Available Minutes) and available minutes
+- the Uptime Percentage (the `Avail%` column)
 
 The relationship `Suspect = Faults + Excused + Unresolved` always holds.
 
@@ -79,7 +80,7 @@ Resources with zero eligible minutes are shown as `N/A`.
 
 #### Resources with most impact
 
-The last section ranks, across all subscriptions, the resources that lost the most minutes (eligible minutes minus available minutes). Because every summary is the sum of those minutes, the lost minutes are also the weight of the resource in the aggregate figures. Each resource takes a header line (its availability, the lost minutes and its share of all the lost minutes) and one line per cause, the heaviest first:
+The last section ranks, across all subscriptions, the resources that lost the most minutes (eligible minutes minus available minutes). Because every summary is the sum of those minutes, the lost minutes are also the weight of the resource in the aggregate figures. Each resource takes a header line (its Uptime Percentage, the lost minutes and its share of all the lost minutes) and one line per cause, the heaviest first:
 
 ```
  3. tmonrenvm01azne  (VM, northeurope, POSTE-BANCOPOSTA-SVILUPPO)
@@ -91,8 +92,8 @@ A cause line gives the minutes it cost, the verdict that counts against availabi
 
 - VMs: the Resource Health note of the fault, the metric Context, or "zero availability that nothing explains" for an unresolved zero;
 - SQL databases: the Resource Health event or its absence, with the failed connections summed by error code and the successful connections of the same minutes;
-- storage accounts: storage is scored per pool (subscription and region), not as minutes down: an account loses its share of the pool's hourly Error Rate, so the header reads "failure rate worth N min" and a `note:` gives the pool's Uptime Percentage. A cause gives the failing minutes that count and the failed requests, the span and number of incidents (runs of failing minutes) when there are several, the largest incidents with their start, and the Resource Health event or its absence;
-- Web Apps: the down minutes that count, with their incidents and failed requests, and the Resource Health event or its absence.
+- storage accounts: an account loses its share of the Error Rate of its pool (subscription and region), so the header reads "failures worth N min" and two `note:` lines give the Uptime Percentage of the pool and the account's own error rate. A cause gives the failed requests and the failing minutes that count, the span and number of incidents (runs of failing minutes) when there are several, the largest incidents with their start, and the Resource Health event or its absence;
+- Web Apps: the down minutes that count (platform faults), with their incidents and failed requests and the Resource Health event; the application errors, which are not counted, appear in a `note:`.
 
 `note:` lines follow when the figure rests on little data (low volume, many down minutes with fewer than 5 requests, a tier outside the SLA, incomplete minute detail). The size of the list is set with `-TopImpact`.
 
@@ -101,7 +102,7 @@ A cause line gives the minutes it cost, the verdict that counts against availabi
 1. The resource inventory comes from Azure Resource Graph.
 2. Each resource kind is measured from its own Azure Monitor signal and turned into *suspect minutes* (minutes that may count against availability).
 3. Every suspect minute is attributed with the Activity Log and Resource Health (VMs and SQL databases also use the metric itself), and ends as a fault, an excused minute or an unresolved minute.
-4. Availability is computed from the eligible minutes and the available minutes.
+4. The Uptime Percentage is computed as in the SLA: `(Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`, with the eligible minutes as Maximum Available Minutes. The summaries add up the minutes of the resources of a subscription, a resource kind and a region, so that they are the Uptime Percentage of that group; the SLA pools the resources of a subscription, and the region is added because one subscription can hold resources in several regions.
 
 Steps 2 and 3 are different for each resource kind, and each algorithm is described only in [Algorithms](#algorithms): [virtual machines](#virtual-machines), [Azure SQL databases](#azure-sql-databases), [storage accounts](#storage-accounts) and [Web Apps](#web-apps). With `-SourceWorkspaceId` the Activity Log and the Resource Health events are read in bulk from Log Analytics (see [Resource Health history](#resource-health-history)).
 
@@ -136,7 +137,7 @@ The template supports two network modes controlled by `usePrivateEndpoints`:
 
 | `usePrivateEndpoints` | Behavior |
 |---|---|
-| `true` | Preserves the current deployment model: creates storage and Function App private endpoints, uses the private endpoint subnet and shared private DNS zones, and keeps public access disabled on those resources |
+| `true` | Creates storage and Function App private endpoints, uses the private endpoint subnet and shared private DNS zones, and keeps public access disabled on those resources |
 | `false` | Skips private endpoints and DNS zone references, and keeps the storage account and Function App publicly reachable |
 
 ### Deployment prerequisites
@@ -225,16 +226,40 @@ func azure functionapp publish fn-getavail-itn-001 --powershell
 
 ## Algorithms
 
-This section describes, step by step, how each resource kind is turned into the numbers in the results table. Every algorithm answers the same question for each suspect minute: *did this minute count against availability, and why?*
+This section describes, step by step, how each resource kind is turned into the numbers in the results table. Each algorithm is self-contained: it starts from the SLA of its resource kind and says how far the data available to a customer allows it to follow it. Two things are shared and described once below: the SLA terms and the way Resource Health history is read.
+
+### SLA terms
+
+The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services) of every kind measures an **Uptime Percentage**. The results table and the algorithms use these terms:
+
+| SLA term | In the results |
+|---|---|
+| Maximum Available Minutes (the sum of the **Deployment Minutes** of the resources) | The **Eligible** minutes: the minutes of the period in which the resource existed and was meant to be running |
+| Downtime | The minutes that count against availability: the **Faults**, and for some kinds the **Unresolved** minutes (each algorithm says which) |
+| Uptime Percentage | The **Avail%** column: `(Eligible − Downtime) ÷ Eligible × 100` |
+| Scheduled Downtime and the customer's own operations, which the SLA excludes from Downtime | **Excused** minutes |
+| Applicable Period | The UTC calendar month of the run |
+
+The SLA also defines Service Levels and Service Credits for each kind. The script reports the measured Uptime Percentage and does not compare it with them.
 
 ### Resource Health history
 
-Every resource kind reads Resource Health history in exactly the same way. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
+Resource Health history is read in exactly the same way for every resource kind. The REST history (about the last 30 days) and, with `-SourceWorkspaceId`, the Resource Health events of the Activity Log in the workspace are **combined for the whole period**. Neither source is complete on its own:
 
 - The REST history can omit short events that the Activity Log still holds. The same account has returned a 22-entry history with its recent `Degraded` events and, hours later, a 9-entry history without them.
 - The workspace lags behind real time and reaches back only as far as its retention.
 
 The REST history is skipped only when a workspace is set and the whole period predates the REST retention. The two sources describe the same events, so duplicates are expected, and each algorithm is built to tolerate them. Without `-SourceWorkspaceId` only the REST history is available: short events can be missing, and periods older than about 30 days have no health evidence.
+
+### Resource Health windows
+
+The SQL database, storage account and Web App algorithms turn the combined history into *windows* (the VM algorithm classifies each note instead). A window opens at a `Degraded` or `Unavailable` note and closes at the next `Available` note; an event that never resolves explains at most 30 minutes. Windows that touch (within two minutes) and have the same kind are merged, because the two sources repeat the same event. A window has one of three kinds:
+
+- **Customer window**: the event was caused by the customer (reason `Customer Initiated` or `User Initiated`, or a `Throttled` note).
+- **Planned window**: the event was planned maintenance (reason `Planned`, or details saying "planned maintenance"). It is the closest customers can get to the SLA's Scheduled Downtime.
+- **Platform window**: every other event.
+
+Resource Health raises its event a few minutes after the first failures, so a platform window is widened: it starts `-HealthLeadMinutes` before the opening note and ends two minutes after the resolution.
 
 ### Virtual machines
 
@@ -297,15 +322,13 @@ Three details matter in practice:
 - **Faults** = minutes decided by rules 2 and 6.
 - **Excused** = minutes decided by rules 1, 3, 4, 5, 7 and 8.
 - **Unresolved** = minutes decided by rule 9.
-- **Eligible minutes** = minutes in the period − Excused.
+- **Eligible minutes** (Maximum Available Minutes) = minutes in the period − Excused.
 - **Downtime** = Faults + Unresolved.
-- **Availability %** = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when no minute is eligible.
-
-This is the SLA formula, `Uptime Percentage = (Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`, with the eligible minutes as *Maximum Available Minutes*. The script's **Availability %** is that Uptime Percentage.
+- **Uptime Percentage** = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when no minute is eligible.
 
 #### Differences from the official SLA
 
-The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services) defines Virtual Machines downtime as a minute with no connectivity to the VM, and Uptime Percentage as `(Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`. The script follows that formula, but it cannot see what Microsoft sees, so it differs in these ways:
+The [Online Services SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services) defines Virtual Machines Downtime as a minute with no connectivity to the VM, and the Uptime Percentage as `(Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`. The script follows that formula, but it cannot see what Microsoft sees, so it differs in these ways:
 
 | Official SLA | This script | Why |
 |---|---|---|
@@ -361,19 +384,17 @@ For the accounts that had at least one failed request, read the per-minute count
 
 #### Step 3: attribute each failing minute to Resource Health
 
-1. Read the Resource Health history described in [Resource Health history](#resource-health-history).
-2. A **window** opens at a `Degraded` or `Unavailable` note and closes at the next `Available` note (an event that never resolves explains at most 30 minutes). Windows of notes caused by the customer, such as `Throttled`, are *customer windows*. Windows that touch are merged.
-3. Resource Health raises its event a few minutes after the first failed requests, so a window is widened: it starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
-4. Each failing minute is decided in this order:
+1. Read the Resource Health history described in [Resource Health history](#resource-health-history) and turn it into customer, planned and platform windows as described in [Resource Health windows](#resource-health-windows).
+2. Each failing minute is decided in this order:
 
 | # | Rule | Verdict |
 |---|---|---|
-| 1 | The account did not exist yet | Not eligible (hours before creation are left out) |
+| 1 | The account did not exist yet | Not a Deployment Minute (hours before creation are left out) |
 | 2 | Inside a platform window | **Fault** |
-| 3 | Inside a customer window | Excused |
+| 3 | Inside a customer or planned window | Excused (customer-caused, or Scheduled Downtime) |
 | 4 | Anything else | **Unresolved** |
 
-Both Fault and Unresolved count against availability: a failed request is a failed request whether or not Azure reported it. The split tells an operator, or an SRE agent, which failures Azure already acknowledged. Excused requests leave both the failed and the counted totals of their hour.
+Both Fault and Unresolved count as Downtime: a failed request is a failed request whether or not Azure reported it. The split tells an operator, or an SRE agent, which failures Azure already acknowledged. Excused requests leave both the failed and the counted totals of their hour.
 
 #### Step 4: compute the result
 
@@ -387,7 +408,7 @@ Every account of the pool carries its share of that loss:
 - **Suspect** = failing minutes = Faults + Excused + Unresolved (minutes with at least one failed request, in the account).
 - **Eligible minutes** = minutes in the period since the account was created.
 - **Lost minutes** = the sum over the hours of 60 × (accounts in the pool) × (the account's failed requests ÷ the pool's counted requests of the hour).
-- **Available minutes** = eligible − lost; **Availability %** = available ÷ eligible.
+- **Available minutes** = eligible − lost; **Uptime Percentage** = available ÷ eligible.
 - The rows of a pool therefore add up to the pool's Uptime Percentage: the sums of available and eligible minutes per subscription, kind and region, in the report and in Log Analytics, give the SLA figure. The multiplication by the number of accounts makes each account weigh as one resource. It also means that an account that causes all the failures of a 35-account pool shows 35 times the pool's Average Error Rate.
 - A busy pool dilutes the failures of a small account: five failed requests on an account with little traffic cost almost nothing when the pool serves millions of transactions in that hour. The narration gives the account's **own error rate** (its failed ÷ counted requests), which is what an operator should look at to see how the account itself behaves.
 - An account with no counted request in the period is reported as `N/A`.
@@ -459,7 +480,7 @@ In a September sample of 181 databases, every one of the 375 zero minutes had er
 3. **Failover windows.** Collect the `failover` operations of the Activity Log (`.../failover/action`), which the customer starts. They are grouped into windows like the resume operations.
 4. **Creation time.** Minutes before the creation time of the database are not Deployment Minutes.
 5. **Billed compute (serverless databases only, SKU name containing `_S_`).** Read `app_cpu_billed` (aggregation `Total`, one-minute grain). A run of at least 5 consecutive minutes without a value is a pause. Shorter holes are gaps in the telemetry, not pauses. The latest 15 minutes of a period that ends now have no data yet and are not judged. The zero minutes that count against availability (Faults and Unresolved) are never treated as paused, so a failure cannot hide as a pause.
-6. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history) and turn it into windows, as for storage accounts: a window opens at an `Unavailable` or `Degraded` note and closes at the next `Available` note. Windows of customer-caused events are customer windows, and windows of planned maintenance (reason `Planned`, or details saying "planned maintenance") are planned windows. A platform window starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
+6. **Resource Health.** Read the combined history described in [Resource Health history](#resource-health-history) and turn it into customer, planned and platform windows as described in [Resource Health windows](#resource-health-windows).
 
 #### Step 2: decide each suspect minute
 
@@ -484,7 +505,7 @@ Resume is decided before Resource Health on purpose: on serverless databases mos
 - **Faults** = minutes decided by rule 6. **Excused** = rules 1, 2, 3, 4, 5 and 7. **Unresolved** = rule 8.
 - **Eligible minutes** are the SLA's *Maximum Available Minutes* (the database's *Deployment Minutes*) = minutes in the period − minutes before creation − paused minutes. Every other excused minute stays eligible: the SLA excludes those from Downtime, not from the denominator.
 - **Downtime** = Faults + Unresolved.
-- **Availability %** is the Uptime Percentage = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when no minute is eligible.
+- **Uptime Percentage** = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when no minute is eligible.
 
 #### Differences from the official SLA
 
@@ -536,13 +557,15 @@ The narration also counts the Resource Health platform events that produced **no
 
 #### What the signal means
 
-A Web App has **no availability metric**. The App Service SLA (99.95% for the Basic, Standard, Premium and Isolated tiers; none for Free and Shared) measures the minutes the app is *set to running* ("Deployment Minutes": stopped time is excluded) and counts a minute as unavailable when the app has no connectivity to the Internet gateway. The closest signal a customer can observe is the HTTP traffic: the `Requests` and `Http5xx` metrics (aggregation `Total`, one-minute grain).
+A Web App has **no availability metric**. The [App Service SLA](https://www.microsoft.com/licensing/docs/view/Service-Level-Agreements-SLA-for-Online-Services) counts as *Deployment Minutes* the minutes the app is set to running (from its creation, or from the customer starting it, until the customer stops or deletes it). It counts as *Downtime* a Deployment Minute in which there is **no connectivity between the app and Microsoft's Internet gateway**. The Uptime Percentage is `(Maximum Available Minutes − Downtime) ÷ Maximum Available Minutes × 100`, with the Deployment Minutes of all the apps of a subscription as the Maximum Available Minutes. The SLA document does not mention tiers; Microsoft's App Service pricing page gives 99.95% to the Basic, Standard, Premium and Isolated tiers and no SLA to Free and Shared.
 
-A **down minute** is a minute with at least one request in which **every** request failed with a 5xx (`Http5xx >= Requests`). Three kinds of minutes are deliberately not down:
+A customer cannot observe connectivity to the gateway. The closest signal is the HTTP traffic: the `Requests` and `Http5xx` metrics (aggregation `Total`, one-minute grain). A **down minute** is a minute with at least one request in which **every** request failed with a 5xx (`Http5xx >= Requests`). Three kinds of minutes are deliberately not down:
 
 - Minutes without requests cannot be judged and count as available.
 - Minutes in which some requests succeeded are *partial*: they are reported, not scored.
 - Minutes with only 4xx errors are client errors.
+
+A down minute is **not** Downtime by itself. A request that reaches the app and gets a 5xx proves that the app was connected, so an application error is not what the SLA counts, and `Http5xx` cannot tell an error of the application from one of the platform. Only a down minute that a platform Resource Health event explains is counted (a **Fault**). The other down minutes are reported as application errors (*Unresolved*) so that an operator, or an SRE agent, can still find them.
 
 Other signals were evaluated and rejected:
 
@@ -550,17 +573,19 @@ Other signals were evaluated and rejected:
 |---|---|
 | `MemoryWorkingSet` | It is `0` whenever the process is not running: stopped apps, Free tier, and Always On disabled after the idle timeout. In a September sample 99.95% of the 511,806 zero minutes had no request at all, so idle apps would be reported as down (in one subscription: 526,318 unresolved minutes, 11 of 154 apps below 50%) while real failures with the process up would be invisible |
 | `HealthCheckStatus` | Needs a health-check path configured on the app and has a 5-minute grain; none of the 20 apps sampled had data |
+| Minutes without requests | They would be the signature of a lack of connectivity, but only for an app that receives a request every minute (for example from a probe). In a sample of 34 apps none had requests in more than 34% of the minutes |
+| HTTP and platform logs of App Service | They carry the status code of each request, but need a diagnostic setting; the sampled workspace had none |
 | Resource Health | In the sampled estate Web Apps had no health events since June and a REST history made of a single baseline row (`Available`, sometimes `Unknown`) |
 
-The failures this algorithm finds are therefore mostly **application** errors (an app answering 5xx while its process is up, which the sampled failing minutes confirmed). They are what the app's users experience, but they are not necessarily the platform's fault: that is what the Unresolved and Fault columns separate.
+The down minutes this algorithm finds are therefore mostly **application** errors (an app answering 5xx while its process is up, which the sampled failing minutes confirmed). They are what the app's users experience, and the Unresolved column shows them, but they do not lower the availability.
 
 #### Step 1: collect the evidence
 
 1. **Hourly totals.** Read `Requests` and `Http5xx` for the whole period at one-hour grain (one call per app). An app with no request in the period is `N/A`.
 2. **Minute detail.** For an app with any 5xx, read the same metrics at one-minute grain, in spans of 5 days (halved when Azure Monitor refuses a response as too large).
-3. **Stopped periods and recycle windows.** Collect the `stop`, `start` and `restart` operations of the Activity Log. Events of one kind at most 5 minutes apart belong to one operation (a window never exceeds 15 minutes), because the Activity Log records each operation several times. A *recycle window* covers an operation plus `-ActivityGraceMinutes`. A *stopped period* runs from a stop to the next start or restart, or to the end of the period. With `-SourceWorkspaceId` the Activity Log is read from the workspace for all apps; without it, only for the apps that had 5xx.
-4. **Creation time.** Minutes before the app was created are not eligible.
-5. **Resource Health.** For an app with 5xx, read the combined history described in [Resource Health history](#resource-health-history) and turn it into windows exactly as for storage accounts. A platform window starts `-HealthLeadMinutes` before the note and ends two minutes after the resolution.
+3. **Stopped periods and recycle windows.** Collect the customer's operations of the Activity Log: `stop`, `start`, `restart`, the change of the app's configuration (`config/write`, which restarts it) and the slot swap. Events of one kind at most 5 minutes apart belong to one operation (a window never exceeds 15 minutes), because the Activity Log records each operation several times. A *recycle window* covers an operation plus `-ActivityGraceMinutes`. A *stopped period* runs from a stop to the next start or restart, or to the end of the period; a configuration change or a swap does not end it. With `-SourceWorkspaceId` the Activity Log is read from the workspace for all apps; without it, only for the apps that had 5xx.
+4. **Creation time.** Minutes before the app was created are not Deployment Minutes.
+5. **Resource Health.** For an app with 5xx, read the combined history described in [Resource Health history](#resource-health-history) and turn it into customer, planned and platform windows as described in [Resource Health windows](#resource-health-windows).
 
 #### Step 2: decide each down minute
 
@@ -568,23 +593,38 @@ Rules are applied in order; the first match wins.
 
 | # | Rule | Verdict |
 |---|---|---|
-| 1 | The app is stopped by the customer | Excused (the minute is not eligible) |
-| 2 | Inside a recycle window of a stop, start or restart | Excused |
+| 1 | The app is stopped by the customer | Excused (not a Deployment Minute) |
+| 2 | Inside a recycle window of a stop, start, restart, configuration change or slot swap | Excused |
 | 3 | Inside a customer Resource Health window | Excused |
-| 4 | Inside a platform Resource Health window | **Fault** |
-| 5 | Nothing explains it | **Unresolved** (counts against availability) |
+| 4 | Inside a planned-maintenance Resource Health window | Excused (the SLA's Scheduled Downtime) |
+| 5 | Inside a platform Resource Health window | **Fault** (counts against availability) |
+| 6 | Nothing explains it | **Unresolved**: an application error, reported and not counted |
 
 #### Step 3: compute the result
 
 - **Suspect** = every down minute = Faults + Excused + Unresolved.
-- **Faults** = rule 4. **Excused** = rules 1, 2 and 3. **Unresolved** = rule 5.
-- **Eligible minutes** = minutes since the app was created − every minute it was stopped (with or without traffic) − the down minutes excused by rules 2 and 3.
-- **Availability %** = (eligible minutes − Faults − Unresolved) ÷ eligible minutes, or `N/A` when the app had no request or no eligible minute.
+- **Faults** = rule 5. **Excused** = rules 1 to 4. **Unresolved** = rule 6.
+- **Eligible minutes** are the SLA's *Maximum Available Minutes* (the app's *Deployment Minutes*) = minutes since the app was created − every minute it was stopped (with or without traffic). The down minutes excused by rules 2 to 4 stay eligible: the SLA excludes them from Downtime, not from the denominator.
+- **Downtime** = Faults.
+- **Uptime Percentage** = (Eligible − Downtime) ÷ Eligible × 100, or `N/A` when the app had no request or no eligible minute.
 - An app on the Free or Shared tier gets its figure with a note that the SLA does not cover it.
+
+#### Differences from the official SLA
+
+| Official SLA | This script | Why |
+|---|---|---|
+| Downtime is a minute with no connectivity between the app and the Internet gateway | Downtime is a down minute (every request failed with a 5xx) that a platform Resource Health event explains | Connectivity to the gateway cannot be observed by a customer. A 5xx proves that the request reached the app, and the metric cannot tell an application error from a platform one. Resource Health is the only platform attribution available |
+| An outage that stops requests from reaching the app is Downtime | It is not seen: the minutes have no request and are not judged | A silent minute is Downtime only for an app that normally receives a request every minute. The sampled apps did not |
+| Microsoft decides which downtime is excluded (the customer's operations, maintenance, throttling, faulty input) | The script excuses stop, start, restart, configuration changes and slot swaps from the Activity Log, and the customer and planned-maintenance Resource Health windows | Microsoft's internal attribution is not available to customers. A swap started from a slot may be logged on the slot rather than on the app, and is then not seen. Scheduled Downtime needs a notice of 5 days, which a customer cannot see: a Resource Health note of planned maintenance is taken as the notice |
+| Deployment Minutes: from creation or the customer starting the app to the customer stopping or deleting it | Minutes since creation minus the stopped minutes found in the Activity Log | A stop before the observation period is not seen: those minutes stay eligible (the app has no traffic, so the percentage is unchanged) |
+| Maximum Available Minutes are summed over the apps of a subscription | Minutes are summed per subscription and region | The report needs a regional split, and one subscription can hold apps in several regions |
+| The SLA covers Web, Mobile, API and Logic Apps | Function Apps and Standard Logic Apps (kind `functionapp`) are not read | Function Apps have their own SLA; the Requests metric does not describe a workflow |
+| Apps in Availability Zones have a different service level (99.99%), and App Service Environment v1 and v2 are not covered | No comparison with a target | Not in scope: the script reports the measured availability only |
+| The Applicable Period of pay-as-you-go services is the 30 days up to the incident | The period is a calendar month (UTC) | A monthly report is what the script produces |
 
 #### Evidence for the minutes that count
 
-For an app with down minutes the narration shows how many of its minutes with traffic were down, the three longest incidents (consecutive down minutes, at most 5 minutes apart) with their requests, verdict and Resource Health event, how many down minutes carried fewer than 5 requests, and a low-volume warning for an app with fewer than 10,000 requests in the period. Partial minutes are reported with the share of their requests that failed.
+For an app with down minutes the narration shows how many of its minutes with traffic were down, how they split into Faults, excused minutes and application errors, the three longest incidents (consecutive down minutes, at most 5 minutes apart) with their requests, verdict and Resource Health event, how many down minutes carried fewer than 5 requests, and a low-volume warning for an app with fewer than 10,000 requests in the period. Partial minutes are reported with the share of their requests that failed. The application errors are listed in the app's `note:` lines when it appears among the resources with most impact.
 
 #### Worked examples
 
@@ -592,18 +632,21 @@ For an app with down minutes the narration shows how many of its minutes with tr
 |---|---|---|
 | Idle Free-tier app, Always On disabled | No requests in the period; `MemoryWorkingSet` reads `0` | `N/A` (`MemoryWorkingSet` would report downtime) |
 | App stopped for a week by the customer | Stop and start operations in the Activity Log; no requests in between | Seven days leave the eligible minutes |
-| Restart during deployment | 3 minutes with every request failing at the time of a `restart` | Excused (recycle window) |
-| Always-failing internal app | 602 of 634 minutes with traffic down, 3,513 requests in the month, 573 of the down minutes with fewer than 5 requests | 98.6%, Unresolved, flagged low volume |
+| Restart during deployment | 3 minutes with every request failing at the time of a `restart` | Excused (recycle window); the minutes stay eligible |
+| App settings changed | Every request fails for 2 minutes right after a `config/write` | Excused (recycle window) |
+| Monthly platform maintenance | Every request fails for a minute; the Resource Health note says planned maintenance | Excused (Scheduled Downtime) |
+| Platform event | Every request fails for 5 minutes while Resource Health reports the app `Unavailable` | 5 Faults: counted |
+| Always-failing internal app | 602 of 634 minutes with traffic down, 3,513 requests in the month, 573 of the down minutes with fewer than 5 requests | 100%: 602 application errors, reported and flagged low volume |
 | Chronic partial errors | 14.8% of the requests fail, never all the requests of a minute | No down minute; reported as partial |
-| Busy app, 5xx burst | 5,739 down minutes of 38,554 with traffic, no stop, no health event | 86.7%, Unresolved: the number to investigate |
+| Busy app, 5xx burst | 5,739 down minutes of 38,554 with traffic, no stop, no health event | 100%: 5,739 application errors, the number to investigate |
 
-In a September sample of 154 apps in one subscription, 142 had traffic, 29 had at least one down minute, and five apps held 8,057 of the 10,104 down minutes (none excused by a health window; 3 stopped, 18 recycle).
+In a September sample of 154 apps in one subscription, 142 had traffic, 29 had at least one down minute, and five apps held 8,057 of the 10,104 down minutes (none explained by a health window; 3 stopped, 18 recycle). All the others were application errors.
 
 #### Limits
 
-- A 5xx is what the customer sees, not necessarily what the platform did: an application bug counts as down. The Fault class stays rare because Resource Health rarely reports Web App events.
-- A minute with a single failed request is down. Sparse apps swing widely; the low-volume warning and the count of down minutes with fewer than 5 requests show when this happens. Scoring such minutes partially was considered and rejected to keep the rule simple.
-- An outage that stops requests from reaching the app leaves silent minutes, which cannot be judged.
-- Only `stop`, `start` and `restart` excuse down minutes. Configuration changes and slot swaps also recycle an app, but no failing minute in the sampled data lined up with them.
+- The availability of a Web App measures the platform only: an application that returns 5xx all day still reads 100%. The Unresolved column and the narration show it. The Fault class is rare because Resource Health rarely reports Web App events, so most apps read 100%.
+- A Resource Health event that causes no all-failed minute is not counted, and neither is an outage that stops requests from reaching the app (silent minutes cannot be judged).
+- A minute with a single failed request is down. Sparse apps swing widely; the low-volume warning and the count of down minutes with fewer than 5 requests show when this happens.
+- A configuration write that does not restart the app (for example a change of the logging settings) also opens a recycle window. It excuses only a minute in which every request failed.
 - A stop that happened before the observation month is not seen, and without `-SourceWorkspaceId` an app without 5xx does not read the Activity Log: their stopped minutes stay eligible. This does not change the percentage, because a stopped app has no traffic, but it overstates the eligible minutes.
 - Without `-SourceWorkspaceId` the Activity Log and Resource Health evidence cover only what the REST APIs retain (about 30 days).

@@ -27,10 +27,13 @@
       - Storage accounts: the Error Rate of each hour over the accounts of a subscription and region,
         as in the SLA, shared among the accounts and attributed to Resource Health.
       - Web Apps (no availability metric): a minute is down when every request failed with a 5xx; the
-        down minutes are matched with the stop/start/restart operations of the Activity Log and with
-        Resource Health.
-    A suspect minute ends as a fault (platform), an excused minute (customer, lifecycle, not yet
-    created) or an unresolved minute; only faults and unresolved minutes count against availability.
+        down minutes are matched with the customer's operations of the Activity Log (stop, start,
+        restart, configuration change, slot swap) and with Resource Health. Only the minutes that a
+        platform Resource Health event explains count against availability: an application error
+        proves connectivity, which is what the SLA measures.
+    A suspect minute ends as a fault (platform), an excused minute (customer, planned maintenance,
+    lifecycle, not yet created) or an unresolved minute. Faults count against availability;
+    unresolved minutes count too, except for Web Apps, where they are reported as application errors.
 
     Resource Health history is read the same way for every kind: the REST history (about the last
     30 days) and, with -SourceWorkspaceId, the Resource Health events of the Activity Log in a Log
@@ -62,7 +65,7 @@
 
 .PARAMETER ActivityGraceMinutes
     Post-operation grace window for Activity Log lifecycle events (default: 10). For Web Apps
-    it is the time after a stop, start or restart during which down minutes are excused.
+    it is the time after a stop, start, restart, configuration change or slot swap during which down minutes are excused.
 
 .PARAMETER FaultWindowMinutes
     Virtual machines only: how long a platform Resource Health note (for example
@@ -1043,7 +1046,7 @@ public sealed class WebResult
     public int    Down;                 // active minutes in which every request failed with a 5xx
     public int    DownFewRequests;      // down minutes with fewer than 5 requests
     public int    Partial;              // active minutes with some, but not all, requests failed
-    public int    Stopped, Recycle, Customer, Fault, Unresolved;   // the decision for each down minute
+    public int    Stopped, Recycle, Customer, Planned, Fault, Unresolved;   // the decision for each down minute
     public int    StoppedMinutes;       // minutes the app was stopped by the customer
     public double Requests, Errors;     // totals of the active minutes
     public double PartialRequests, PartialErrors;
@@ -1074,13 +1077,18 @@ public static class WebParser
         }
     }
 
-    /// <summary>Maps an Activity Log operation name to "stop", "start" or "restart"; "" for any other operation.</summary>
+    /// <summary>
+    /// Maps an Activity Log operation name to "stop", "start" or "restart", or to "config" (a change of the
+    /// app's configuration, which restarts it) or "swap" (a slot swap); "" for any other operation.
+    /// </summary>
     public static string LifecycleKind(string operation)
     {
         string o = (operation ?? "").ToLowerInvariant();
         if (o.Contains("/sites/stop/"))    return "stop";
         if (o.Contains("/sites/start/"))   return "start";
         if (o.Contains("/sites/restart/")) return "restart";
+        if (o.Contains("/sites/config/write")) return "config";
+        if (o.Contains("/slotsswap/"))     return "swap";
         return "";
     }
 }
@@ -1132,10 +1140,11 @@ public static class WebClassifier
     private const long OneMin = TimeSpan.TicksPerMinute;
 
     /// <summary>
-    /// Builds, from the stop, start and restart operations, the periods the app was stopped by the customer
-    /// (a stop up to the next start or restart, or the end of the period) and the recycle windows (each
-    /// operation, plus the grace time). Events of one kind that are close together (at most 5 minutes apart,
-    /// 15 minutes in all) are one operation: the Activity Log records each operation several times.
+    /// Builds, from the customer's operations, the periods the app was stopped (a stop up to the next start or
+    /// restart, or the end of the period) and the recycle windows (each operation, plus the grace time). A
+    /// configuration change or a slot swap recycles the app but does not start or stop it. Events of one kind
+    /// that are close together (at most 5 minutes apart, 15 minutes in all) are one operation: the Activity Log
+    /// records each operation several times.
     /// </summary>
     public static void BuildLifecycle(List<WebEvent> events, long periodEndTicks, long graceTicks,
                                       List<long[]> stopped, List<long[]> recycle)
@@ -1144,7 +1153,7 @@ public static class WebClassifier
         sorted.Sort((a, b) => a.Ticks.CompareTo(b.Ticks));
         var operations = new List<(long start, long end, string kind)>();
         // Group the events of each kind into operations by proximity.
-        foreach (string kind in new[] { "stop", "start", "restart" })
+        foreach (string kind in new[] { "stop", "start", "restart", "config", "swap" })
         {
             long first = -1, last = -1;
             foreach (var e in sorted)
@@ -1165,7 +1174,7 @@ public static class WebClassifier
         {
             recycle.Add(new[] { op.start, op.end + graceTicks });
             if (op.kind == "stop") { if (stopAt < 0) stopAt = op.start; }
-            else if (stopAt >= 0) { stopped.Add(new[] { stopAt, op.end }); stopAt = -1; }
+            else if ((op.kind == "start" || op.kind == "restart") && stopAt >= 0) { stopped.Add(new[] { stopAt, op.end }); stopAt = -1; }
         }
         if (stopAt >= 0) stopped.Add(new[] { stopAt, periodEndTicks });
     }
@@ -1173,9 +1182,9 @@ public static class WebClassifier
     /// <summary>
     /// Finds the down minutes (every request failed with a 5xx) from the first minute the app existed and
     /// decides each: stopped by the customer, inside a recycle window, inside a Resource Health window
-    /// (customer: excused, platform: Fault; a window starts leadTicks before the event and ends graceTicks
-    /// after it), otherwise Unresolved. Minutes without requests are not judged; minutes with only some
-    /// requests failed are counted as partial and not scored.
+    /// (customer: excused, planned maintenance: excused, platform: Fault; a window starts leadTicks before the
+    /// event and ends graceTicks after it), otherwise Unresolved. Minutes without requests are not judged;
+    /// minutes with only some requests failed are counted as partial and not scored.
     /// </summary>
     public static WebResult Classify(double[] requests, double[] errors, int firstMinute, long startTicks,
                                      List<long[]> stopped, List<long[]> recycle, List<HealthWindow> health,
@@ -1216,7 +1225,7 @@ public static class WebClassifier
                     if (t + OneMin > w[0] && t <= w[1]) { cls = "Recycle"; break; }
             if (cls.Length == 0)
                 foreach (var w in health)
-                    if (t >= w.Start - leadTicks && t <= w.End + graceTicks) { cls = w.Customer ? "Customer" : "Fault"; win = w; break; }
+                    if (t >= w.Start - leadTicks && t <= w.End + graceTicks) { cls = w.Customer ? "Customer" : w.Planned ? "Planned" : "Fault"; win = w; break; }
             if (cls.Length == 0) cls = "Unresolved";
             // Count the decision for the summary.
             switch (cls)
@@ -1224,6 +1233,7 @@ public static class WebClassifier
                 case "Stopped":  r.Stopped++;  break;
                 case "Recycle":  r.Recycle++;  break;
                 case "Customer": r.Customer++; break;
+                case "Planned":  r.Planned++;  break;
                 case "Fault":    r.Fault++;    break;
                 default:         r.Unresolved++; break;
             }
@@ -1792,6 +1802,9 @@ let actOps = dynamic([
   'MICROSOFT.WEB/SITES/STOP/ACTION',
   'MICROSOFT.WEB/SITES/START/ACTION',
   'MICROSOFT.WEB/SITES/RESTART/ACTION',
+  'MICROSOFT.WEB/SITES/CONFIG/WRITE',
+  'MICROSOFT.WEB/SITES/SLOTSSWAP/ACTION',
+  'MICROSOFT.WEB/SITES/SLOTS/SLOTSSWAP/ACTION',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE',
   'MICROSOFT.SQL/SERVERS/DATABASES/WRITE',
   'MICROSOFT.COMPUTE/VIRTUALMACHINES/DELETE',
@@ -3382,7 +3395,7 @@ function Invoke-StorageInvestigation {
             $class = 'Unresolved'; $win = $null
             foreach ($w in $windows) {
                 if ($ticks -ge $w.Start - $leadTicks -and $ticks -le $w.End + $graceTicks) {
-                    $class = $w.Customer ? 'Excused' : 'Fault'; $win = $w; break
+                    $class = ($w.Customer -or $w.Planned) ? 'Excused' : 'Fault'; $win = $w; break
                 }
             }
             $count[$class]++
@@ -3714,10 +3727,11 @@ function Set-StorageEligibility {
 #endregion
 
 #region Web App algorithm
-# Web Apps have no availability metric. The score follows what a customer sees: a minute is down when
-# every request of the minute failed with an HTTP 5xx. Only the minutes the app is set to running count
-# (the App Service SLA "Deployment Minutes"). Minutes without requests are not judged and count as
-# available (README, "Algorithms > Web Apps").
+# Web Apps have no availability metric. A minute is down when every request of the minute failed with an
+# HTTP 5xx. Only the minutes the app is set to running count (the App Service SLA "Deployment Minutes"),
+# and only a down minute that a platform Resource Health event explains is Downtime: the SLA counts a lack
+# of connectivity, and a request that reaches the app and gets a 5xx proves that it was connected. Minutes
+# without requests are not judged and count as available (README, "Algorithms > Web Apps").
 
 # Apps with fewer requests than this in the period are flagged as low-volume when they have down minutes.
 $WebLowVolumeRequests = 10000
@@ -3802,7 +3816,8 @@ function Get-WebHourlyCounts {
     Finds and classifies the down minutes of the given Web Apps.
 
 .DESCRIPTION
-    For each app: (1) builds the stopped periods and the recycle windows from the stop, start and restart
+    For each app: (1) builds the stopped periods and the recycle windows from the stop, start, restart,
+    configuration-change and slot-swap
     operations of the Activity Log (from Log Analytics when a workspace is used; otherwise read from the
     REST API, only for the apps that had 5xx); (2) for an app that had 5xx, reads the PT1M Requests and
     Http5xx counts (spans of 5 days, halved when the response is too large) and builds the Resource Health
@@ -3949,9 +3964,11 @@ function Invoke-WebInvestigation {
        With -SourceWorkspaceId the Activity Log comes from Log Analytics for all the apps; without it only
        the apps that had 5xx read it, so the stopped minutes of the other apps are not removed from their
        eligible minutes (their availability stays 100%).
-    3. Eligible minutes = minutes since the app was created, without the minutes it was stopped and the
-       down minutes excused by a recycle or a customer Resource Health window.
-       Availability % = (eligible - Fault - Unresolved down minutes) / eligible.
+    3. Eligible minutes (the SLA's Maximum Available Minutes, the app's Deployment Minutes) = minutes since the
+       app was created, without the minutes it was stopped. Downtime = the down minutes that a platform
+       Resource Health event explains (Faults). The down minutes that nothing explains are application
+       errors: they are reported but not counted, because the SLA counts only a lack of connectivity.
+       Availability % = (eligible - Faults) / eligible.
 
 .PARAMETER Resources
     Web App descriptors from Get-ResourceInventory.
@@ -4047,11 +4064,12 @@ function Invoke-WebAvailability {
         $t   = $totals[$key]
         $inv = $investigation[$key]
         $w   = $inv ? $inv.Result : $null
-        # Eligible minutes leave the time before creation, the stopped minutes and the excused down minutes.
+        # Deployment Minutes: the time before creation and the stopped minutes leave the eligible minutes. The excused
+        # down minutes stay in: the SLA excludes them from Downtime, not from the Maximum Available Minutes.
         $stoppedMinutes = $w ? $w.StoppedMinutes : 0
-        $excused  = $w ? $w.Recycle + $w.Customer : 0
-        $lost     = $w ? $w.Fault + $w.Unresolved : 0
-        $eligible = $TotalMinutes - $t.FirstMinute - $stoppedMinutes - $excused
+        # Downtime counts only the minutes a platform event explains; the unexplained ones are application errors.
+        $lost     = $w ? $w.Fault : 0
+        $eligible = $TotalMinutes - $t.FirstMinute - $stoppedMinutes
         $results[$key] = [PSCustomObject]@{
             Excluded        = $t.Requests -le 0 -or $eligible -le 0
             EligibleMinutes = $eligible
@@ -4076,8 +4094,9 @@ function Invoke-WebAvailability {
 
 .DESCRIPTION
     Suspect = down minutes (every request failed with a 5xx) = Faults + Excused + Unresolved, where Excused
-    counts the minutes the app was stopped, recycled or inside a customer Resource Health window.
-    AvailableMinutes is the eligible minutes minus the Fault and Unresolved down minutes.
+    counts the minutes the app was stopped, recycled or inside a customer or planned-maintenance Resource
+    Health window. Only the Faults count against availability: AvailableMinutes is the eligible minutes minus
+    the Faults. Unresolved down minutes are application errors, reported but not counted.
 
 .PARAMETER Record
     The eligibility record of the app (see Step 4).
@@ -4104,12 +4123,12 @@ function Set-WebEligibility {
     # Without minute detail (an app that never had a 5xx) there is no down minute: the figure is 100%.
     $w = $Result.Detail
     $down = $w ? $w.Down : 0
-    $lost = $w ? $w.Fault + $w.Unresolved : 0
-    # Fill the eligibility record; the available minutes are the eligible ones minus Fault and Unresolved.
+    $lost = $w ? $w.Fault : 0
+    # Fill the eligibility record; the available minutes are the eligible ones minus the Faults.
     $Record.EligibleMinutes           = $Result.EligibleMinutes
     $Record.SuspectMinutes            = $down
     $Record.ConfirmedDowntimeMinutes  = $w ? $w.Fault : 0
-    $Record.ExcusedMinutes            = $w ? $w.Stopped + $w.Recycle + $w.Customer : 0
+    $Record.ExcusedMinutes            = $w ? $w.Stopped + $w.Recycle + $w.Customer + $w.Planned : 0
     $Record.UnexplainedSuspectMinutes = $w ? $w.Unresolved : 0
     $Record.AvailableMinutes          = [math]::Round($Result.EligibleMinutes - $lost, 2)
     $Record.AvailabilityPct           = [math]::Round($Result.Percent, 5).ToString('F5')
@@ -4119,8 +4138,8 @@ function Set-WebEligibility {
     }
     # Narration: the share of minutes with traffic that were down, the heaviest incidents and the volume warnings.
     if ($down -gt 0) {
-        Write-Host ("  [$name] web: {0:N0} of {1:N0} min with traffic had every request fail with a 5xx ({2:P1}), {3:N0} request(s) in all: {4} confirmed by Resource Health + {5} excused ({6} stopped, {7} recycle, {8} customer) + {9} unresolved" -f
-            $down, $w.Active, ($down / $w.Active), $Result.Requests, $w.Fault, $Record.ExcusedMinutes, $w.Stopped, $w.Recycle, $w.Customer, $w.Unresolved)
+        Write-Host ("  [$name] web: {0:N0} of {1:N0} min with traffic had every request fail with a 5xx ({2:P1}), {3:N0} request(s) in all: {4} confirmed by Resource Health (counted) + {5} excused ({6} stopped, {7} recycle, {8} customer, {9} planned) + {10} application error(s) that nothing explains (not counted)" -f
+            $down, $w.Active, ($down / $w.Active), $Result.Requests, $w.Fault, $Record.ExcusedMinutes, $w.Stopped, $w.Recycle, $w.Customer, $w.Planned, $w.Unresolved)
         # The heaviest incidents (longest first), three at most.
         $sorted = @($w.Incidents | Sort-Object Minutes -Descending)
         # The first three incidents are listed with their cause; the others are only counted.
@@ -4137,21 +4156,20 @@ function Set-WebEligibility {
             Write-Host ("  [$name] low volume: only {0:N0} request(s) in the period, the percentage rests on very few requests" -f $Result.Requests)
         }
 
-        # The causes of the "most impact" report: the down minutes that count, by Resource Health event or none.
-        $counted = @($sorted | Where-Object { $_.Class -in 'Fault', 'Unresolved' })
-        $Record.Causes = @(foreach ($g in ($counted | Group-Object { $_.Class + '|' + ($_.Window ? $_.Window.Title : '') })) {
+        # The causes of the "most impact" report: the down minutes that count (platform faults), by Resource Health event.
+        $counted = @($sorted | Where-Object { $_.Class -eq 'Fault' })
+        $Record.Causes = @(foreach ($g in ($counted | Group-Object { $_.Window ? $_.Window.Title : '' })) {
             $first = $g.Group[0]
-            $isFault = $first.Class -eq 'Fault'
             $requests = ($g.Group | Measure-Object Requests -Sum).Sum
-            $what = ($isFault ? (Get-WindowCause $first.Window) : 'no stop, restart or Resource Health event') +
-                "; $($g.Count) incident(s), $('{0:N0}' -f $requests) request(s) failed"
+            $what = (Get-WindowCause $first.Window) + "; $($g.Count) incident(s), $('{0:N0}' -f $requests) request(s) failed"
             # A single incident is as long as the lost minutes already shown, so its length is left out.
             $when = @($g.Group | Sort-Object Minutes -Descending |
                 ForEach-Object { Format-Occurrence $Result.PeriodStart.AddMinutes($_.StartMinute) ($g.Count -eq 1 ? 0 : $_.Minutes) })
-            New-LossCause (($g.Group | Measure-Object Minutes -Sum).Sum) ($isFault ? 'platform fault' : 'unresolved') $what $when
+            New-LossCause (($g.Group | Measure-Object Minutes -Sum).Sum) 'platform fault' $what $when
         })
         # Notes on how far the percentage can be trusted.
         $notes = [System.Collections.Generic.List[string]]::new()
+        if ($w.Unresolved -gt 0) { $notes.Add("$($w.Unresolved) application error minute(s): every request failed with a 5xx and nothing explains it. They are not counted, because the SLA counts only a lack of connectivity") }
         if ($w.DownFewRequests -gt 0) { $notes.Add("$($w.DownFewRequests) of the $down down minutes carried fewer than 5 requests") }
         if ($Result.LowVolume) { $notes.Add(('low volume: only {0:N0} request(s) in the period, the percentage rests on very few requests' -f $Result.Requests)) }
         if ($Result.Tier -in $WebNoSlaTiers) { $notes.Add("tier $($Result.Tier): the App Service SLA does not cover this tier, the figure is informative only") }
@@ -4376,8 +4394,6 @@ function Write-TopImpact([object[]]$Sorted, [int]$Top) {
         Select-Object *, @{ n = 'LostMinutes'; e = { [double]$_.EligibleMinutes - [double]$_.AvailableMinutes } } |
         Where-Object { $_.LostMinutes -gt 0.005 } |
         Sort-Object LostMinutes -Descending)
-    $totalLost = ($withLoss | Measure-Object LostMinutes -Sum).Sum
-    $totalEligible = ($scored | Measure-Object EligibleMinutes -Sum).Sum
 
     Write-Host ([string]::new([char]0x2550, 62))
     if ($withLoss.Count -eq 0) {
@@ -4385,6 +4401,9 @@ function Write-TopImpact([object[]]$Sorted, [int]$Top) {
         Write-Host ''
         return
     }
+    # The totals exist only when something was lost (Measure-Object returns no Sum for an empty list).
+    $totalLost = ($withLoss | Measure-Object LostMinutes -Sum).Sum
+    $totalEligible = ($scored | Measure-Object EligibleMinutes -Sum).Sum
     Write-Host "  RESOURCES WITH MOST IMPACT (top $([math]::Min($Top, $withLoss.Count)) of $($withLoss.Count) with lost minutes)"
     Write-Host ("  Together: {0:N2} min lost of {1:N0} eligible min ({2:N5}% of the eligible time)" -f
         $totalLost, $totalEligible, ($totalLost / $totalEligible * 100))
@@ -4671,7 +4690,7 @@ if ($storageResources.Count -gt 0) {
 #endregion
 
 #region Step 5c: Web Apps
-# The Web App algorithm (README, "Algorithms > Web Apps") counts the minutes in which every request failed
+# The Web App algorithm (README, "Algorithms > Web Apps") finds the minutes in which every request failed
 # with a 5xx and attributes them to the Activity Log and Resource Health. It fills the eligibility records directly.
 $webResources = @($resources | Where-Object { $_.Kind -eq 'WebApp' })
 if ($webResources.Count -gt 0) {
