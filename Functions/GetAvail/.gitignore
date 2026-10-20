@@ -10,5 +10,6 @@ __blobstorage__
 __queuestorage__
 __azurite_db*__.json
 
-# Saved modules (large, fetched before publishing)
-Modules/Az.*
+# Saved modules (large, fetched with Save-Module before publishing): the folder is kept, its contents are not
+Modules/*
+!Modules/README.md
