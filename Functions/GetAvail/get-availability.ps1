@@ -1056,6 +1056,8 @@ public sealed class WebIncident
     public double Requests;
     public string Class = "";           // Stopped, Recycle, Customer, Fault or Unresolved
     public HealthWindow Window;         // Resource Health window that decided the class, if any
+    public int    FaultMinutes;         // the minutes of the incident that are platform faults
+    public HealthWindow FaultWindow;    // the window behind the first of them
 }
 
 /// <summary>What the Web App algorithm found in the minutes of one app.</summary>
@@ -1268,6 +1270,7 @@ public static class WebClassifier
                 if (cur != null) r.Incidents.Add(cur);
                 cur = new WebIncident { StartMinute = m, EndMinute = m, Minutes = 1, Requests = req, Class = cls, Window = win };
             }
+            if (cls == "Fault") { cur.FaultMinutes++; if (cur.FaultWindow == null) cur.FaultWindow = win; }
         }
         if (cur != null) r.Incidents.Add(cur);
         return r;
@@ -1983,7 +1986,14 @@ actData | union healthData
         }
     }
 
-    Write-Host "Log Analytics: fetched $($rows.Count) events for $($dataByRes.Count) resource(s)"
+    # The caller has already printed "Fetching ... from Log Analytics... ", so the sentence continues here.
+    $asked = $normalizedResourceIds.Count
+    if ($rows.Count -eq 0) {
+        Write-Host "none of the $asked resource(s) queried has a Resource Health or lifecycle event in the workspace for this period"
+    }
+    else {
+        Write-Host "$($rows.Count) event(s) for $($dataByRes.Count) of the $asked resource(s) queried"
+    }
     $dataByRes
 }
 #endregion
@@ -4376,15 +4386,15 @@ function Set-WebEligibility {
         }
 
         # The causes of the "most impact" report: the down minutes that count (platform faults), by Resource Health event.
-        $counted = @($sorted | Where-Object { $_.Class -eq 'Fault' })
-        $Record.Causes = @(foreach ($g in ($counted | Group-Object { $_.Window ? $_.Window.Title : '' })) {
+        $counted = @($sorted | Where-Object { $_.FaultMinutes -gt 0 })
+        $Record.Causes = @(foreach ($g in ($counted | Group-Object { $_.FaultWindow ? $_.FaultWindow.Title : '' })) {
             $first = $g.Group[0]
             $requests = ($g.Group | Measure-Object Requests -Sum).Sum
-            $what = (Get-WindowCause $first.Window) + "; $($g.Count) incident(s), $('{0:N0}' -f $requests) request(s) failed"
+            $what = (Get-WindowCause $first.FaultWindow) + "; $($g.Count) incident(s), $('{0:N0}' -f $requests) request(s) failed"
             # A single incident is as long as the lost minutes already shown, so its length is left out.
-            $when = @($g.Group | Sort-Object Minutes -Descending |
-                ForEach-Object { Format-Occurrence $Result.PeriodStart.AddMinutes($_.StartMinute) ($g.Count -eq 1 ? 0 : $_.Minutes) })
-            New-LossCause (($g.Group | Measure-Object Minutes -Sum).Sum) 'platform fault' $what $when
+            $when = @($g.Group | Sort-Object FaultMinutes -Descending |
+                ForEach-Object { Format-Occurrence $Result.PeriodStart.AddMinutes($_.StartMinute) ($g.Count -eq 1 ? 0 : $_.FaultMinutes) })
+            New-LossCause (($g.Group | Measure-Object FaultMinutes -Sum).Sum) 'platform fault' $what $when
         })
         # Notes on how far the percentage can be trusted.
         $notes = [System.Collections.Generic.List[string]]::new()
